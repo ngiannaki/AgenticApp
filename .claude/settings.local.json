@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -m 2 http://localhost:8000/mcp -o /dev/null -w \"indexing:%{http_code}\\\\n\")",
+      "Bash(curl -s -m 2 http://localhost:8001/mcp -o /dev/null -w \"retrieval:%{http_code}\\\\n\")",
+      "Bash(curl -s -m 2 http://localhost:8002/mcp -o /dev/null -w \"db:%{http_code}\\\\n\")",
+      "Read(//c/Users/Nigia/AppData/Local/Temp/**)",
+      "Bash(curl -s http://localhost:8100/api/sessions/0386ff56-dcb6-426c-841d-e42d42bd8f3f/_debug)",
+      "Bash(npx tsc *)",
+      "Bash(npm install *)",
+      "Bash(.venv/Scripts/python -c \"import motor; print\\('motor ok'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import pymongo; print\\(pymongo.version\\)\")",
+      "Bash(.venv/Scripts/python -m pip install motor)"
+    ]
+  }
+}

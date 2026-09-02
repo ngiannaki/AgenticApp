@@ -1,0 +1,88 @@
+# Example authorization configuration for the Database MCP server.
+#
+# Copy this file to `permissions.yaml` (or point DB_MCP_PERMISSIONS_FILE at a
+# copy elsewhere) and adjust it for your schema. Tables not listed here are
+# denied *every* operation by default — there is no implicit "allow everything" —
+# unless `default` below is set.
+#
+# Per-table fields:
+#   select / insert / update / delete / schema_change: bool, default false
+#   deny_columns: [str]  -- columns hidden from SELECT/INSERT/UPDATE even
+#                            when the table-level operation above is allowed
+#                            (e.g. hide a password hash or internal secret)
+#
+# default: fallback policy applied to any table with no explicit entry below
+# and not in protected_tables. Useful when the agent needs to freely create
+# new tables (db_create_table) and read/write them without you pre-listing
+# every table name. Leave this key out entirely to keep strict deny-by-default
+# for anything unlisted.
+#
+# protected_tables: tables that back the RAG pipeline's own infrastructure.
+# A protected table may still allow `select` above, but insert/update/delete/
+# schema_change are hard-blocked here regardless of the per-table or default
+# flags, and cannot be re-enabled by any single tool call.
+
+default:
+  select: true
+  insert: true
+  update: true
+  delete: false
+  schema_change: true
+
+tables:
+  documents:
+    select: true
+    insert: true
+    update: true
+    delete: false
+    schema_change: false
+
+  document_versions:
+    select: true
+    insert: true
+    update: false
+    delete: false
+    schema_change: false
+
+  chunks:
+    select: true
+    insert: true
+    update: false
+    delete: false
+    schema_change: false
+
+  embeddings:
+    select: true
+    insert: true
+    update: false
+    delete: false
+    schema_change: false
+
+  collections:
+    select: true
+    insert: true
+    update: true
+    delete: true
+    schema_change: true
+
+  ingestion_jobs:
+    select: true
+    insert: true
+    update: true
+    delete: false
+    schema_change: false
+
+  users:
+    select: true
+    insert: false
+    update: false
+    delete: false
+    schema_change: false
+    deny_columns:
+      - password_hash
+      - api_key
+
+protected_tables:
+  - document_versions
+  - chunks
+  - embeddings

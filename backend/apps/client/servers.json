@@ -1,0 +1,24 @@
+{
+  "_comment": "MCP server mapping used by client.agent.MCPAgent. Same 'mcpServers' shape FastMCP's Client understands natively (see config/claude_desktop_config.example.json) — start the HTTP servers first, or switch a server to the stdio block below.",
+
+  "mcpServers": {
+    "indexing": {
+      "url": "http://localhost:8000/mcp"
+    },
+    "retrieval": {
+      "url": "http://localhost:8001/mcp"
+    },
+    "db": {
+      "url": "http://localhost:8002/mcp"
+    }
+  },
+
+  "_stdio_fallback_example": {
+    "mcpServers": {
+      "claude-code-tools": {
+        "command": "python",
+        "args": ["servers/claude_server/server.py", "--transport", "stdio"]
+      }
+    }
+  }
+}

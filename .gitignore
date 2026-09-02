@@ -1,0 +1,9 @@
+.venv/
+.env
+application_default_credentials.json
+localhost-key.pem
+localhost-cert.pem
+localhost.pem
+logs/
+data/
+**__pycache__
