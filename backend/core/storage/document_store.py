@@ -1,11 +1,13 @@
 from pathlib import Path
 from uuid import UUID
 
+from backend.config import settings
+
 
 class DocumentStore:
 
-    def __init__(self, root: str | Path = "data/documents"):
-        self.root = Path(root)
+    def __init__(self, root: str | Path | None = None):
+        self.root = Path(root or settings.document_store.dir)
         self.root.mkdir(
             parents=True,
             exist_ok=True,

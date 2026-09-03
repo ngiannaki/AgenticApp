@@ -11,10 +11,9 @@ Provides:
 from typing import Optional, Dict, List
 from llama_index.core import Document
 from llama_index.core.node_parser import HierarchicalNodeParser, SimpleNodeParser
-from llama_index.llms.ollama import Ollama
 import logging
 
-from backend.core.config import settings
+from backend.config import get_llamaindex_llm, settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,20 +21,11 @@ logger = logging.getLogger(__name__)
 class MetadataEnhancer:
     """Enhances document metadata with summaries, sections, and hierarchy info."""
 
-    def __init__(self, ollama_base_url: str = settings.base_url):
-        """
-        Initialize metadata enhancer with Ollama LLM.
+    def __init__(self) -> None:
+        """Initialize metadata enhancer with the configured LLM (Ollama in DEV, OpenAI in PROD)."""
+        self.llm = get_llamaindex_llm(settings.metadata_model, temperature=settings.metadata_temperature)
 
-        Args:
-            ollama_base_url: URL where Ollama is running
-        """
-        self.llm = Ollama(
-            model=settings.chat_model,
-            base_url=ollama_base_url,
-            temperature=0.1,
-        )
-        
-        logger.info("MetadataEnhancer initialized")
+        logger.info("MetadataEnhancer initialized with model=%s", settings.metadata_model)
     
     def extract_sections(self, text: str, top_k: int = 5) -> List[Dict]:
         """

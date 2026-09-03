@@ -46,12 +46,12 @@ class DocAIPageLimitExceededError(RuntimeError):
         self.page_limit = page_limit
         self.pages_sent = pages_sent
 
-# ── Google credential bootstrap (mirrors llms.py logic) ───────────────────
-_DEFAULT_ADC = (
-    Path(__file__).resolve().parents[3] / "google" / "application_default_credentials.json"
-)
-if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ and _DEFAULT_ADC.exists():
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_DEFAULT_ADC)
+# ── Google credential bootstrap (see backend/config: GOOGLE_DOCAI_CREDENTIALS_PATH) ──
+if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+    from backend.config import settings as _settings
+
+    if _settings.google_docai.credentials_path and Path(_settings.google_docai.credentials_path).exists():
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _settings.google_docai.credentials_path
 
 _DOCAI_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 

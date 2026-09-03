@@ -16,6 +16,24 @@ from typing import Any
 
 from backend.apps.client.memory import ConversationMemory
 from backend.apps.api.schemas import InterruptDecisionRequest
+from backend.config import settings as app_settings
+
+# Tokens reserved out of num_ctx for the model's own generation on a single
+# turn: the visible answer plus, on a thinking model with reasoning_effort
+# set (or a model like gpt-oss that reasons by default), its hidden
+# chain-of-thought — which shares the same fixed context window as the
+# prompt. Without this headroom, a full prompt can leave the model no room
+# to think, and Ollama truncates the *prompt* instead to make space, which
+# silently drops the oldest turns (see ConversationMemory.max_context_tokens).
+_RESERVED_GENERATION_TOKENS = 4096
+
+
+def _max_context_tokens() -> int | None:
+    """None in PROD (real OpenAI enforces its own window and errors clearly
+    instead of silently truncating, so message-count pruning is enough)."""
+    if app_settings.is_prod:
+        return None
+    return max(2048, app_settings.ollama.num_ctx - _RESERVED_GENERATION_TOKENS)
 
 
 @dataclass
@@ -69,10 +87,18 @@ class SessionManager:
         self._sessions: dict[str, ChatSession] = {}
         self._idle_timeout = idle_timeout_seconds
 
-    def create(self, system_prompt: str, max_history_messages: int, approval_required_tools: list[str]) -> ChatSession:
+    def create(
+        self,
+        system_prompt: str,
+        max_history_messages: int,
+        approval_required_tools: list[str],
+        max_tool_result_chars: int = 8000,
+    ) -> ChatSession:
         session = ChatSession(
             session_id=str(uuid.uuid4()),
-            memory=ConversationMemory(system_prompt, max_history_messages),
+            memory=ConversationMemory(
+                system_prompt, max_history_messages, max_tool_result_chars, _max_context_tokens()
+            ),
             approval_required_tools=approval_required_tools,
         )
         self._sessions[session.session_id] = session
@@ -85,11 +111,14 @@ class SessionManager:
         max_history_messages: int,
         approval_required_tools: list[str],
         history: list[dict[str, Any]],
+        max_tool_result_chars: int = 8000,
     ) -> ChatSession:
         """Rebuild a session that lives in MongoDB but was evicted or lost to a
         restart, replaying its stored turns back into fresh conversation memory
         so the model still has context for the next message."""
-        memory = ConversationMemory(system_prompt, max_history_messages)
+        memory = ConversationMemory(
+            system_prompt, max_history_messages, max_tool_result_chars, _max_context_tokens()
+        )
         for turn in history:
             if turn["role"] == "user":
                 memory.add_user(turn["content"])

@@ -9,25 +9,42 @@ that's the human-in-the-loop hook.
 
 One AgentRuntime is created once at startup (backend/apps/api/main.py) and
 shared read-only across all sessions: it holds the single MCP connection,
-the discovered tool list, and the Ollama client. Per-conversation state
-(memory, pending interrupts, approval policy) lives on ChatSession instead.
+the discovered tool list, and the LLM client (Ollama or OpenAI, depending on
+ENVIRONMENT — see backend/config). Per-conversation state (memory, pending
+interrupts, approval policy) lives on ChatSession instead.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from typing import Any, AsyncIterator
 
-import ollama
+import openai
 from fastmcp import Client
 
 from backend.apps.api import events
 from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
-from backend.core.config import settings as ollama_settings
+from backend.config import get_async_openai_client, get_ollama_extra_body, settings as app_settings
 
 logger = logging.getLogger("agentic_api")
+
+
+def _extract_reasoning(message: Any) -> str | None:
+    """Pull the model's chain-of-thought off a chat completion message, if present.
+
+    Ollama's OpenAI-compatible endpoint adds a non-standard "reasoning" field
+    to the message for thinking-capable models (e.g. gpt-oss:20b) when
+    `reasoning_effort` is set (see get_ollama_extra_body). It isn't part of
+    the openai SDK's typed model, so it only surfaces via `model_extra`.
+    """
+    reasoning = getattr(message, "reasoning", None)
+    if not reasoning:
+        extra = getattr(message, "model_extra", None) or {}
+        reasoning = extra.get("reasoning")
+    return reasoning or None
 
 
 def _extract_text(result: Any) -> str:
@@ -43,11 +60,11 @@ def _extract_text(result: Any) -> str:
 
 
 class AgentRuntime:
-    """Shared, process-wide MCP connection + tool list + Ollama client."""
+    """Shared, process-wide MCP connection + tool list + LLM client."""
 
-    def __init__(self, mcp_client: Client, ollama_client: ollama.AsyncClient, settings: ApiSettings) -> None:
+    def __init__(self, mcp_client: Client, llm_client: openai.AsyncOpenAI, settings: ApiSettings) -> None:
         self.mcp = mcp_client
-        self.ollama = ollama_client
+        self.llm = llm_client
         self.settings = settings
         self.tools: list[dict[str, Any]] = []
 
@@ -55,8 +72,8 @@ class AgentRuntime:
     async def connect(cls, servers: dict, settings: ApiSettings) -> "AgentRuntime":
         mcp_client = Client(servers)
         await mcp_client.__aenter__()
-        ollama_client = ollama.AsyncClient(host=ollama_settings.base_url)
-        runtime = cls(mcp_client, ollama_client, settings)
+        llm_client = get_async_openai_client()
+        runtime = cls(mcp_client, llm_client, settings)
         await runtime._load_tools()
         return runtime
 
@@ -85,7 +102,7 @@ class AgentRuntime:
     async def _chat(
         self, session: ChatSession, tools_enabled: bool = True
     ) -> AsyncIterator[tuple[str, Any]]:
-        """Call ollama.chat, recovering from a malformed-tool-call parse failure.
+        """Call the chat completions endpoint, recovering from a malformed-tool-call parse failure.
 
         Some models (observed with gpt-oss:20b) occasionally leak chain-of-thought
         text into the slot where a tool call is expected; Ollama's server tries to
@@ -95,28 +112,29 @@ class AgentRuntime:
         twice and retry instead of ending the whole turn.
 
         Yields ("event", sse_dict) for status/error events to forward as-is, then
-        exactly one of ("response", ChatResponse) on success or ("failed", None)
+        exactly one of ("response", ChatCompletion) on success or ("failed", None)
         after an unrecoverable error (an "error" event has already been yielded).
         """
         max_recovery_attempts = 2
         for attempt in range(max_recovery_attempts + 1):
             try:
-                response = await self.ollama.chat(
-                    model=ollama_settings.chat_model,
+                response = await self.llm.chat.completions.create(
+                    model=app_settings.chat_model,
                     messages=session.memory.messages(),
                     tools=(self.tools or None) if tools_enabled else None,
-                    options={"temperature": self.settings.temperature},
+                    temperature=self.settings.temperature,
+                    extra_body=get_ollama_extra_body(),
                 )
                 yield ("response", response)
                 return
-            except ollama.ResponseError as exc:
-                malformed_tool_call = "error parsing tool call" in exc.error
+            except openai.APIStatusError as exc:
+                malformed_tool_call = "error parsing tool call" in str(exc)
                 if malformed_tool_call and attempt < max_recovery_attempts:
                     logger.warning(
                         "Model produced a malformed tool call (attempt %d/%d): %s",
                         attempt + 1,
                         max_recovery_attempts,
-                        exc.error,
+                        exc,
                     )
                     yield ("event", events.status("model output could not be parsed as a tool call, retrying"))
                     session.memory.add_user(
@@ -124,12 +142,12 @@ class AgentRuntime:
                         "call, or plain final-answer text — never a mix of prose and partial JSON."
                     )
                     continue
-                logger.exception("Ollama chat call failed")
+                logger.exception("LLM chat call failed")
                 yield ("event", events.error(f"LLM call failed: {exc}"))
                 yield ("failed", None)
                 return
             except Exception as exc:  # noqa: BLE001 — surface upstream failure and end the turn
-                logger.exception("Ollama chat call failed")
+                logger.exception("LLM chat call failed")
                 yield ("event", events.error(f"LLM call failed: {exc}"))
                 yield ("failed", None)
                 return
@@ -155,7 +173,10 @@ class AgentRuntime:
             if response is None:
                 return
 
-            message = response.message
+            message = response.choices[0].message
+            reasoning = _extract_reasoning(message)
+            if reasoning:
+                yield events.reasoning(reasoning)
 
             if not message.tool_calls:
                 answer = message.content or ""
@@ -188,7 +209,11 @@ class AgentRuntime:
                 return
         if response is None:
             return
-        final = response.message.content or "Unable to produce a final answer in the allotted iterations."
+        final_message = response.choices[0].message
+        reasoning = _extract_reasoning(final_message)
+        if reasoning:
+            yield events.reasoning(reasoning)
+        final = final_message.content or "Unable to produce a final answer in the allotted iterations."
 
         session.memory.add_assistant(final)
         yield events.message(final)
@@ -196,10 +221,23 @@ class AgentRuntime:
 
     async def _handle_tool_call(self, session: ChatSession, call: Any) -> AsyncIterator[dict[str, Any]]:
         name = call.function.name
-        arguments = dict(call.function.arguments or {})
+        arguments = json.loads(call.function.arguments) if call.function.arguments else {}
         call_id = str(uuid.uuid4())
 
         yield events.tool_call(call_id, name, arguments)
+
+        if name not in self.tool_names:
+            available = ", ".join(self.tool_names)
+            text = (
+                f"Error calling tool '{name}': unknown tool. "
+                f"Available tools are: {available}. Call one of these exactly, "
+                "using the arguments from the conversation or a previous tool result, "
+                "or answer directly without a tool call if none of them fit."
+            )
+            logger.warning("Model called unknown tool '%s' (available: %s)", name, available)
+            yield events.tool_result(call_id, name, False, text)
+            session.memory.add_tool_result(name, text, tool_call_id=call.id)
+            return
 
         if session.requires_approval(name):
             pending = session.new_interrupt(call_id, name, arguments)
@@ -213,7 +251,7 @@ class AgentRuntime:
                 if decision.reason:
                     text += f" Reason: {decision.reason}"
                 yield events.tool_result(call_id, name, False, text)
-                session.memory.add_tool_result(name, text)
+                session.memory.add_tool_result(name, text, tool_call_id=call.id)
                 return
             if decision.action == "edit" and decision.arguments is not None:
                 arguments = decision.arguments
@@ -229,7 +267,7 @@ class AgentRuntime:
             logger.error(text)
 
         yield events.tool_result(call_id, name, ok, text)
-        session.memory.add_tool_result(name, text)
+        session.memory.add_tool_result(name, text, tool_call_id=call.id)
 
     async def _await_decision(self, future: "asyncio.Future") -> Any:
         """Wait on a pending interrupt.

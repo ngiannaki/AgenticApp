@@ -46,6 +46,7 @@ $repoRoot  = "C:\Users\Nigia\source\repos\AgenticApp"
 $indexingModule  = "backend.mcp_servers.indexing.server"
 $retrievalModule = "backend.mcp_servers.retrieval.server"
 $dbModule = "backend.mcp_servers.db.server"
+$codeModule = "backend.mcp_servers.code.server"
 $apiModule = "backend.apps.api.main"
 
 # Set this to the folder containing nginx.exe if you want this script to also launch nginx.
@@ -198,20 +199,29 @@ $dbProc = Start-Process -FilePath $pythonExe `
     -WorkingDirectory $repoRoot `
     -PassThru -WindowStyle Normal
 
+# --- Start Code Execution server (port 8003, assumed hardcoded in server.py) ---
+Write-Host "Starting Code Execution MCP server (port 8003)..." -ForegroundColor Cyan
+$codeProc = Start-Process -FilePath $pythonExe `
+    -ArgumentList "-m", $codeModule `
+    -WorkingDirectory $repoRoot `
+    -PassThru -WindowStyle Normal
+
 Write-Host "DB server PID:        $($dbProc.Id)"
+Write-Host "Code server PID:      $($codeProc.Id)"
 
 Write-Host "Indexing server PID:  $($indexingProc.Id)"
 Write-Host "Retrieval server PID: $($retrievalProc.Id)"
 
 # --- Start Agentic API server (port 8100) ---
-# AgentRuntime connects to all three MCP servers at startup and fails fast
+# AgentRuntime connects to all MCP servers at startup and fails fast
 # if they're not reachable yet, so wait for their ports before launching it.
 Write-Host "Waiting for MCP servers before starting the Agentic API..." -ForegroundColor Cyan
 $indexingReady  = Wait-ForPort -ServerName "Indexing MCP server"  -Port 8000
 $retrievalReady = Wait-ForPort -ServerName "Retrieval MCP server" -Port 8001
 $dbReady        = Wait-ForPort -ServerName "DB MCP server"        -Port 8002
+$codeReady      = Wait-ForPort -ServerName "Code Execution MCP server" -Port 8003
 
-if ($indexingReady -and $retrievalReady -and $dbReady) {
+if ($indexingReady -and $retrievalReady -and $dbReady -and $codeReady) {
     Write-Host "Starting Agentic API server (port 8100)..." -ForegroundColor Cyan
     $apiProc = Start-Process -FilePath $pythonExe `
         -ArgumentList "-m", $apiModule `
@@ -241,6 +251,6 @@ if ($nginxDir) {
 Write-Host ""
 Write-Host "All set. Servers are running in their own windows." -ForegroundColor Green
 Write-Host "Closing this window will NOT stop them (they were launched as separate processes)."
-$allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id)
+$allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id, $codeProc.Id)
 if ($apiProc) { $allPids += $apiProc.Id }
 Write-Host "To stop them manually: Stop-Process -Id $($allPids -join ',')"

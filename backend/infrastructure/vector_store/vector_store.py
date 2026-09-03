@@ -2,7 +2,6 @@ import chromadb
 from llama_index.core import Document, VectorStoreIndex
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.storage import StorageContext
-from llama_index.embeddings.ollama import OllamaEmbedding
 import logging
 from pathlib import Path
 import json
@@ -11,41 +10,38 @@ from backend.infrastructure.vector_store.metadata_enhancer import (
     MetadataEnhancer,
     HierarchicalChunker
 )
-from backend.core.config import settings
+from backend.config import get_llamaindex_embedding, settings
 
 logger = logging.getLogger(__name__)
 
 
 class VectorStore:
-    def __init__(self, persist_dir: str = "data/vector_store", ollama_base_url: str = settings.base_url):
+    def __init__(self, persist_dir: str | None = None):
         """
-        Initialize vector store with ChromaDB backend and Ollama embeddings.
+        Initialize vector store with ChromaDB backend and the configured
+        embedding model (Ollama in DEV, OpenAI in PROD).
         Vectors are persisted to disk organized by document_id.
-        
+
         Args:
             persist_dir: Directory where vectors will be persisted
-            ollama_base_url: URL where Ollama is running
         """
         # Create persistence directory
-        self.persist_dir = Path(persist_dir)
+        self.persist_dir = Path(persist_dir or settings.vector_store.dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize Ollama embeddings
-        self.embed_model = OllamaEmbedding(
-            model_name=settings.embedding_model,
-            base_url=ollama_base_url,
-        )
-        
+
+        # Initialize embeddings
+        self.embed_model = get_llamaindex_embedding(settings.embedding_model)
+
         # Initialize ChromaDB persistent client
         # This stores vectors to disk instead of in-memory
         self.chroma_client = chromadb.PersistentClient(
             path=str(self.persist_dir)
         )
-        
+
         # Initialize metadata enhancer and hierarchical chunker
-        self.metadata_enhancer = MetadataEnhancer(ollama_base_url=ollama_base_url)
+        self.metadata_enhancer = MetadataEnhancer()
         self.hierarchical_chunker = HierarchicalChunker()
-        
+
         logger.info(f"Vector store initialized with persistent storage at: {self.persist_dir}")
     
     def index_document_enhanced(

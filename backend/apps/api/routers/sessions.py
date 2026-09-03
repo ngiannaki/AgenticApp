@@ -31,6 +31,7 @@ async def create_session(request: Request, body: CreateSessionRequest) -> Sessio
         system_prompt=body.system_prompt or DEFAULT_SYSTEM_PROMPT,
         max_history_messages=settings.max_history_messages,
         approval_required_tools=approval_required_tools,
+        max_tool_result_chars=settings.max_tool_result_chars,
     )
 
     if store is not None:

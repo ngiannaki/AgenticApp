@@ -8,6 +8,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from fastmcp import FastMCP
+from backend.config import settings
 from backend.core.storage.document_store import DocumentStore
 from backend.mcp_servers.indexing.parsers.pdf import parse_pdf
 from backend.infrastructure.vector_store import VectorStore
@@ -353,8 +354,8 @@ if __name__ == "__main__":
         # Try using FastMCP with HTTP transport and custom config
         mcp.run(
             transport="http",
-            host="0.0.0.0",
-            port=8000,
+            host=settings.indexing_server.host,
+            port=settings.indexing_server.port,
         )
     except TypeError:
         # Fallback: Run with uvicorn directly
@@ -383,7 +384,7 @@ if __name__ == "__main__":
         
         uvicorn.run(
             app,
-            host="0.0.0.0",
-            port=8000,
+            host=settings.indexing_server.host,
+            port=settings.indexing_server.port,
             log_level="info",
         )

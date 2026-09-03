@@ -1,9 +1,7 @@
 import logging
-import os
 from a2a.types import Role
 
 import uvicorn
-from dotenv import load_dotenv
 from starlette.applications import Starlette
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -32,6 +30,8 @@ from a2a.types import (
 )
 from agent import RetrievalAgent
 
+from backend.config import settings
+
 
 def create_agent_message(text: str) -> Message:
     return Message(
@@ -47,25 +47,14 @@ def create_agent_message(text: str) -> Message:
 # Configuration
 # ---------------------------------------------------------
 
-load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
 )
 
 logger = logging.getLogger(__name__)
 
-HOST = os.getenv(
-    "AGENT_HOST",
-    "localhost",
-)
-
-PORT = int(
-    os.getenv(
-        "RETRIEVAL_AGENT_PORT",
-        "9999",
-    )
-)
+HOST = settings.retrieval_agent.host
+PORT = settings.retrieval_agent.port
 
 
 # =========================================================

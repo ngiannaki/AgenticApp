@@ -40,6 +40,8 @@ def _to_step(event: dict[str, Any]) -> dict[str, Any] | None:
 
     if kind == "status":
         return {"id": step_id, "type": "status", "message": data.get("message")}
+    if kind == "reasoning":
+        return {"id": step_id, "type": "reasoning", "content": data.get("content")}
     if kind == "tool_call":
         return {
             "id": step_id,
@@ -90,6 +92,7 @@ async def _rehydrate_session(request: Request, session_id: str) -> Any:
         max_history_messages=settings.max_history_messages,
         approval_required_tools=settings.approval_required_tools,
         history=history,
+        max_tool_result_chars=settings.max_tool_result_chars,
     )
     logger.info("Rehydrated session %s from %d persisted message(s)", session_id, len(history))
     return session

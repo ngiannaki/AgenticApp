@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.apps.api.config import get_api_settings
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import chat, conversations, interrupts, sessions, tools
+from backend.apps.api.routers import chat, conversations, files, interrupts, sessions, tools
 from backend.apps.api.sessions import SessionManager
 from backend.apps.api.streaming_agent import AgentRuntime
 
@@ -110,6 +110,7 @@ def create_app() -> FastAPI:
     app.include_router(interrupts.router)
     app.include_router(tools.router)
     app.include_router(conversations.router)
+    app.include_router(files.router)
 
     @app.get("/api/health")
     def health() -> dict:

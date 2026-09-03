@@ -1,0 +1,10 @@
+# This repo has no root dependency manifest (backend/pyproject.toml is
+# empty; packages are just installed into the shared .venv). run_python_code
+# needs nothing beyond what every other server here already needs (fastmcp,
+# pydantic) and the Python standard library (subprocess, ast, shlex).
+# generate_file needs python-docx and openpyxl — both already installed in
+# this repo's venv (used elsewhere for document parsing), listed here only
+# so this file documents the server's real dependency surface.
+
+python-docx>=1.1,<2
+openpyxl>=3.1,<4

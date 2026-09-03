@@ -8,12 +8,12 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 #from config.settings import get_use_google_api
 
-from backend.core.config import settings
+from backend.config import settings
 
 logger = logging.getLogger(__name__)
-PROJECT_ID = "project-db0446e6-5527-4b1b-ba4"
+PROJECT_ID = settings.google_docai.project_id
 LOCATION = "us-central1"
-OLLAMA_BASE_URL = settings.base_url
+OLLAMA_BASE_URL = settings.ollama.base_url
 OLLAMA_CHAT_MODEL = settings.chat_model
 OLLAMA_EMBEDDING_MODEL = settings.embedding_model
 # VERTEX_CHAT_MODEL = os.getenv("VERTEX_CHAT_MODEL", "gemini-2.5-flash")

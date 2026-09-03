@@ -10,6 +10,9 @@
     },
     "db": {
       "url": "http://localhost:8002/mcp"
+    },
+    "code": {
+      "url": "http://localhost:8003/mcp"
     }
   },
 

@@ -38,12 +38,7 @@ import os
 from pathlib import Path
 from typing import Any, List, Optional
 
-from dotenv import load_dotenv
-
-# Load .env from repo root if present
-_ENV_FILE = Path(__file__).resolve().parents[2] / "src" / "datasage" / ".env"
-if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE)
+from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -51,20 +46,21 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-GOOGLE_DOCAI_PROJECT_ID = os.getenv("GOOGLE_DOCAI_PROJECT_ID", "project-db0446e6-5527-4b1b-ba4")
-GOOGLE_DOCAI_LOCATION = os.getenv("GOOGLE_DOCAI_LOCATION", "eu")
-GOOGLE_DOCAI_PROCESSOR_ID = os.getenv("GOOGLE_DOCAI_PROCESSOR_ID", "45e6c24dbbd65e16")
+GOOGLE_DOCAI_PROJECT_ID = settings.google_docai.project_id
+GOOGLE_DOCAI_LOCATION = settings.google_docai.location
+GOOGLE_DOCAI_PROCESSOR_ID = settings.google_docai.processor_id
 
-# Bootstrap Google ADC from repo-local credentials file if env var is not set
-_DEFAULT_ADC = Path(__file__).resolve().parents[2] / "google" / "application_default_credentials.json"
-if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ and _DEFAULT_ADC.exists():
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_DEFAULT_ADC)
+# Bootstrap Google ADC from a configured credentials file if the env var isn't already set
+if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ and settings.google_docai.credentials_path:
+    _credentials_path = Path(settings.google_docai.credentials_path)
+    if _credentials_path.exists():
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_credentials_path)
 
 # ---------------------------------------------------------------------------
-# Runtime flag (mirrors config.settings.USE_GOOGLE_PARSER)
+# Runtime flag (mirrors settings.google_docai.use_parser)
 # ---------------------------------------------------------------------------
 
-_USE_GOOGLE_PARSER: bool = os.getenv("USE_GOOGLE_PARSER", "false").lower() == "true"
+_USE_GOOGLE_PARSER: bool = settings.google_docai.use_parser
 
 
 def get_use_google_parser() -> bool:

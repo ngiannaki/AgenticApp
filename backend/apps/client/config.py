@@ -15,7 +15,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from backend.core.config import settings
+from backend.config import settings
 DEFAULT_SERVERS_PATH = Path(__file__).parent / "servers.json"
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -30,9 +30,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "for it instead of calling the tool with a made-up value. "
     "If the user's message is empty, unclear, or not an actionable request, "
     "ask a clarifying question instead of calling a tool. "
-    "When you do have enough real information, call the tool with correct, "
-    "complete arguments, then give a direct, concise final answer grounded "
-    "in the tool's actual result, without narrating your tool usage."
+    "A single request often needs more than one tool call before you can answer "
+    "— e.g. retrieving data is not the end goal if the user also asked you to "
+    "chart, summarize, or save it; that follow-up step is part of the same "
+    "request, not a separate one. After a tool result, decide whether it fully "
+    "satisfies everything the user asked for; if not, call the next tool that "
+    "gets you there instead of answering early. "
+    "When you do have enough real information to satisfy the whole request, "
+    "give a direct, concise final answer grounded in the tools' actual results, "
+    "without narrating your tool usage."
 )
 
 
@@ -42,8 +48,10 @@ class AgentConfig(BaseModel):
     servers: dict = Field(default_factory=dict)
     """FastMCP-style {'mcpServers': {...}} mapping."""
 
-    ollama_base_url: str = settings.base_url
-    ollama_model: str = settings.chat_model
+    # This CLI talks to Ollama's native API directly (ollama.Client in agent.py),
+    # so it always uses the DEV model regardless of ENVIRONMENT.
+    ollama_base_url: str = settings.ollama.base_url
+    ollama_model: str = settings.chat.dev
 
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     max_iterations: int = 15

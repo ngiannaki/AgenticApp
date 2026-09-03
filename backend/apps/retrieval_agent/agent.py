@@ -1,14 +1,12 @@
 import json
 import logging
-import os
 from typing import Any
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from openai import AsyncOpenAI
 
-from backend.core.config import settings
+from backend.config import get_async_openai_client, get_ollama_extra_body, settings
 
 logger = logging.getLogger(__name__)
 
@@ -75,37 +73,17 @@ class RetrievalAgent:
         # Configuration
         # ---------------------------------------------------------
 
-        self.ollama_base_url = f"{settings.base_url}/v1"
+        self.model = settings.retrieval_agent_model
 
-        self.model = settings.chat_model
-
-        self.mcp_url = os.getenv(
-            "RETRIEVAL_MCP_URL",
-            "http://localhost:8001/mcp",
-        )
-
-        self.top_k = int(
-            os.getenv(
-                "RETRIEVAL_TOP_K",
-                "10",
-            )
-        )
-
-        self.max_iterations = int(
-            os.getenv(
-                "RETRIEVAL_MAX_ITERATIONS",
-                "5",
-            )
-        )
+        self.mcp_url = settings.retrieval_agent.mcp_url
+        self.top_k = settings.retrieval_agent.top_k
+        self.max_iterations = settings.retrieval_agent.max_iterations
 
         # ---------------------------------------------------------
-        # Ollama
+        # LLM (Ollama in DEV, OpenAI in PROD — see backend/config)
         # ---------------------------------------------------------
 
-        self.llm = AsyncOpenAI(
-            base_url=self.ollama_base_url,
-            api_key="ollama",
-        )
+        self.llm = get_async_openai_client()
 
         logger.info(
             "RetrievalAgent initialized "
@@ -360,7 +338,8 @@ Rules:
                 },
             ],
             temperature=0,
-            response_format={"type":"json_object"}
+            response_format={"type":"json_object"},
+            extra_body=get_ollama_extra_body(),
         )
 
         content = (
@@ -438,6 +417,7 @@ Instructions:
                 },
             ],
             temperature=0,
+            extra_body=get_ollama_extra_body(),
         )
 
         content = (

@@ -8,6 +8,8 @@ Event types
 -----------
 session   - session_id + connected tool names (sent once, stream open)
 status    - free-text progress note ("thinking", "iteration 2/15", ...)
+reasoning - the model's chain-of-thought for one LLM call, when the model
+            returns one (currently: gpt-oss:20b via Ollama's "reasoning" field)
 tool_call - the model requested a tool call (call_id, name, arguments)
 interrupt - a tool call is paused pending human approval (interrupt_id, ...)
 tool_result - a tool call finished (call_id, name, ok, result)
@@ -27,6 +29,10 @@ def sse(event: str, data: dict[str, Any]) -> dict[str, Any]:
 
 def status(message: str, **extra: Any) -> dict[str, Any]:
     return sse("status", {"message": message, **extra})
+
+
+def reasoning(content: str) -> dict[str, Any]:
+    return sse("reasoning", {"content": content})
 
 
 def tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

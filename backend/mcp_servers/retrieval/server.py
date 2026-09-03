@@ -8,6 +8,7 @@ if str(project_root) not in sys.path:
 
 from fastmcp import FastMCP
 import logging
+from backend.config import settings
 from backend.mcp_servers.retrieval.retriever import DocumentRetriever
 
 # Ensure logs directory exists
@@ -177,6 +178,6 @@ def summarize_document(document_id: str, query: str) -> dict:
 if __name__ == "__main__":
     mcp.run(
         transport="http",
-        host="0.0.0.0",
-        port=8001,
+        host=settings.retrieval_server.host,
+        port=settings.retrieval_server.port,
     )

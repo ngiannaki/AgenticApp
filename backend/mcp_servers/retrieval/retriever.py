@@ -1,13 +1,11 @@
 from llama_index.core import VectorStoreIndex
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.storage import StorageContext
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.ollama import OllamaEmbedding
 import chromadb
 import logging
 from pathlib import Path
 from backend.infrastructure.reranking import Reranker, QueryNormalizer
-from backend.core.config import settings
+from backend.config import get_llamaindex_embedding, get_llamaindex_llm, settings
 
 logger = logging.getLogger(__name__)
 # Ensure logger has handlers configured
@@ -20,50 +18,37 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-# Configuration
-VECTOR_STORE_DIR = "data/vector_store"
-OLLAMA_BASE_URL = settings.base_url
-OLLAMA_CHAT_MODEL = settings.chat_model
-OLLAMA_EMBEDDING_MODEL = settings.embedding_model
-
 
 class DocumentRetriever:
-    """RAG-based document retriever using Ollama and ChromaDB with reranking."""
+    """RAG-based document retriever using ChromaDB with reranking, and the
+    configured LLM/embedding model (Ollama in DEV, OpenAI in PROD)."""
 
     def __init__(
         self,
-        persist_dir: str = VECTOR_STORE_DIR,
-        ollama_base_url: str = OLLAMA_BASE_URL,
+        persist_dir: str | None = None,
         use_reranker: bool = True,
-        relevance_threshold: float = 0.1
+        relevance_threshold: float | None = None,
     ):
-        self.persist_dir = Path(persist_dir)
-        self.ollama_base_url = ollama_base_url
+        self.persist_dir = Path(persist_dir or settings.vector_store.dir)
 
         # Initialize ChromaDB persistent client
         self.chroma_client = chromadb.PersistentClient(
             path=str(self.persist_dir)
         )
 
-        # Initialize Ollama LLM
-        self.llm = Ollama(
-            model=OLLAMA_CHAT_MODEL,
-            base_url=ollama_base_url,
-            temperature=0.7,
-        )
+        # Initialize LLM used for answer synthesis
+        self.llm = get_llamaindex_llm(settings.retrieval_model, temperature=settings.retrieval_temperature)
 
-        # Initialize Ollama embeddings
-        self.embed_model = OllamaEmbedding(
-            model_name=OLLAMA_EMBEDDING_MODEL,
-            base_url=ollama_base_url,
-        )
+        # Initialize embeddings
+        self.embed_model = get_llamaindex_embedding(settings.embedding_model)
 
         # Initialize reranker for post-retrieval scoring
-        self.reranker = Reranker(relevance_threshold) if use_reranker else None
+        threshold = relevance_threshold if relevance_threshold is not None else settings.reranking.retrieval_threshold
+        self.reranker = Reranker(threshold) if use_reranker else None
 
         logger.info(f"DocumentRetriever initialized with ChromaDB at {self.persist_dir}")
         if self.reranker:
-            logger.info(f"Reranker enabled with threshold: {relevance_threshold}")
+            logger.info(f"Reranker enabled with threshold: {threshold}")
     
     def query(self, document_id: str, query: str, top_k: int = 5) -> dict:
         """
