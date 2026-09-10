@@ -25,24 +25,41 @@ class DocumentStore:
 
     def get_pdf_path(self, document_id: str) -> Path:
         """
-        Return the PDF path for a document.
+        Return the PDF path for a document. Back-compat wrapper for callers
+        that only ever dealt with PDFs (server.py's parse_document) — new
+        code should use get_file_path, which works for any stored extension.
+        """
+
+        return self.get_document_dir(document_id) / "original.pdf"
+
+    def get_file_path(self, document_id: str) -> Path | None:
+        """
+        Return the stored file's path regardless of its original extension
+        (stored as `original{ext}`), or None if nothing has been stored yet.
         """
 
         document_dir = self.get_document_dir(document_id)
+        if not document_dir.exists():
+            return None
 
-        return document_dir / "document.pdf"
+        matches = list(document_dir.glob("original.*"))
+        return matches[0] if matches else None
 
     def create_document(
         self,
-        pdf_bytes: bytes,
+        file_bytes: bytes,
         document_id: str,
+        filename: str = "document.pdf",
     ) -> Path:
         """
-        Store a new PDF.
+        Store a new file of any supported type.
 
         Creates:
 
-        data/documents/{document_id}/document.pdf
+        data/documents/{document_id}/original{ext}
+
+        where {ext} is taken from `filename` (defaults to .pdf for back-compat
+        with callers that only ever pass raw PDF bytes).
         """
 
         document_dir = self.get_document_dir(
@@ -54,14 +71,15 @@ class DocumentStore:
             exist_ok=True,
         )
 
-        pdf_path = document_dir / "document.pdf"
+        extension = Path(filename).suffix or ".pdf"
+        file_path = document_dir / f"original{extension}"
 
-        pdf_path.write_bytes(pdf_bytes)
+        file_path.write_bytes(file_bytes)
 
-        return pdf_path
+        return file_path
 
     def exists(self, document_id: str) -> bool:
-        return self.get_pdf_path(document_id).exists()
+        return self.get_file_path(document_id) is not None
 
     def delete(self, document_id: str) -> None:
 

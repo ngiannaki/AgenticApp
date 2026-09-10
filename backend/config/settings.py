@@ -308,6 +308,16 @@ class CodeMcpSettings(BaseSettings):
         description="When allow_shell_commands is true, only commands whose first token matches one of these (case-insensitive, extension-stripped) are permitted.",
     )
 
+    # --- Generative UI tool (on by default; the one operator-facing kill switch) --
+    allow_ui_generation: bool = Field(
+        default=True,
+        description="Master switch for the generate_ui tool. When false, the tool isn't registered with the MCP server at all, so the model never sees it and can't call it — turn off here to stop generative-UI usage instantly without touching the frontend or the model's system prompt.",
+    )
+    max_ui_html_length: int = Field(
+        default=200_000, gt=0,
+        description="Max characters accepted as the generate_ui tool's html input.",
+    )
+
     # --- Logging -------------------------------------------------------------------
     log_dir: str = Field(default="logs")
     log_level: str = Field(default="INFO")
@@ -344,9 +354,20 @@ class RetrievalAgentSettings(BaseSettings):
 
 
 class VectorStoreSettings(BaseSettings):
+    """Chroma is run as its own server process (see start_mcp_servers.ps1)
+    rather than opened in-process via PersistentClient, because the indexing
+    and retrieval MCP servers are two separate long-lived processes — two
+    independent PersistentClient instances against the same on-disk store
+    don't reliably see each other's writes (Chroma's embedded client caches
+    collection state per-process), so a document indexed after the retrieval
+    server started could look like it doesn't exist. Routing both through one
+    HttpClient/server gives them a single consistent view."""
+
     model_config = _settings_config("VECTOR_STORE_")
 
     dir: str = "data/vector_store"
+    host: str = "localhost"
+    port: int = 8010
 
 
 class DocumentStoreSettings(BaseSettings):
@@ -368,6 +389,25 @@ class RerankingSettings(BaseSettings):
     model_config = _settings_config("RERANK_")
 
     retrieval_threshold: float = Field(default=0.1, description="Relevance threshold used by the retrieval MCP server's reranker.")
+
+
+class AuthSettings(BaseSettings):
+    """Email/password auth for the API (backend/apps/api/auth.py)."""
+
+    model_config = _settings_config("AUTH_")
+
+    dev_bypass: bool = Field(
+        default=False,
+        description=(
+            "Local-dev-only escape hatch, independent of ENVIRONMENT. When true, every "
+            "request is treated as one seeded test account (dev_bypass_email) and the "
+            "frontend skips the sign-in screen entirely — no token required. Never enable "
+            "this in a deployment reachable by more than one person."
+        ),
+    )
+    dev_bypass_email: str = "dev@local.test"
+    dev_bypass_password: str = "dev-password"
+    """Only used to seed the bypass account at startup; never required to authenticate while dev_bypass is on."""
 
 
 class GoogleDocAISettings(BaseSettings):
@@ -413,6 +453,7 @@ class Settings:
         self.artifact_store = ArtifactStoreSettings()
         self.reranking = RerankingSettings()
         self.google_docai = GoogleDocAISettings()
+        self.auth = AuthSettings()
 
     # --- environment helpers -------------------------------------------------
     @property

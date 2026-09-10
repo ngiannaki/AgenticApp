@@ -28,12 +28,22 @@ class DocumentRetriever:
         persist_dir: str | None = None,
         use_reranker: bool = True,
         relevance_threshold: float | None = None,
+        host: str | None = None,
+        port: int | None = None,
     ):
         self.persist_dir = Path(persist_dir or settings.vector_store.dir)
 
-        # Initialize ChromaDB persistent client
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(self.persist_dir)
+        # Connect to the standalone Chroma server (started by
+        # start_mcp_servers.ps1) rather than opening the on-disk store
+        # in-process — this retriever and the indexing server's VectorStore
+        # run in separate processes, and two independent PersistentClients
+        # against the same directory don't reliably see each other's writes
+        # (a document indexed after this process started could otherwise
+        # look like it doesn't exist). An HttpClient against one shared
+        # server gives both processes a consistent view.
+        self.chroma_client = chromadb.HttpClient(
+            host=host or settings.vector_store.host,
+            port=port or settings.vector_store.port,
         )
 
         # Initialize LLM used for answer synthesis
@@ -49,8 +59,22 @@ class DocumentRetriever:
         logger.info(f"DocumentRetriever initialized with ChromaDB at {self.persist_dir}")
         if self.reranker:
             logger.info(f"Reranker enabled with threshold: {threshold}")
-    
-    def query(self, document_id: str, query: str, top_k: int = 5) -> dict:
+
+    def _check_ownership(self, collection, document_id: str, user_id: str | None) -> bool:
+        """A document indexed with no user_id (legacy/dev data) is treated as
+        unowned and accessible to anyone, to avoid locking out pre-auth data.
+        Once a document has an owner, only that user_id may access it —
+        this is the actual per-user isolation boundary, enforced here rather
+        than trusted from any caller-supplied argument at a higher layer."""
+        owner = (collection.metadata or {}).get("user_id")
+        if owner and owner != user_id:
+            logger.warning(
+                f"[OWNERSHIP] Denied access to document {document_id} for user_id={user_id!r} (owned by {owner!r})"
+            )
+            return False
+        return True
+
+    def query(self, document_id: str, query: str, top_k: int = 5, user_id: str | None = None) -> dict:
         """
         Query a document and get an answer using RAG with reranking.
 
@@ -77,6 +101,13 @@ class DocumentRetriever:
                 logger.info(f"[QUERY] Collection found: {collection_name}")
             except ValueError:
                 logger.error(f"[QUERY] Collection not found: {collection_name}")
+                return {
+                    "success": False,
+                    "document_id": document_id,
+                    "error": f"Document not found in vector store: {document_id}"
+                }
+
+            if not self._check_ownership(collection, document_id, user_id):
                 return {
                     "success": False,
                     "document_id": document_id,
@@ -206,20 +237,20 @@ class DocumentRetriever:
 
         return enriched_chunks
 
-    def get_document_metadata(self, document_id: str) -> dict:
+    def get_document_metadata(self, document_id: str, user_id: str | None = None) -> dict:
         """
         Get enhanced metadata for a document from vector store collection metadata.
-        
+
         Args:
             document_id: UUID of the document
-        
+
         Returns:
             Dictionary with document metadata
         """
         try:
             # Get the collection
             collection_name = f"doc_{document_id}"
-            
+
             try:
                 collection = self.chroma_client.get_collection(name=collection_name)
             except ValueError:
@@ -228,7 +259,14 @@ class DocumentRetriever:
                     "document_id": document_id,
                     "error": f"Document not found in vector store: {document_id}"
                 }
-            
+
+            if not self._check_ownership(collection, document_id, user_id):
+                return {
+                    "success": False,
+                    "document_id": document_id,
+                    "error": f"Document not found in vector store: {document_id}"
+                }
+
             # Get collection metadata
             collection_metadata = collection.metadata or {}
             
@@ -295,6 +333,7 @@ class DocumentRetriever:
         document_id: str,
         query: str,
         top_k: int = 5,
+        user_id: str | None = None,
     ) -> dict:
         """
         Retrieve relevant chunks from a document with reranking.
@@ -324,6 +363,14 @@ class DocumentRetriever:
                         f"Document not found in vector store: "
                         f"{document_id}"
                     ),
+                }
+
+            if not self._check_ownership(collection, document_id, user_id):
+                return {
+                    "success": False,
+                    "document_id": document_id,
+                    "query": query,
+                    "error": f"Document not found in vector store: {document_id}",
                 }
 
             chroma_vector_store = ChromaVectorStore(

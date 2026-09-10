@@ -49,6 +49,11 @@ $dbModule = "backend.mcp_servers.db.server"
 $codeModule = "backend.mcp_servers.code.server"
 $apiModule = "backend.apps.api.main"
 
+# Chroma exe lives alongside python.exe in the venv's Scripts folder.
+$chromaExe = Join-Path (Split-Path $pythonExe -Parent) "chroma.exe"
+$chromaPort = 8010
+$chromaDataDir = Join-Path $repoRoot "data\vector_store"
+
 # Set this to the folder containing nginx.exe if you want this script to also launch nginx.
 # Leave as $null to skip starting nginx automatically.
 $nginxDir       = "C:\Users\Nigia\nginx-1.31.3"   # e.g. "C:\nginx-1.25.3"
@@ -178,6 +183,29 @@ if ($LASTEXITCODE -eq 0) {
 
 $ErrorActionPreference = $prevErrorActionPreference
 
+# --- Start Chroma vector store server ---
+# Indexing (VectorStore) and Retrieval (DocumentRetriever) are separate
+# processes, so they can't each open the on-disk Chroma store directly
+# (PersistentClient) and reliably see each other's writes — one process's
+# in-memory view of the store can go stale relative to the other's writes.
+# Routing both through a single `chroma run` server via HttpClient fixes
+# that; both must connect to it, so start it before them and wait for it.
+Write-Host "Starting Chroma vector store server (port $chromaPort)..." -ForegroundColor Cyan
+if (-not (Test-Path $chromaExe)) {
+    Write-Warning "chroma.exe not found at $chromaExe - the indexing/retrieval servers will fail to connect to the vector store."
+} else {
+    New-Item -ItemType Directory -Force -Path $chromaDataDir | Out-Null
+    $chromaProc = Start-Process -FilePath $chromaExe `
+        -ArgumentList "run", "--path", $chromaDataDir, "--port", $chromaPort `
+        -WorkingDirectory $repoRoot `
+        -PassThru -WindowStyle Normal
+    Write-Host "Chroma server PID: $($chromaProc.Id)"
+    $chromaReady = Wait-ForPort -ServerName "Chroma vector store server" -Port $chromaPort
+    if (-not $chromaReady) {
+        Write-Warning "Chroma server never came up - the indexing/retrieval MCP servers will fail to connect to the vector store."
+    }
+}
+
 # --- Start Indexing server (port 8000, hardcoded in server.py) ---
 Write-Host "Starting Indexing MCP server (port 8000)..." -ForegroundColor Cyan
 $indexingProc = Start-Process -FilePath $pythonExe `
@@ -252,5 +280,6 @@ Write-Host ""
 Write-Host "All set. Servers are running in their own windows." -ForegroundColor Green
 Write-Host "Closing this window will NOT stop them (they were launched as separate processes)."
 $allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id, $codeProc.Id)
+if ($chromaProc) { $allPids += $chromaProc.Id }
 if ($apiProc) { $allPids += $apiProc.Id }
 Write-Host "To stop them manually: Stop-Process -Id $($allPids -join ',')"

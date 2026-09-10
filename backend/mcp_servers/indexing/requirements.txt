@@ -1,0 +1,25 @@
+# This repo has no root dependency manifest (backend/pyproject.toml is
+# empty; packages are just installed into the shared .venv). Listed here so
+# this file documents the indexing server's real dependency surface.
+#
+# read_document (pdf/csv/xlsx/txt/docx/pptx) needs pymupdf, openpyxl,
+# python-docx and python-pptx; csv/txt use only the standard library. PDF
+# markdown rendering additionally uses docling + llama-index-core (via
+# parsers/pdf_markdown.py + document_parser.py) when installed;
+# pdf_markdown.py degrades gracefully to plain pymupdf text if either import
+# fails, so these two are soft dependencies in practice — pinned here because
+# they're already installed in this repo's venv.
+#
+# upload_and_index_document / parse_and_index_enhanced need fastmcp (already
+# required repo-wide).
+#
+# parsers.py (Google Document AI backend) is not currently wired into
+# server.py's tools — its extra dependency (google-cloud-documentai) is
+# intentionally not listed here.
+
+pymupdf>=1.24,<2
+openpyxl>=3.1,<4
+docling>=2.100,<3
+llama-index-core>=0.14,<0.15
+python-docx>=1.1,<2
+python-pptx>=1.0,<2

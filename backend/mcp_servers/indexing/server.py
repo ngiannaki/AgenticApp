@@ -10,7 +10,14 @@ if str(project_root) not in sys.path:
 from fastmcp import FastMCP
 from backend.config import settings
 from backend.core.storage.document_store import DocumentStore
+from backend.mcp_servers.indexing.parsers.csv_reader import parse_csv
+from backend.mcp_servers.indexing.parsers.detect import detect_document_type_from_filename
+from backend.mcp_servers.indexing.parsers.docx_reader import parse_docx
 from backend.mcp_servers.indexing.parsers.pdf import parse_pdf
+from backend.mcp_servers.indexing.parsers.pptx_reader import parse_pptx
+from backend.mcp_servers.indexing.parsers.reader import read_document as _read_document
+from backend.mcp_servers.indexing.parsers.txt_reader import parse_txt
+from backend.mcp_servers.indexing.parsers.xlsx_reader import parse_xlsx
 from backend.infrastructure.vector_store import VectorStore
 import logging
 from uuid import uuid4
@@ -39,7 +46,15 @@ mcp = FastMCP("indexing")
 @mcp.tool
 def upload_document(pdf_base64: str = None, file_path: str = None) -> dict: # type: ignore
     """
-    Upload a PDF document to the server.
+    Upload a PDF document to the server so it can be parsed and indexed
+    (see parse_and_index_enhanced) into the vector store for later search.
+
+    PDF only — takes exactly these two optional args, nothing else (no
+    file_name/filename param exists; the server generates a document_id and
+    that's what identifies the document afterward). For CSV, XLSX, TXT/MD,
+    or a PDF you just want to read (not index for search), use
+    read_document(file_path) instead — it reads the file directly and
+    returns its content in one call, no document_id/store involved.
 
     Can accept either:
     - pdf_base64: The PDF file encoded as base64 string (for small files)
@@ -80,8 +95,9 @@ def upload_document(pdf_base64: str = None, file_path: str = None) -> dict: # ty
             pdf_bytes = base64.b64decode(pdf_base64)
         
         store.create_document(
-            pdf_bytes=pdf_bytes,
+            file_bytes=pdf_bytes,
             document_id=document_id,
+            filename="document.pdf",
         )
         logger.info(f"[UPLOAD] Stored PDF for UUID: {document_id} ({len(pdf_bytes)} bytes)")
         
@@ -103,6 +119,11 @@ def upload_document_bytes(pdf_bytes: bytes) -> dict:
     """
     Upload a PDF document to the server by sending its raw bytes directly.
 
+    PDF only — takes exactly this one arg (no file_name/filename param; the
+    server generates a document_id). For CSV, XLSX, or TXT/MD, or a PDF you
+    just want to read rather than index for search, use read_document
+    instead (note: read_document takes a server-local file_path, not bytes).
+
     Use this instead of upload_document's file_path option when the MCP
     client and server are not on the same machine (e.g. connecting through
     nginx/Cloudflare), since file_path is resolved on the server's local
@@ -122,8 +143,9 @@ def upload_document_bytes(pdf_bytes: bytes) -> dict:
 
     try:
         store.create_document(
-            pdf_bytes=pdf_bytes,
+            file_bytes=pdf_bytes,
             document_id=document_id,
+            filename="document.pdf",
         )
         logger.info(f"[UPLOAD_BYTES] Stored PDF for UUID: {document_id} ({len(pdf_bytes)} bytes)")
 
@@ -139,6 +161,163 @@ def upload_document_bytes(pdf_bytes: bytes) -> dict:
             "success": False,
             "error": str(e)
         }
+
+
+def _parse_for_indexing(file_path: Path, content_type: str) -> dict:
+    """Dispatch to the right parser and normalize its result into the shape
+    index_document_enhanced expects: 'pages'+'full_text'+'markdown' for
+    pdf/pptx/docx/txt, or 'sheets' for csv/xlsx."""
+    if content_type == "pdf":
+        return parse_pdf(str(file_path))
+    if content_type == "pptx":
+        return parse_pptx(file_path)
+    if content_type == "docx":
+        return parse_docx(file_path)
+    if content_type == "txt":
+        return parse_txt(file_path)
+    if content_type == "csv":
+        result = parse_csv(file_path)
+        return {"sheets": [{"name": file_path.stem, "headers": result["headers"], "rows": result["rows"]}]}
+    if content_type == "xlsx":
+        result = parse_xlsx(file_path)
+        return {"sheets": [{"name": s["name"], "headers": s["headers"], "rows": s["rows"]} for s in result["sheets"]]}
+    raise ValueError(f"Unsupported content type: {content_type}")
+
+
+@mcp.tool
+def upload_and_index_document(file_b64: str, filename: str, user_id: str) -> dict:
+    """
+    Upload and index a document of any supported type in one step:
+    pdf, csv, xlsx/xlsm, txt, md, log, docx, or pptx.
+
+    Detects the type from `filename`'s extension, stores the raw bytes,
+    parses it with the matching reader, and indexes it into the vector store
+    using type-appropriate chunking (row-group chunks for csv/xlsx,
+    heading/page-aware hierarchical chunks for everything else) so it becomes
+    retrievable via retrieve_document(document_id, query).
+
+    `user_id` scopes ownership — every chunk's metadata is stamped with it,
+    and retrieve_document/get_document_info refuse to return results for a
+    document belonging to a different user_id. This argument is always
+    supplied by the calling application (never by an end user's free-text
+    request) — do not ask the user for a user_id.
+
+    Args:
+        file_b64: The file's raw bytes, base64-encoded. Deliberately a plain
+            `str` decoded manually below rather than a `bytes`-typed
+            parameter — a `bytes` parameter's JSON-over-the-wire coercion is
+            ambiguous (pydantic's default treats an incoming JSON string as
+            literal UTF-8 text, not base64, so arbitrary binary — e.g. a PDF
+            — would round-trip corrupted or fail outright on non-UTF-8 bytes).
+        filename: Original filename (used to detect type and for display)
+        user_id: Owner of this document
+
+    Returns:
+        A dictionary with document_id, content_type, and chunks_indexed
+    """
+    document_id = str(uuid4())
+    logger.info(f"[UPLOAD_AND_INDEX] user={user_id} filename={filename} UUID: {document_id}")
+
+    try:
+        file_bytes = base64.b64decode(file_b64)
+    except Exception as e:
+        logger.warning(f"[UPLOAD_AND_INDEX] user={user_id} invalid base64 for {filename}: {e}")
+        return {"success": False, "error": f"Invalid base64 file content: {e}"}
+
+    try:
+        content_type = detect_document_type_from_filename(filename, fallback_bytes=file_bytes[:4096])
+    except ValueError as e:
+        logger.warning(f"[UPLOAD_AND_INDEX] user={user_id} rejected {filename}: {e}")
+        return {"success": False, "error": str(e)}
+
+    try:
+        file_path = store.create_document(file_bytes=file_bytes, document_id=document_id, filename=filename)
+        logger.info(f"[UPLOAD_AND_INDEX] user={user_id} stored {document_id} as {content_type} ({len(file_bytes)} bytes)")
+
+        parsed_content = _parse_for_indexing(file_path, content_type)
+
+        index_result = vector_store.index_document_enhanced(
+            document_id=document_id,
+            parsed_content=parsed_content,
+            document_name=filename,
+            use_hierarchical=True,
+            extract_metadata=True,
+            content_type=content_type,
+            extra_metadata={"user_id": user_id},
+        )
+
+        if not index_result.get("success"):
+            logger.error(f"[UPLOAD_AND_INDEX] user={user_id} indexing failed for {document_id}: {index_result.get('error')}")
+            return {"success": False, "document_id": document_id, "error": index_result.get("error", "Indexing failed")}
+
+        logger.info(
+            f"[UPLOAD_AND_INDEX] user={user_id} indexed {document_id}: "
+            f"{index_result.get('chunks_indexed', 0)} chunks"
+        )
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "filename": filename,
+            "content_type": content_type,
+            "chunks_indexed": index_result.get("chunks_indexed", 0),
+        }
+    except Exception as e:
+        logger.error(f"[UPLOAD_AND_INDEX] user={user_id} failed for {document_id}: {str(e)}", exc_info=True)
+        return {"success": False, "document_id": document_id, "error": str(e)}
+
+
+@mcp.tool
+def read_document(file_path: str, format: str = "markdown") -> dict:
+    """Read a PDF, CSV, XLSX, or TXT/MD/LOG file and return its content.
+
+    Detects the file's type from its extension (falling back to magic bytes
+    for a mislabeled extension, and to a text-decode check for an unknown
+    one) and parses it with the matching reader — Docling (falling back to
+    pymupdf) for PDF, the stdlib csv module (with delimiter sniffing) for
+    CSV, openpyxl for XLSX, plain UTF-8 for TXT/MD/LOG. Use this instead of
+    upload_document + parse_document when you just need a file's content
+    read into the conversation (not indexed into the vector store), or for
+    any format other than PDF.
+
+    `format` controls how `content` is rendered:
+    - "markdown" (default): tables render as real `| markdown | tables |`;
+      PDFs additionally get heading structure from Docling's layout
+      analysis when Docling is available, falling back to plain text
+      wrapped with `## Page N` headers when it isn't.
+    - "text": flat plain text, no markdown syntax.
+    Prefer markdown when you'll show the content to a user or another LLM
+    step (it preserves table/heading structure); use text if you need the
+    raw content with no formatting markup.
+
+    `file_path` is resolved on the server's local filesystem — same
+    constraint as upload_document's file_path option (see
+    upload_document_bytes if the file only exists on the client).
+
+    Returns `{success, type, format, filename, content, ...}` on success,
+    where `content` is the rendering in the requested format and `...` is
+    type-specific: PDF adds `page_count`/`pages`; CSV adds
+    `headers`/`rows`/`row_count`/`column_count`; XLSX adds
+    `sheets`/`sheet_count` (each sheet has its own `headers`/`rows`); TXT
+    adds `line_count`/`char_count`. On failure returns `{success: False,
+    error}`.
+    """
+    logger.info(f"[READ_DOCUMENT] Reading file: {file_path} (format={format})")
+
+    try:
+        result = _read_document(file_path, format=format)
+        result["success"] = True
+        logger.info(
+            f"[READ_DOCUMENT] Parsed {file_path} as type={result.get('type')}"
+        )
+        return result
+    except Exception as e:
+        logger.error(f"[READ_DOCUMENT] Failed for {file_path}: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 
 def parse_document(document_id: str) -> dict:
     """

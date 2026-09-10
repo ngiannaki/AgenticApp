@@ -91,15 +91,21 @@ def retrieve_document(
     document_id: str,
     query: str,
     top_k: int = 5,
+    user_id: str = "",
 ) -> dict:
     """
     Retrieve relevant chunks from a document.
 
     This tool performs vector retrieval only.
     It does not generate an answer.
+
+    `user_id` is always injected by the calling application (never asked of
+    the end user) and is checked against the document's owner — a mismatch
+    returns the same "not found" error as a nonexistent document_id, so a
+    caller can't distinguish "wrong owner" from "doesn't exist".
     """
     logger.info(f"[RETRIEVAL] retrieve_document called")
-    logger.info(f"[RETRIEVAL] document_id: {document_id}, query: {query}, top_k: {top_k}")
+    logger.info(f"[RETRIEVAL] user_id: {user_id}, document_id: {document_id}, query: {query}, top_k: {top_k}")
 
     if not query or not query.strip():
         logger.error("[RETRIEVAL] Query is empty or None")
@@ -113,6 +119,7 @@ def retrieve_document(
         document_id=document_id,
         query=query,
         top_k=top_k,
+        user_id=user_id or None,
     )
 
     if result.get("success"):
@@ -123,10 +130,10 @@ def retrieve_document(
     return result
 
 @mcp.tool
-def get_document_info(document_id: str) -> dict:
+def get_document_info(document_id: str, user_id: str = "") -> dict:
     """
     Get enhanced metadata and information about a document.
-    
+
     Retrieves:
     - Document name
     - Total chunks
@@ -134,16 +141,19 @@ def get_document_info(document_id: str) -> dict:
     - Hierarchy distribution (chunk levels)
     - Total pages (if multi-page)
     - Collection metadata
-    
+
+    `user_id` is always injected by the calling application and checked
+    against the document's owner (see retrieve_document's docstring).
+
     Args:
         document_id: UUID of the document
-    
+
     Returns:
         Dictionary with document metadata and statistics
     """
-    logger.info(f"[RETRIEVAL] get_document_info called for document_id: {document_id}")
-    
-    result = retriever.get_document_metadata(document_id)
+    logger.info(f"[RETRIEVAL] get_document_info called for document_id: {document_id}, user_id: {user_id}")
+
+    result = retriever.get_document_metadata(document_id, user_id=user_id or None)
     
     if result.get("success"):
         logger.info(f"[RETRIEVAL] Retrieved metadata: {result.get('total_chunks', 0)} chunks")

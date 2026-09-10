@@ -34,6 +34,7 @@ from backend.mcp_servers.code.execution.runner import run_python_code as _run_py
 from backend.mcp_servers.code.execution.runner import run_shell_command as _run_shell_command
 from backend.mcp_servers.code.execution.syntax import check_python_syntax as _check_python_syntax
 from backend.mcp_servers.code.generation.generator import generate_file as _generate_file
+from backend.mcp_servers.code.generation.ui import generate_ui as _generate_ui
 
 # Ensure logs directory exists
 log_dir = Path(__file__).parent.parent.parent.parent / "logs"
@@ -228,6 +229,53 @@ def generate_file(format: str, filename: str, content: dict) -> dict:
     image) so the chat UI can render or link it.
     """
     return _handle("generate_file", _generate_file, format, filename, content, settings=settings)
+
+
+if settings.allow_ui_generation:
+
+    @mcp.tool
+    def generate_ui(html: str, title: str = "Generated UI") -> dict:
+        """Generate a custom, interactive UI component from HTML/CSS/JS you write
+        yourself, and return a URL the chat UI renders inline in a sandboxed iframe.
+
+        Use this when the user wants something to actually see and interact with —
+        a form, a mini dashboard, a calculator, an interactive diagram, a game —
+        rather than a plain text/markdown answer. There is no fixed component
+        library here: write real HTML with inline `<style>`/`<script>` (or a
+        `<script src="https://...">` from a public CDN) exactly as you would for
+        a real webpage. Keep it self-contained — everything the page needs should
+        be in `html` itself or loaded from a public URL, since it will run
+        completely isolated from this conversation and from the rest of the app
+        (no access to cookies, local storage, or any other page's data).
+
+        The page runs in a browser iframe sandbox with scripts allowed but no
+        access to the parent page or its storage, so: don't rely on `window.top`,
+        `postMessage` to a parent you don't control, or reading/writing outside
+        the iframe. If the UI needs to report something back to the conversation
+        (e.g. a form's submitted values), have the user copy/paste it, or just
+        describe what happened in your next reply — there is no live channel back
+        to you once the iframe is rendered.
+
+        `html` may be a full document (starting with `<!doctype html>` or
+        `<html>`) or just a body fragment — a fragment is automatically wrapped
+        in a minimal document with a UTF-8 charset and a responsive viewport meta
+        tag. `title` becomes the document's `<title>` (used only if `html` is a
+        fragment); defaults to "Generated UI".
+
+        Returns `{success, filename, url, content_type, size_bytes}` on success.
+        The chat UI automatically renders this result as an embedded
+        preview/code panel (with a live iframe preview and a "Code" tab
+        showing the raw HTML) as soon as the tool call completes — you do not
+        need to reference the `url` in your reply for it to show up. Don't
+        repeat the raw URL as a markdown link in your answer; just describe
+        what you built in a sentence or two.
+
+        This tool can be turned off by an operator at any time (CODE_MCP_ALLOW_UI_GENERATION=false
+        in the server's config) to stop generative-UI usage — if it isn't in
+        your tool list, it's currently disabled; don't ask the user to enable it,
+        just answer without it.
+        """
+        return _handle("generate_ui", _generate_ui, html, title, settings=settings)
 
 
 if __name__ == "__main__":

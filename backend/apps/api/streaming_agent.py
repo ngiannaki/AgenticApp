@@ -31,6 +31,74 @@ from backend.config import get_async_openai_client, get_ollama_extra_body, setti
 
 logger = logging.getLogger("agentic_api")
 
+ASK_USER_TOOL_NAME = "ask_user"
+
+# Tool calls whose user_id argument must come from the authenticated session,
+# never from the model. The model is told which document_ids are attached
+# (see _attached_documents_note) but is never told or asked for a user_id —
+# _handle_tool_call overwrites/injects this field itself right before
+# dispatch, so a model can't retrieve or index another user's documents no
+# matter what it puts in its own tool-call arguments.
+_USER_SCOPED_TOOLS = {"retrieval_retrieve_document", "retrieval_get_document_info", "indexing_upload_and_index_document"}
+
+# A local tool, not backed by any MCP server: handled entirely inside
+# _handle_tool_call by pausing the turn on a PendingQuestion, the same way a
+# human-approval interrupt pauses it. Modeled on AskUserQuestion-style
+# clarifying questions — a prompt plus optional multiple-choice buttons, with
+# free text always accepted as a fallback ("Other").
+_ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": ASK_USER_TOOL_NAME,
+        "description": (
+            "Ask the human a clarifying question and wait for their answer before "
+            "continuing. Use this when you're blocked on a decision only the user can "
+            "make — e.g. which of several ambiguous options they mean, or a choice "
+            "with no safe default — rather than guessing. Optionally offer a short "
+            "list of choices to show as buttons; the user can still type a free-text "
+            "answer instead of picking one. Do not use this for information you could "
+            "instead find with another tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "The question to ask the user."},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional short list of choices to offer as buttons (2-4 recommended). Omit for a free-text-only question.",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
+}
+
+
+def _with_attached_documents_note(session: ChatSession, question: str) -> str:
+    """Prepend a short note listing this session's attached documents so the
+    model knows which document_ids exist to call retrieve_document on. Only
+    the composed text sent to the model is affected — the persisted/displayed
+    chat history keeps the user's original `question` (see routers/chat.py,
+    which passes `body.message` to persistence separately)."""
+    if not session.attached_documents:
+        return question
+    listing = ", ".join(
+        f"{doc['filename']} (document_id={doc['document_id']}, type={doc['content_type']})"
+        for doc in session.attached_documents
+    )
+    note = (
+        f"[Attached files: {listing}]\n"
+        "These files were already uploaded and indexed into the vector store — "
+        "there is no local file_path for them, so read_document (which needs a "
+        "server-local file_path) will not work here. To answer questions about "
+        "an attached file's content, call retrieve_document(document_id, query) "
+        "with a query describing what you're looking for (call it more than "
+        "once with different queries if you need several kinds of information), "
+        "or get_document_info(document_id) for metadata like section/page counts."
+    )
+    return f"{note}\n\n{question}"
+
 
 def _extract_reasoning(message: Any) -> str | None:
     """Pull the model's chain-of-thought off a chat completion message, if present.
@@ -93,7 +161,8 @@ class AgentRuntime:
             }
             for t in mcp_tools
         ]
-        logger.info("Connected to %d MCP tool(s): %s", len(self.tools), ", ".join(self.tool_names))
+        self.tools.append(_ASK_USER_TOOL_SCHEMA)
+        logger.info("Connected to %d MCP tool(s) + ask_user: %s", len(self.tools) - 1, ", ".join(self.tool_names))
 
     @property
     def tool_names(self) -> list[str]:
@@ -155,7 +224,7 @@ class AgentRuntime:
     async def run_stream(self, session: ChatSession, question: str) -> AsyncIterator[dict[str, Any]]:
         """Drive one user turn for `session`, yielding SSE-ready events as it goes."""
         session.touch()
-        session.memory.add_user(question)
+        session.memory.add_user(_with_attached_documents_note(session, question))
         max_iterations = self.settings.max_iterations
 
         for iteration in range(1, max_iterations + 1):
@@ -226,6 +295,11 @@ class AgentRuntime:
 
         yield events.tool_call(call_id, name, arguments)
 
+        if name == ASK_USER_TOOL_NAME:
+            async for event in self._handle_ask_user(session, call, call_id, arguments):
+                yield event
+            return
+
         if name not in self.tool_names:
             available = ", ".join(self.tool_names)
             text = (
@@ -256,6 +330,9 @@ class AgentRuntime:
             if decision.action == "edit" and decision.arguments is not None:
                 arguments = decision.arguments
 
+        if name in _USER_SCOPED_TOOLS:
+            arguments["user_id"] = session.user_id
+
         yield events.status(f"calling {name}")
         try:
             result = await self.mcp.call_tool(name, arguments)
@@ -268,6 +345,42 @@ class AgentRuntime:
 
         yield events.tool_result(call_id, name, ok, text)
         session.memory.add_tool_result(name, text, tool_call_id=call.id)
+
+    async def _handle_ask_user(
+        self, session: ChatSession, call: Any, call_id: str, arguments: dict[str, Any]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Pause the turn and ask the human a question, the ask_user tool's whole
+        job — never dispatched to MCP, since the answer has to come from whoever
+        is looking at the frontend, not from a tool server."""
+        prompt = str(arguments.get("prompt") or "").strip()
+        options = [str(o) for o in (arguments.get("options") or []) if str(o).strip()]
+
+        if not prompt:
+            text = "Error calling tool 'ask_user': 'prompt' is required."
+            yield events.tool_result(call_id, ASK_USER_TOOL_NAME, False, text)
+            session.memory.add_tool_result(ASK_USER_TOOL_NAME, text, tool_call_id=call.id)
+            return
+
+        pending = session.new_question(call_id, prompt, options, allow_other=True)
+        yield events.question(pending.question_id, call_id, prompt, options, allow_other=True)
+
+        answer = await self._await_answer(pending.future)
+        session.pending_questions.pop(pending.question_id, None)
+
+        yield events.tool_result(call_id, ASK_USER_TOOL_NAME, True, answer.answer)
+        session.memory.add_tool_result(ASK_USER_TOOL_NAME, answer.answer, tool_call_id=call.id)
+
+    async def _await_answer(self, future: "asyncio.Future") -> Any:
+        """Same wait/timeout shape as _await_decision, for a pending question."""
+        timeout = self.settings.interrupt_timeout_seconds
+        try:
+            if timeout is None:
+                return await future
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            from backend.apps.api.schemas import QuestionAnswerRequest
+
+            return QuestionAnswerRequest(answer="(no response — timed out waiting for the user)")
 
     async def _await_decision(self, future: "asyncio.Future") -> Any:
         """Wait on a pending interrupt.

@@ -8,6 +8,7 @@ Provides:
 - Metadata enrichment
 """
 
+import re
 from typing import Optional, Dict, List
 from llama_index.core import Document
 from llama_index.core.node_parser import HierarchicalNodeParser, SimpleNodeParser
@@ -16,6 +17,38 @@ import logging
 from backend.config import get_llamaindex_llm, settings
 
 logger = logging.getLogger(__name__)
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+.+$", re.MULTILINE)
+
+
+def split_into_pages(text: str) -> List[Dict]:
+    """Split markdown-flavored text into pseudo-"pages" at `#`-heading
+    boundaries, so txt/md/docx content gets hierarchical-chunked per section
+    instead of as one undifferentiated blob (which loses structure the same
+    way one giant PDF page would). Content with no headings — a plain .log
+    or .txt file — comes back as a single page, matching prior behavior.
+    """
+
+    if not text or not text.strip():
+        return []
+
+    matches = list(_HEADING_RE.finditer(text))
+    if not matches:
+        return [{"page_number": 1, "text": text}]
+
+    pages = []
+    starts = [m.start() for m in matches] + [len(text)]
+    # Anything before the first heading (e.g. an unlabeled intro paragraph)
+    # becomes its own leading page instead of being dropped.
+    if starts[0] > 0 and text[: starts[0]].strip():
+        pages.append({"page_number": 1, "text": text[: starts[0]]})
+
+    for i, start in enumerate(starts[:-1]):
+        section = text[start : starts[i + 1]]
+        if section.strip():
+            pages.append({"page_number": len(pages) + 1, "text": section})
+
+    return pages
 
 
 class MetadataEnhancer:
@@ -108,26 +141,27 @@ Summary:"""
             logger.warning(f"Failed to generate summary: {str(e)}")
             return ""
     
-    def extract_metadata(self, text: str, document_name: str = "Untitled") -> Dict:
+    def extract_metadata(self, text: str, document_name: str = "Untitled", content_type: str = "pdf") -> Dict:
         """
         Extract comprehensive metadata from document.
-        
+
         Args:
             text: Document text
             document_name: Original document file name
-        
+            content_type: Detected type (pdf/csv/xlsx/txt/docx/pptx)
+
         Returns:
             Dictionary with enhanced metadata
         """
         try:
             word_count = len(text.split())
             char_count = len(text)
-            
+
             metadata = {
                 "document_name": document_name,
                 "word_count": word_count,
                 "char_count": char_count,
-                "document_type": "pdf",  # Can be enhanced based on actual file type
+                "document_type": content_type,
             }
             
             # Generate summary
@@ -150,7 +184,7 @@ Summary:"""
             logger.error(f"Failed to extract metadata: {str(e)}")
             return {
                 "document_name": document_name,
-                "document_type": "pdf",
+                "document_type": content_type,
                 "error": str(e)
             }
 
@@ -172,22 +206,26 @@ class HierarchicalChunker:
         text: str,
         document_id: str,
         document_name: str = "Untitled",
-        page_number: int = 1
+        page_number: int = 1,
+        extra_metadata: Optional[Dict] = None,
     ) -> List[Dict]:
         """
         Create hierarchical chunks from text.
-        
+
         Each chunk has information about its hierarchy level and parent chunks.
-        
+
         Args:
             text: Text to chunk
             document_id: Document UUID
             document_name: Original document name
             page_number: Page number (for multi-page docs)
-        
+            extra_metadata: Additional fields merged into every chunk's metadata
+                (e.g. user_id, content_type, slide_number, heading)
+
         Returns:
             List of chunks with hierarchy metadata
         """
+        extra_metadata = extra_metadata or {}
         try:
             # Create Document object
             doc = Document(
@@ -196,12 +234,13 @@ class HierarchicalChunker:
                     "document_id": document_id,
                     "document_name": document_name,
                     "page_number": page_number,
+                    **extra_metadata,
                 }
             )
-            
+
             # Parse into hierarchical nodes
             nodes = self.parser.get_nodes_from_documents([doc])
-            
+
             # Convert nodes to chunk dictionaries
             chunks = []
             for i, node in enumerate(nodes):
@@ -214,19 +253,20 @@ class HierarchicalChunker:
                         "chunk_index": i,
                         "chunk_id": node.node_id if hasattr(node, 'node_id') else f"{document_id}-chunk-{i}",
                         "hierarchy_level": getattr(node, 'level', 0) if hasattr(node, 'level') else 0,
-                        "source": "hierarchical_parse"
+                        "source": "hierarchical_parse",
+                        **extra_metadata,
                     }
                 }
-                
+
                 # Add parent node reference if exists
                 if hasattr(node, 'parent_node') and node.parent_node:
                     chunk["metadata"]["parent_chunk_id"] = node.parent_node.node_id
-                
+
                 chunks.append(chunk)
-            
+
             logger.info(f"Created {len(chunks)} hierarchical chunks for {document_id}")
             return chunks
-        
+
         except Exception as e:
             logger.warning(f"Hierarchical chunking failed, falling back to simple chunks: {str(e)}")
             return [
@@ -238,40 +278,142 @@ class HierarchicalChunker:
                         "page_number": page_number,
                         "chunk_index": 0,
                         "source": "fallback_simple",
+                        **extra_metadata,
                     }
                 }
             ]
-    
+
     def create_chunks_from_pages(
         self,
         pages: List[Dict],
         document_id: str,
-        document_name: str = "Untitled"
+        document_name: str = "Untitled",
+        extra_metadata: Optional[Dict] = None,
     ) -> List[Dict]:
         """
         Create hierarchical chunks from pages.
-        
+
         Args:
-            pages: List of page dicts with 'text' and 'page_number'
+            pages: List of page dicts with 'text' and 'page_number' (may also
+                carry type-specific fields like 'slide_number'/'title', which
+                are merged into every chunk produced from that page)
             document_id: Document UUID
             document_name: Original document name
-        
+            extra_metadata: Additional fields merged into every chunk's metadata
+
         Returns:
             List of hierarchical chunks
         """
         all_chunks = []
-        
+        base_extra = extra_metadata or {}
+
         for page in pages:
             page_text = page.get("text", "")
             page_num = page.get("page_number", 1)
-            
+            page_extra = {
+                **base_extra,
+                **{k: v for k, v in page.items() if k not in ("text", "page_number") and v not in (None, "")},
+            }
+
             if page_text.strip():
                 page_chunks = self.create_hierarchical_chunks(
                     text=page_text,
                     document_id=document_id,
                     document_name=document_name,
-                    page_number=page_num
+                    page_number=page_num,
+                    extra_metadata=page_extra,
                 )
                 all_chunks.extend(page_chunks)
-        
+
         return all_chunks
+
+
+class TabularChunker:
+    """Chunk csv/xlsx content by row group rather than by character window.
+
+    A plain sliding-window chunker over a rendered table risks cutting a row
+    in half or separating data rows from their header, both of which make a
+    retrieved chunk useless (or misleading) on its own. Instead each chunk is
+    a batch of whole rows with the header repeated at the top, plus one
+    summary chunk per sheet so the agent can answer "what's in this file"
+    without having retrieved every row.
+    """
+
+    def __init__(self, rows_per_chunk: int = 50):
+        self.rows_per_chunk = rows_per_chunk
+
+    def create_chunks_from_sheets(
+        self,
+        sheets: List[Dict],
+        document_id: str,
+        document_name: str = "Untitled",
+        extra_metadata: Optional[Dict] = None,
+    ) -> List[Dict]:
+        """
+        Args:
+            sheets: list of {"name": str, "headers": list[str], "rows": list[list]}
+                (a single-sheet CSV can pass one entry with name="Sheet1")
+        """
+        base_extra = extra_metadata or {}
+        chunks: List[Dict] = []
+
+        for sheet in sheets:
+            sheet_name = sheet.get("name", "Sheet1")
+            headers = [str(h) for h in sheet.get("headers", [])]
+            rows = sheet.get("rows", [])
+
+            chunks.append(self._summary_chunk(sheet_name, headers, rows, document_id, document_name, base_extra))
+
+            for start in range(0, len(rows), self.rows_per_chunk):
+                batch = rows[start : start + self.rows_per_chunk]
+                end = start + len(batch) - 1
+                text = self._render_table(headers, batch)
+                chunks.append(
+                    {
+                        "text": text,
+                        "metadata": {
+                            "document_id": document_id,
+                            "document_name": document_name,
+                            "sheet_name": sheet_name,
+                            "row_start": start,
+                            "row_end": end,
+                            "source": "tabular_rows",
+                            **base_extra,
+                        },
+                    }
+                )
+
+        return chunks
+
+    def _summary_chunk(
+        self,
+        sheet_name: str,
+        headers: List[str],
+        rows: List[list],
+        document_id: str,
+        document_name: str,
+        base_extra: Dict,
+    ) -> Dict:
+        columns = ", ".join(headers) if headers else "(no header row)"
+        text = f"Table '{sheet_name}' has {len(rows)} rows and columns: {columns}"
+        return {
+            "text": text,
+            "metadata": {
+                "document_id": document_id,
+                "document_name": document_name,
+                "sheet_name": sheet_name,
+                "row_count": len(rows),
+                "source": "tabular_summary",
+                **base_extra,
+            },
+        }
+
+    @staticmethod
+    def _render_table(headers: List[str], rows: List[list]) -> str:
+        cell = lambda v: "" if v is None else str(v)
+        lines = []
+        if headers:
+            lines.append(" | ".join(cell(h) for h in headers))
+            lines.append(" | ".join("---" for _ in headers))
+        lines.extend(" | ".join(cell(c) for c in row) for row in rows)
+        return "\n".join(lines)

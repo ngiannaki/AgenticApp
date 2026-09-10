@@ -8,7 +8,9 @@ import json
 
 from backend.infrastructure.vector_store.metadata_enhancer import (
     MetadataEnhancer,
-    HierarchicalChunker
+    HierarchicalChunker,
+    TabularChunker,
+    split_into_pages,
 )
 from backend.config import get_llamaindex_embedding, settings
 
@@ -16,31 +18,40 @@ logger = logging.getLogger(__name__)
 
 
 class VectorStore:
-    def __init__(self, persist_dir: str | None = None):
+    def __init__(self, persist_dir: str | None = None, host: str | None = None, port: int | None = None):
         """
         Initialize vector store with ChromaDB backend and the configured
         embedding model (Ollama in DEV, OpenAI in PROD).
         Vectors are persisted to disk organized by document_id.
 
         Args:
-            persist_dir: Directory where vectors will be persisted
+            persist_dir: Directory where vectors will be persisted. Only used
+                to make sure it exists — the actual store is a standalone
+                `chroma run` server process at host:port (see
+                start_mcp_servers.ps1), not opened directly here.
+            host: Chroma server host (defaults to settings.vector_store.host)
+            port: Chroma server port (defaults to settings.vector_store.port)
         """
-        # Create persistence directory
+        # Create persistence directory (used by the standalone chroma server)
         self.persist_dir = Path(persist_dir or settings.vector_store.dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize embeddings
         self.embed_model = get_llamaindex_embedding(settings.embedding_model)
 
-        # Initialize ChromaDB persistent client
-        # This stores vectors to disk instead of in-memory
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(self.persist_dir)
+        # Connect to the standalone Chroma server rather than opening the
+        # on-disk store in-process — see VectorStoreSettings docstring for
+        # why (this class and DocumentRetriever run in separate processes
+        # and must share one consistent view of the store).
+        self.chroma_client = chromadb.HttpClient(
+            host=host or settings.vector_store.host,
+            port=port or settings.vector_store.port,
         )
 
-        # Initialize metadata enhancer and hierarchical chunker
+        # Initialize metadata enhancer and chunkers
         self.metadata_enhancer = MetadataEnhancer()
         self.hierarchical_chunker = HierarchicalChunker()
+        self.tabular_chunker = TabularChunker()
 
         logger.info(f"Vector store initialized with persistent storage at: {self.persist_dir}")
     
@@ -50,73 +61,107 @@ class VectorStore:
         parsed_content: dict,
         document_name: str = "Untitled",
         use_hierarchical: bool = True,
-        extract_metadata: bool = True
+        extract_metadata: bool = True,
+        content_type: str = "pdf",
+        extra_metadata: dict | None = None,
     ) -> dict:
         """
         Index a document with enhanced metadata extraction.
-        
-        Uses:
-        - Hierarchical chunking for better semantic relationships
-        - Document summary extraction
-        - Section/topic extraction
-        - Document statistics
-        
+
+        Chunking strategy depends on `content_type`:
+        - "csv"/"xlsx": row-group chunks via TabularChunker (a sliding text
+          window over a rendered table risks splitting a row or separating
+          it from its header — row-group chunks with the header repeated
+          avoid both).
+        - "pdf"/"pptx": hierarchical chunking over each physical page/slide
+          (parsed_content["pages"]).
+        - "docx"/"txt" (md/log included): hierarchical chunking over
+          heading-delimited pseudo-pages (split_into_pages), so structure
+          survives instead of one undifferentiated blob.
+
         Args:
             document_id: UUID of the document
-            parsed_content: Parsed document content dict with 'pages' and 'full_text'
+            parsed_content: Parser output — 'pages'+'full_text' for
+                pdf/pptx/docx/txt, or 'sheets' (list of {name, headers, rows})
+                for csv/xlsx
             document_name: Original document file name
             use_hierarchical: Use hierarchical chunking instead of page-based
-            extract_metadata: Extract document summary and sections
-        
+                (ignored for csv/xlsx, which always use TabularChunker)
+            extract_metadata: Extract document summary and sections (skipped
+                for csv/xlsx — a summary chunk is produced directly instead)
+            content_type: One of detect.SUPPORTED_TYPES
+            extra_metadata: Additional fields stamped onto every chunk
+                (e.g. {"user_id": ...})
+
         Returns:
             Dictionary with indexing status and enhanced metadata
         """
+        extra_metadata = extra_metadata or {}
         try:
-            logger.info(f"[ENHANCED INDEX] Starting enhanced indexing for UUID: {document_id}")
-            
-            # Extract metadata if requested
-            enhanced_metadata = {}
-            if extract_metadata and parsed_content.get("full_text"):
-                logger.info(f"[ENHANCED INDEX] Extracting document metadata...")
-                enhanced_metadata = self.metadata_enhancer.extract_metadata(
-                    parsed_content["full_text"],
-                    document_name=document_name
-                )
-                logger.info(f"[ENHANCED INDEX] Extracted metadata fields: {list(enhanced_metadata.keys())}")
-            
-            # Create chunks
-            if use_hierarchical:
-                logger.info(f"[ENHANCED INDEX] Using hierarchical chunking...")
-                chunks = self.hierarchical_chunker.create_chunks_from_pages(
-                    parsed_content.get("pages", []),
+            logger.info(f"[ENHANCED INDEX] Starting enhanced indexing for UUID: {document_id} (type={content_type})")
+
+            if content_type in ("csv", "xlsx"):
+                chunks = self.tabular_chunker.create_chunks_from_sheets(
+                    parsed_content.get("sheets", []),
                     document_id=document_id,
-                    document_name=document_name
+                    document_name=document_name,
+                    extra_metadata={**extra_metadata, "content_type": content_type},
                 )
+                enhanced_metadata = {"document_name": document_name, "document_type": content_type}
             else:
-                logger.info(f"[ENHANCED INDEX] Using page-based chunking...")
-                chunks = self._create_page_chunks(
-                    parsed_content.get("pages", []),
-                    document_id=document_id,
-                    document_name=document_name
-                )
-            
+                enhanced_metadata = {}
+                if extract_metadata and parsed_content.get("full_text"):
+                    logger.info(f"[ENHANCED INDEX] Extracting document metadata...")
+                    enhanced_metadata = self.metadata_enhancer.extract_metadata(
+                        parsed_content["full_text"],
+                        document_name=document_name,
+                        content_type=content_type,
+                    )
+                    logger.info(f"[ENHANCED INDEX] Extracted metadata fields: {list(enhanced_metadata.keys())}")
+
+                pages = parsed_content.get("pages", [])
+                if not pages and content_type in ("docx", "txt"):
+                    # No physical pages (docx/txt/md/log) — synthesize
+                    # heading-delimited pseudo-pages so structure survives
+                    # chunking instead of hierarchy-chunking one giant blob.
+                    source_text = parsed_content.get("markdown") or parsed_content.get("full_text", "")
+                    pages = split_into_pages(source_text)
+
+                if use_hierarchical:
+                    logger.info(f"[ENHANCED INDEX] Using hierarchical chunking...")
+                    chunks = self.hierarchical_chunker.create_chunks_from_pages(
+                        pages,
+                        document_id=document_id,
+                        document_name=document_name,
+                        extra_metadata={**extra_metadata, "content_type": content_type},
+                    )
+                else:
+                    logger.info(f"[ENHANCED INDEX] Using page-based chunking...")
+                    chunks = self._create_page_chunks(
+                        pages,
+                        document_id=document_id,
+                        document_name=document_name,
+                    )
+                    for chunk in chunks:
+                        chunk["metadata"].update({**extra_metadata, "content_type": content_type})
+
             if not chunks:
                 return {
                     "success": False,
                     "document_id": document_id,
                     "error": "No chunks created"
                 }
-            
+
             # Index with enhanced metadata
             result = self.index_document(document_id, chunks)
-            
+
             # Add enhanced metadata to result
             result["enhanced_metadata"] = enhanced_metadata
-            
+
             logger.info(f"[ENHANCED INDEX] Successfully indexed with enhanced metadata for {document_id}")
-            
+
             return result
-        
+
         except Exception as e:
             logger.error(f"[ENHANCED INDEX] Failed for {document_id}: {str(e)}", exc_info=True)
             return {
@@ -161,11 +206,17 @@ class VectorStore:
             Dictionary with indexing status and metadata
         """
         try:
-            # Create a collection per document (organized by UUID)
+            # Create a collection per document (organized by UUID). user_id
+            # (if any chunk carries one) is stamped onto the collection itself
+            # too, so retrieval can check ownership without a vector search.
             collection_name = f"doc_{document_id}"
+            collection_metadata = {"hnsw:space": "cosine", "document_id": document_id}
+            user_id = next((c.get("metadata", {}).get("user_id") for c in chunks if c.get("metadata", {}).get("user_id")), None)
+            if user_id:
+                collection_metadata["user_id"] = user_id
             collection = self.chroma_client.get_or_create_collection(
                 name=collection_name,
-                metadata={"hnsw:space": "cosine", "document_id": document_id}
+                metadata=collection_metadata
             )
             
             # Create ChromaDB vector store

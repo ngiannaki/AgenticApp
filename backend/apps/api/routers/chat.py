@@ -15,13 +15,14 @@ import logging
 import uuid
 from typing import Any, AsyncIterator
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from backend.apps.api import events
+from backend.apps.api.auth import AuthUser, get_current_user
 from backend.apps.api.config import get_api_settings
 from backend.apps.api.schemas import ChatRequest
-from backend.apps.client.config import DEFAULT_SYSTEM_PROMPT
+from backend.apps.api.session_helpers import get_or_rehydrate_session
 
 router = APIRouter(prefix="/api/sessions", tags=["chat"])
 logger = logging.getLogger("agentic_api")
@@ -59,6 +60,16 @@ def _to_step(event: dict[str, Any]) -> dict[str, Any] | None:
             "name": data.get("name"),
             "arguments": data.get("arguments"),
         }
+    if kind == "question":
+        return {
+            "id": step_id,
+            "type": "question",
+            "questionId": data.get("question_id"),
+            "callId": data.get("call_id"),
+            "prompt": data.get("prompt"),
+            "options": data.get("options"),
+            "allowOther": data.get("allow_other"),
+        }
     if kind == "tool_result":
         return {
             "id": step_id,
@@ -73,41 +84,15 @@ def _to_step(event: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-async def _rehydrate_session(request: Request, session_id: str) -> Any:
-    """Try to rebuild an evicted/lost in-memory session from persisted history.
-    Returns the restored ChatSession, or None if there's no record of it."""
-    store = request.app.state.conversation_store
-    if store is None:
-        return None
-
-    conversation = await store.get_conversation(session_id)
-    if conversation is None:
-        return None
-
-    settings = get_api_settings()
-    history = await store.get_messages(session_id)
-    session = request.app.state.session_manager.restore(
-        session_id=session_id,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
-        max_history_messages=settings.max_history_messages,
-        approval_required_tools=settings.approval_required_tools,
-        history=history,
-        max_tool_result_chars=settings.max_tool_result_chars,
-    )
-    logger.info("Rehydrated session %s from %d persisted message(s)", session_id, len(history))
-    return session
-
-
 @router.post("/{session_id}/messages")
-async def send_message(session_id: str, body: ChatRequest, request: Request) -> EventSourceResponse:
-    session_manager = request.app.state.session_manager
+async def send_message(
+    session_id: str, body: ChatRequest, request: Request, user: AuthUser = Depends(get_current_user)
+) -> EventSourceResponse:
     runtime = request.app.state.runtime
     store = request.app.state.conversation_store
     settings = get_api_settings()
 
-    session = session_manager.get(session_id)
-    if session is None:
-        session = await _rehydrate_session(request, session_id)
+    session = await get_or_rehydrate_session(request, session_id, user.user_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 

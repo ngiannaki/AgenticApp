@@ -52,15 +52,16 @@ class ConversationStore:
 
     async def _ensure_indexes(self) -> None:
         await self._conversations.create_index("updated_at")
+        await self._conversations.create_index("user_id")
         await self._messages.create_index([("conversation_id", 1), ("created_at", 1)])
 
     # --- Conversations ------------------------------------------------------
 
-    async def create_conversation(self, conversation_id: str, title: str = DEFAULT_TITLE) -> None:
+    async def create_conversation(self, conversation_id: str, user_id: str, title: str = DEFAULT_TITLE) -> None:
         now = time.time()
         try:
             await self._conversations.insert_one(
-                {"_id": conversation_id, "title": title, "created_at": now, "updated_at": now}
+                {"_id": conversation_id, "user_id": user_id, "title": title, "created_at": now, "updated_at": now}
             )
         except PyMongoError:
             logger.exception("Failed to persist new conversation %s", conversation_id)
@@ -72,9 +73,9 @@ class ConversationStore:
             logger.exception("Failed to load conversation %s", conversation_id)
             return None
 
-    async def list_conversations(self) -> list[dict[str, Any]]:
+    async def list_conversations(self, user_id: str) -> list[dict[str, Any]]:
         try:
-            cursor = self._conversations.find().sort("updated_at", -1)
+            cursor = self._conversations.find({"user_id": user_id}).sort("updated_at", -1)
             return [
                 {
                     "id": doc["_id"],
@@ -85,7 +86,7 @@ class ConversationStore:
                 async for doc in cursor
             ]
         except PyMongoError:
-            logger.exception("Failed to list conversations")
+            logger.exception("Failed to list conversations for user %s", user_id)
             return []
 
     async def set_title_if_default(self, conversation_id: str, title: str) -> None:

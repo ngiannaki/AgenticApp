@@ -35,6 +35,9 @@ approval-required tools, idle session timeout, etc).
   `{action: "approve"|"reject"|"edit", arguments?, reason?}` → resolves a
   pending human-in-the-loop pause; the still-open SSE stream from the
   `/messages` call above resumes and keeps emitting events.
+- `POST /api/sessions/{id}/questions/{question_id}/answer` `{answer}` →
+  resolves a pending `ask_user` question (button label or free text); the
+  still-open SSE stream resumes the same way.
 
 ## SSE event types
 
@@ -43,6 +46,7 @@ approval-required tools, idle session timeout, etc).
 | `status`     | `{message}` — progress note                           |
 | `tool_call`  | `{call_id, name, arguments}` — model wants to call a tool |
 | `interrupt`  | `{interrupt_id, call_id, name, arguments}` — paused, waiting on `.../resume` |
+| `question`   | `{question_id, call_id, prompt, options, allow_other}` — model asked the user something via `ask_user`, waiting on `.../questions/{id}/answer` |
 | `tool_result`| `{call_id, name, ok, result}`                          |
 | `message`    | `{content}` — assistant's final answer for the turn    |
 | `error`      | `{detail}` — stream ends after this                    |
@@ -68,6 +72,15 @@ approval waits and reverse-proxy idle timeouts.
      (plus optional `reason`) as the tool result and continues
 4. The original SSE stream (still open) resumes and keeps emitting events
    for the rest of the turn.
+
+There's a second, separate pause the model can trigger itself: it always has
+access to a local `ask_user` tool (not backed by any MCP server) it can call
+with `{prompt, options?}` whenever it's blocked on a decision only the user
+can make. Calling it emits `tool_call` then `question` and suspends the turn
+exactly like an approval interrupt, resolved via
+`POST /api/sessions/{id}/questions/{question_id}/answer {answer}` — `answer`
+can be the text of one of `options` (rendered as buttons) or arbitrary free
+text, since `allow_other` is always true.
 
 ## Notes
 

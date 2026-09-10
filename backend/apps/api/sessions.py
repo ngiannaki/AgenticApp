@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.apps.client.memory import ConversationMemory
-from backend.apps.api.schemas import InterruptDecisionRequest
+from backend.apps.api.schemas import InterruptDecisionRequest, QuestionAnswerRequest
 from backend.config import settings as app_settings
 
 # Tokens reserved out of num_ctx for the model's own generation on a single
@@ -48,16 +48,43 @@ class PendingInterrupt:
 
 
 @dataclass
+class PendingQuestion:
+    question_id: str
+    call_id: str
+    prompt: str
+    options: list[str]
+    allow_other: bool
+    future: "asyncio.Future[QuestionAnswerRequest]" = field(
+        default_factory=lambda: asyncio.get_running_loop().create_future()
+    )
+
+
+@dataclass
 class ChatSession:
     session_id: str
     memory: ConversationMemory
     approval_required_tools: list[str]
+    user_id: str = ""
+    """Owner of this session — set at creation from the authenticated caller
+    (backend.apps.api.auth.get_current_user). Never taken from model/tool
+    input: it's what streaming_agent.py force-injects into user-scoped tool
+    calls (retrieval_retrieve_document, retrieval_get_document_info,
+    indexing_upload_and_index_document)
+    so the model can never impersonate another user."""
+    attached_documents: list[dict[str, Any]] = field(default_factory=list)
+    """Documents uploaded into this conversation: [{document_id, filename, content_type}, ...]."""
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_interrupts: dict[str, PendingInterrupt] = field(default_factory=dict)
+    pending_questions: dict[str, PendingQuestion] = field(default_factory=dict)
     last_active: float = field(default_factory=time.time)
 
     def touch(self) -> None:
         self.last_active = time.time()
+
+    def add_attached_document(self, document_id: str, filename: str, content_type: str) -> None:
+        self.attached_documents.append(
+            {"document_id": document_id, "filename": filename, "content_type": content_type}
+        )
 
     def requires_approval(self, tool_name: str) -> bool:
         return "*" in self.approval_required_tools or tool_name in self.approval_required_tools
@@ -79,6 +106,26 @@ class ChatSession:
         pending.future.set_result(decision)
         return True
 
+    def new_question(
+        self, call_id: str, prompt: str, options: list[str], allow_other: bool
+    ) -> PendingQuestion:
+        pending = PendingQuestion(
+            question_id=str(uuid.uuid4()),
+            call_id=call_id,
+            prompt=prompt,
+            options=options,
+            allow_other=allow_other,
+        )
+        self.pending_questions[pending.question_id] = pending
+        return pending
+
+    def resolve_question(self, question_id: str, answer: QuestionAnswerRequest) -> bool:
+        pending = self.pending_questions.get(question_id)
+        if pending is None or pending.future.done():
+            return False
+        pending.future.set_result(answer)
+        return True
+
 
 class SessionManager:
     """Owns every live ChatSession. Not process-shared — one worker only."""
@@ -92,6 +139,7 @@ class SessionManager:
         system_prompt: str,
         max_history_messages: int,
         approval_required_tools: list[str],
+        user_id: str,
         max_tool_result_chars: int = 8000,
     ) -> ChatSession:
         session = ChatSession(
@@ -100,6 +148,7 @@ class SessionManager:
                 system_prompt, max_history_messages, max_tool_result_chars, _max_context_tokens()
             ),
             approval_required_tools=approval_required_tools,
+            user_id=user_id,
         )
         self._sessions[session.session_id] = session
         return session
@@ -111,6 +160,7 @@ class SessionManager:
         max_history_messages: int,
         approval_required_tools: list[str],
         history: list[dict[str, Any]],
+        user_id: str,
         max_tool_result_chars: int = 8000,
     ) -> ChatSession:
         """Rebuild a session that lives in MongoDB but was evicted or lost to a
@@ -128,6 +178,7 @@ class SessionManager:
             session_id=session_id,
             memory=memory,
             approval_required_tools=approval_required_tools,
+            user_id=user_id,
         )
         self._sessions[session_id] = session
         return session
@@ -141,6 +192,9 @@ class SessionManager:
             for pending in session.pending_interrupts.values():
                 if not pending.future.done():
                     pending.future.cancel()
+            for pending_q in session.pending_questions.values():
+                if not pending_q.future.done():
+                    pending_q.future.cancel()
 
     def evict_idle(self) -> list[str]:
         cutoff = time.time() - self._idle_timeout

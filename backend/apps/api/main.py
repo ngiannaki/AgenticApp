@@ -25,12 +25,20 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.apps.api.auth import UserStore
 from backend.apps.api.config import get_api_settings
+from backend.apps.api.document_registry import DocumentRegistry
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import chat, conversations, files, interrupts, sessions, tools
+from backend.apps.api.routers import auth, chat, conversations, files, interrupts, questions, sessions, tools
 from backend.apps.api.sessions import SessionManager
+# ROLLBACK: swapped from `from backend.apps.api.streaming_agent import
+# AgentRuntime` to try the v2 orchestrator/executor/critic runtime live. To
+# revert, restore that import and change `OrchestratedAgentRuntime.connect`
+# back to `AgentRuntime.connect` below — nothing else in this file, or any
+# router, references the runtime class name directly.
 from backend.apps.api.streaming_agent import AgentRuntime
+from backend.config import settings as app_settings
 
 logger = logging.getLogger("agentic_api")
 
@@ -67,13 +75,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.conversation_store = await ConversationStore.connect(
             settings.mongo_url, settings.mongo_db_name
         )
+        # Auth (users/tokens) and the document registry share the same
+        # Mongo connection/database as conversation persistence.
+        mongo_client = app.state.conversation_store.client
+        mongo_db = mongo_client[settings.mongo_db_name]
+        app.state.user_store = await UserStore.connect(mongo_client, mongo_db)
+        app.state.document_registry = await DocumentRegistry.connect(mongo_client, mongo_db)
     except Exception:  # noqa: BLE001 — persistence is a durability nice-to-have, not a hard dependency
         logger.exception(
-            "Could not connect to MongoDB at %s — conversations will not be persisted "
-            "until it is reachable. Start it via start_mcp_servers.ps1 or docker.",
+            "Could not connect to MongoDB at %s — conversations, auth, and documents will "
+            "not be persisted until it is reachable. Start it via start_mcp_servers.ps1 or docker.",
             settings.mongo_url,
         )
         app.state.conversation_store = None
+        app.state.user_store = None
+        app.state.document_registry = None
+
+    if app_settings.auth.dev_bypass:
+        if app.state.user_store is not None:
+            app.state.dev_user = await app.state.user_store.seed_dev_user(
+                app_settings.auth.dev_bypass_email, app_settings.auth.dev_bypass_password
+            )
+        else:
+            # Mongo unreachable but bypass is on: fall back to an in-memory
+            # identity so local dev without Mongo still works end to end.
+            from backend.apps.api.auth import AuthUser
+
+            app.state.dev_user = AuthUser(user_id="dev-user", email=app_settings.auth.dev_bypass_email)
+        logger.warning(
+            "AUTH_DEV_BYPASS is on — every request is treated as %s. Do not use this in a "
+            "deployment reachable by more than one person.",
+            app.state.dev_user.email,
+        )
 
     reaper_task = asyncio.create_task(
         _idle_session_reaper(app, interval_seconds=min(300.0, settings.session_idle_timeout_seconds))
@@ -105,12 +138,15 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(auth.router)
     app.include_router(sessions.router)
     app.include_router(chat.router)
     app.include_router(interrupts.router)
+    app.include_router(questions.router)
     app.include_router(tools.router)
     app.include_router(conversations.router)
     app.include_router(files.router)
+    app.include_router(files.documents_router)
 
     @app.get("/api/health")
     def health() -> dict:

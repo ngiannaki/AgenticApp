@@ -1,15 +1,42 @@
 """Serves files captured from tool calls — currently: run_python_code output
-files (plots, CSVs, ...) saved by the Code MCP server via ArtifactStore.
+files (plots, CSVs, ...) and generate_ui's HTML pages, saved by the Code MCP
+server via ArtifactStore — plus the chat file-upload endpoint and the
+per-user document registry ("my files").
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+import base64
+import json
+import logging
+import mimetypes
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from backend.apps.api.auth import AuthUser, get_current_user
+from backend.apps.api.session_helpers import get_or_rehydrate_session
 from backend.core.storage.artifact_store import ArtifactStore
+
+logger = logging.getLogger("agentic_api")
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 _store = ArtifactStore()
+
+_SUPPORTED_UPLOAD_EXTENSIONS = {
+    ".pdf", ".csv", ".xlsx", ".xlsm", ".txt", ".log", ".md", ".docx", ".pptx",
+}
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25MB
+
+# Types the browser should render in place (an <img>, or a generate_ui page
+# loaded into an iframe) rather than offer as a "Save As" download. Everything
+# else (docx/xlsx/csv/...) keeps the default "attachment" disposition, since
+# those are meant to be opened in an external app. This matters specifically
+# for the iframe case: unlike an <img> load, a browser treats an iframe's
+# src fetch as a navigation, and honors Content-Disposition: attachment by
+# downloading the file instead of rendering it — so an inline HTML artifact
+# would silently fail to display without this.
+_INLINE_CONTENT_TYPES = {"text/html", "image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}
 
 
 @router.get("/{artifact_id}/{filename}")
@@ -17,4 +44,117 @@ def get_file(artifact_id: str, filename: str) -> FileResponse:
     path = _store.get_path(artifact_id, filename)
     if path is None:
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, filename=path.name)
+    media_type, _ = mimetypes.guess_type(path.name)
+    disposition = "inline" if media_type in _INLINE_CONTENT_TYPES else "attachment"
+    return FileResponse(path, filename=path.name, content_disposition_type=disposition)
+
+
+# --- Chat file uploads + per-user document registry -------------------------
+# Separate router (no /api/files prefix) since these live at /api/sessions/...
+# and /api/documents rather than under the artifact-serving path above.
+documents_router = APIRouter(tags=["documents"])
+
+
+@documents_router.post("/api/sessions/{session_id}/upload")
+async def upload_file(
+    session_id: str,
+    request: Request,
+    file: UploadFile,
+    user: AuthUser = Depends(get_current_user),
+) -> dict:
+    session = await get_or_rehydrate_session(request, session_id, user.user_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    filename = file.filename or "upload"
+    extension = Path(filename).suffix.lower()
+    if extension not in _SUPPORTED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{extension}'. Supported: {', '.join(sorted(_SUPPORTED_UPLOAD_EXTENSIONS))}",
+        )
+
+    file_bytes = await file.read()
+    if len(file_bytes) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB)")
+
+    runtime = request.app.state.runtime
+    logger.info("[UPLOAD] user=%s session=%s filename=%s size=%d", user.user_id, session_id, filename, len(file_bytes))
+
+    try:
+        # upload_and_index_document takes file_b64 (a plain base64 str),
+        # not a `bytes`-typed param — see its docstring for why: pydantic's
+        # default JSON coercion for a `bytes` field treats an incoming JSON
+        # string as literal UTF-8 text rather than base64, which corrupts
+        # (or outright fails on) arbitrary binary content like a PDF.
+        result = await runtime.mcp.call_tool(
+            "indexing_upload_and_index_document",
+            {
+                "file_b64": base64.b64encode(file_bytes).decode("ascii"),
+                "filename": filename,
+                "user_id": user.user_id,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a normal HTTP error, not a 500 stack trace
+        logger.exception("upload_and_index_document call failed for %s", filename)
+        raise HTTPException(status_code=502, detail=f"Indexing failed: {exc}")
+
+    data = _tool_result_json(result)
+    if not data.get("success"):
+        raise HTTPException(status_code=422, detail=data.get("error", "Indexing failed"))
+
+    document_id = data["document_id"]
+    content_type = data.get("content_type", extension.lstrip("."))
+    chunks_indexed = data.get("chunks_indexed", 0)
+
+    registry = request.app.state.document_registry
+    if registry is not None:
+        await registry.create(
+            document_id=document_id,
+            user_id=user.user_id,
+            original_name=filename,
+            stored_name=f"original{extension}",
+            file_type=content_type,
+            status="indexed",
+            chunks_indexed=chunks_indexed,
+        )
+
+    session.add_attached_document(document_id, filename, content_type)
+
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "content_type": content_type,
+        "chunks_indexed": chunks_indexed,
+    }
+
+
+@documents_router.get("/api/documents")
+async def list_documents(request: Request, user: AuthUser = Depends(get_current_user)) -> list[dict]:
+    registry = request.app.state.document_registry
+    if registry is None:
+        return []
+    return await registry.list_for_user(user.user_id)
+
+
+@documents_router.delete("/api/documents/{document_id}", status_code=204)
+async def delete_document(
+    document_id: str, request: Request, user: AuthUser = Depends(get_current_user)
+) -> None:
+    registry = request.app.state.document_registry
+    if registry is None:
+        raise HTTPException(status_code=503, detail="Document registry is unavailable")
+    deleted = await registry.delete(document_id, user.user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+
+def _tool_result_json(result) -> dict:
+    """Mirror streaming_agent._extract_text's unwrapping, then parse the JSON
+    text every indexing/retrieval tool returns."""
+    content = getattr(result, "content", result)
+    if isinstance(content, list):
+        text = "\n".join(b.text for b in content if hasattr(b, "text"))
+    else:
+        text = str(content)
+    return json.loads(text)

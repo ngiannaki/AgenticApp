@@ -1,0 +1,17 @@
+# This repo has no root dependency manifest (backend/pyproject.toml is
+# empty; packages are just installed into the shared .venv). Listed here so
+# this file documents the API's real dependency surface beyond what's
+# already pinned elsewhere (fastapi, motor, pymongo, openai, fastmcp,
+# sse-starlette are already required by other servers in this repo).
+#
+# bcrypt is used by backend/apps/api/auth.py for password hashing.
+#
+# openai-agents is used by streaming_agent_v3.py (the openai-agents-SDK
+# flavor of the orchestrator/executor/critic agent). Pinned to <0.20 because
+# openai-agents>=0.20 requires openai>=3.0, which is a breaking major bump
+# that litellm and llama-index-llms-openai in this repo aren't compatible
+# with yet — 0.19.x is the newest release that still works with the
+# openai>=2.45,<3 already pinned elsewhere.
+
+bcrypt>=4.1,<6
+openai-agents>=0.19.4,<0.20

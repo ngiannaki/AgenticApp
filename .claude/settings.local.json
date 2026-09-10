@@ -10,7 +10,17 @@
       "Bash(npm install *)",
       "Bash(.venv/Scripts/python -c \"import motor; print\\('motor ok'\\)\")",
       "Bash(.venv/Scripts/python -c \"import pymongo; print\\(pymongo.version\\)\")",
-      "Bash(.venv/Scripts/python -m pip install motor)"
+      "Bash(.venv/Scripts/python -m pip install motor)",
+      "Bash(npx eslint *)",
+      "Bash(python -c ' *)",
+      "Bash(xargs grep -l \"iteration\" -i)",
+      "Bash(python -c 'import ast; [ast.parse\\(open\\(f, encoding='\\\\''utf-8'\\\\''\\).read\\(\\), f\\) for f in [ *)",
+      "Bash(where python *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('backend/mcp_servers/indexing/server.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(python -c \"import docx; print\\('docx ok'\\)\")",
+      "Bash(python -c \"import fastapi, motor, fastmcp; print\\('deps ok'\\)\")"
     ]
   }
 }

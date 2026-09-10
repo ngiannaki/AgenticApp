@@ -6,6 +6,27 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class SignupRequest(BaseModel):
+    email: str = Field(min_length=3)
+    password: str = Field(min_length=8)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3)
+    password: str = Field(min_length=1)
+
+
+class AuthResponse(BaseModel):
+    user_id: str
+    email: str
+    token: str
+
+
+class CurrentUserResponse(BaseModel):
+    user_id: str
+    email: str
+
+
 class ToolInfo(BaseModel):
     name: str
     description: str
@@ -44,4 +65,14 @@ class InterruptDecisionRequest(BaseModel):
 
 class InterruptDecisionResponse(BaseModel):
     interrupt_id: str
+    accepted: bool
+
+
+class QuestionAnswerRequest(BaseModel):
+    answer: str = Field(min_length=1)
+    """The user's answer — either the text of the option button they picked, or free text they typed."""
+
+
+class QuestionAnswerResponse(BaseModel):
+    question_id: str
     accepted: bool

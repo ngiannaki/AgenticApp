@@ -1,10 +1,12 @@
 # Code Execution MCP Server
 
-A FastMCP server with two distinct jobs: **running code** (submit Python,
-get back exit code/stdout/stderr/timing) and **generating files**
+A FastMCP server with three distinct jobs: **running code** (submit Python,
+get back exit code/stdout/stderr/timing), **generating files**
 (txt/md/csv/xlsx/docx from structured input, no code required, real
-formatting). Part of this repo's MCP stack, alongside the `indexing`,
-`retrieval`, and `db` servers in `backend/mcp_servers/`.
+formatting), and **generating UI** (model-authored HTML/CSS/JS rendered
+inline in the chat UI's sandboxed iframe). Part of this repo's MCP stack,
+alongside the `indexing`, `retrieval`, and `db` servers in
+`backend/mcp_servers/`.
 
 ## Why this isn't "just call subprocess.run from a tool"
 
@@ -59,6 +61,7 @@ code says:
 | `check_python_syntax` | Python source | Fast `ast.parse`-based syntax check, no execution |
 | `run_shell_command` | a command line | Runs an allowlisted executable (disabled by default) |
 | `generate_file` | structured content + a format | Renders a properly-formatted txt/md/csv/xlsx/docx — no code involved |
+| `generate_ui` | free-form HTML/CSS/JS | Saves a self-contained webpage as an artifact; the frontend embeds it in a sandboxed iframe — a real "generative UI" surface, not a fixed component library |
 
 `run_python_code` is the primary code-running tool — "does this code work"
 is answered by `success` (exit code 0) plus `stderr` for a traceback when it
@@ -140,6 +143,28 @@ picking up a file from somewhere else on disk by way of a crafted
 against writing outside its working directory — there's no OS-level
 container/chroot here, only the process isolation described above — so
 this doesn't change that pre-existing risk, it just doesn't add to it.
+
+## `generate_ui`: free-form, LLM-authored UI, not a fixed component set
+
+Unlike a JSON-spec-driven UI (the model picks from components you predefined),
+`generate_ui` takes real HTML/CSS/JS the model writes itself — a custom form,
+a mini dashboard, a game, anything — and hands back a URL, same
+`ArtifactStore` + `GET /api/files/{id}/{filename}` path as `generate_file`.
+The frontend (`ChatWindow.tsx`'s `UiArtifactBlock`) embeds that URL in an
+`<iframe sandbox="allow-scripts allow-forms">` — no `allow-same-origin`, so
+the generated page can't read the parent app's cookies, storage, or DOM even
+if the generated JS is buggy or hostile. That sandbox, not anything on the
+server side, is the actual security boundary; `generate_ui` itself only
+size-caps the input (`CODE_MCP_MAX_UI_HTML_LENGTH`) and wraps a bare fragment
+in a minimal document (UTF-8 charset, responsive viewport meta) if it isn't
+already a full `<html>` document.
+
+**Kill switch:** `CODE_MCP_ALLOW_UI_GENERATION` (default `true`). Set to
+`false` and restart the server to remove `generate_ui` from the tool list
+entirely — the model never sees it, so it can't be overused. This is a
+server-config switch (like `CODE_MCP_ALLOW_SHELL_COMMANDS`), not a per-user
+toggle; it's the deliberate operator-facing control for "generative UI is
+getting used more than we want."
 
 ## `run_shell_command`: off by default, allowlisted when on
 
