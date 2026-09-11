@@ -5,11 +5,11 @@ per-user document registry ("my files").
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import mimetypes
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -17,11 +17,13 @@ from fastapi.responses import FileResponse
 from backend.apps.api.auth import AuthUser, get_current_user
 from backend.apps.api.session_helpers import get_or_rehydrate_session
 from backend.core.storage.artifact_store import ArtifactStore
+from backend.core.storage.document_store import DocumentStore
 
 logger = logging.getLogger("agentic_api")
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 _store = ArtifactStore()
+_document_store = DocumentStore()
 
 _SUPPORTED_UPLOAD_EXTENSIONS = {
     ".pdf", ".csv", ".xlsx", ".xlsm", ".txt", ".log", ".md", ".docx", ".pptx",
@@ -55,17 +57,10 @@ def get_file(artifact_id: str, filename: str) -> FileResponse:
 documents_router = APIRouter(tags=["documents"])
 
 
-@documents_router.post("/api/sessions/{session_id}/upload")
-async def upload_file(
-    session_id: str,
-    request: Request,
-    file: UploadFile,
-    user: AuthUser = Depends(get_current_user),
-) -> dict:
-    session = await get_or_rehydrate_session(request, session_id, user.user_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-
+async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) -> dict:
+    """Shared by the session-scoped and standalone upload endpoints: stores +
+    parses + chunks + embeds `file` and registers it in the per-user document
+    registry. Returns the same shape both endpoints respond with."""
     filename = file.filename or "upload"
     extension = Path(filename).suffix.lower()
     if extension not in _SUPPORTED_UPLOAD_EXTENSIONS:
@@ -79,24 +74,33 @@ async def upload_file(
         raise HTTPException(status_code=413, detail=f"File too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB)")
 
     runtime = request.app.state.runtime
-    logger.info("[UPLOAD] user=%s session=%s filename=%s size=%d", user.user_id, session_id, filename, len(file_bytes))
+    logger.info("[UPLOAD] user=%s filename=%s size=%d", user.user_id, filename, len(file_bytes))
+
+    # Write straight into the shared document store (settings.document_store.dir,
+    # the same directory the indexing MCP server's own DocumentStore reads from —
+    # both processes run on the same host) rather than base64-encoding the file
+    # into the MCP tool call: fastmcp's streamable-HTTP transport caps a single
+    # request body at 4MiB, and base64 alone inflates the payload ~33% on top of
+    # that, so anything past a few MB of actual file content used to 413 here.
+    # Passing just the document_id keeps the tool call tiny regardless of file size.
+    document_id = str(uuid4())
+    _document_store.create_document(file_bytes=file_bytes, document_id=document_id, filename=filename)
 
     try:
-        # upload_and_index_document takes file_b64 (a plain base64 str),
-        # not a `bytes`-typed param — see its docstring for why: pydantic's
-        # default JSON coercion for a `bytes` field treats an incoming JSON
-        # string as literal UTF-8 text rather than base64, which corrupts
-        # (or outright fails on) arbitrary binary content like a PDF.
+        # Uses the "_v2" (LangChain) indexing pipeline — retrieval on these
+        # documents (streaming_agent.py's _with_attached_documents_note) is
+        # pointed at the matching "_v2" retrieval tools, since v1/v2 write to
+        # separate vector collections and can't read each other's documents.
         result = await runtime.mcp.call_tool(
-            "indexing_upload_and_index_document",
+            "indexing_upload_and_index_document_v2",
             {
-                "file_b64": base64.b64encode(file_bytes).decode("ascii"),
+                "document_id": document_id,
                 "filename": filename,
                 "user_id": user.user_id,
             },
         )
     except Exception as exc:  # noqa: BLE001 — surface as a normal HTTP error, not a 500 stack trace
-        logger.exception("upload_and_index_document call failed for %s", filename)
+        logger.exception("upload_and_index_document_v2 call failed for %s", filename)
         raise HTTPException(status_code=502, detail=f"Indexing failed: {exc}")
 
     data = _tool_result_json(result)
@@ -119,8 +123,6 @@ async def upload_file(
             chunks_indexed=chunks_indexed,
         )
 
-    session.add_attached_document(document_id, filename, content_type)
-
     return {
         "document_id": document_id,
         "filename": filename,
@@ -129,12 +131,63 @@ async def upload_file(
     }
 
 
+@documents_router.post("/api/sessions/{session_id}/upload")
+async def upload_file(
+    session_id: str,
+    request: Request,
+    file: UploadFile,
+    user: AuthUser = Depends(get_current_user),
+) -> dict:
+    session = await get_or_rehydrate_session(request, session_id, user.user_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result = await _upload_and_index(request, file, user)
+    session.add_attached_document(result["document_id"], result["filename"], result["content_type"])
+    return result
+
+
+@documents_router.post("/api/documents/upload")
+async def upload_document(
+    request: Request,
+    file: UploadFile,
+    user: AuthUser = Depends(get_current_user),
+) -> dict:
+    """Uploads + indexes a document from the standalone Documents page, with
+    no chat session involved — the user references it later by document_id
+    from any conversation."""
+    return await _upload_and_index(request, file, user)
+
+
 @documents_router.get("/api/documents")
 async def list_documents(request: Request, user: AuthUser = Depends(get_current_user)) -> list[dict]:
     registry = request.app.state.document_registry
     if registry is None:
         return []
     return await registry.list_for_user(user.user_id)
+
+
+@documents_router.get("/api/documents/{document_id}/content")
+async def get_document_content(
+    document_id: str, request: Request, user: AuthUser = Depends(get_current_user)
+) -> FileResponse:
+    """Serves a previously uploaded document's original bytes for the
+    Documents page's "view" action, after checking the caller owns it."""
+    registry = request.app.state.document_registry
+    if registry is None or not await registry.is_owner(document_id, user.user_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    path = _document_store.get_file_path(document_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    media_type, _ = mimetypes.guess_type(path.name)
+    disposition = "inline" if media_type in _INLINE_CONTENT_TYPES or media_type == "application/pdf" else "attachment"
+    doc = await registry.get(document_id)
+    display_name = (doc or {}).get("original_name") or path.name
+    return FileResponse(
+        path, filename=display_name, media_type=media_type, content_disposition_type=disposition
+    )
 
 
 @documents_router.delete("/api/documents/{document_id}", status_code=204)
@@ -147,6 +200,15 @@ async def delete_document(
     deleted = await registry.delete(document_id, user.user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Document not found")
+
+    # Matches _upload_and_index's indexing_upload_and_index_document_v2 call —
+    # a document from this registry was indexed into the v2 collection, so
+    # cleanup must target the same one.
+    runtime = request.app.state.runtime
+    try:
+        await runtime.mcp.call_tool("indexing_delete_document_v2", {"document_id": document_id})
+    except Exception:  # noqa: BLE001 — the registry entry is already gone; log and move on
+        logger.exception("indexing_delete_document_v2 call failed for %s", document_id)
 
 
 def _tool_result_json(result) -> dict:

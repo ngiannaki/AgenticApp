@@ -67,9 +67,11 @@ class ChatSession:
     user_id: str = ""
     """Owner of this session — set at creation from the authenticated caller
     (backend.apps.api.auth.get_current_user). Never taken from model/tool
-    input: it's what streaming_agent.py force-injects into user-scoped tool
-    calls (retrieval_retrieve_document, retrieval_get_document_info,
-    indexing_upload_and_index_document)
+    input: it's what streaming_agent.py force-injects into every tool call
+    whose MCP schema declares a user_id parameter (see
+    AgentRuntime.user_scoped_tool_names — currently
+    retrieval_retrieve_document_v2, retrieval_get_document_info_v2,
+    indexing_upload_and_index_document_v2, and their v1 equivalents)
     so the model can never impersonate another user."""
     attached_documents: list[dict[str, Any]] = field(default_factory=list)
     """Documents uploaded into this conversation: [{document_id, filename, content_type}, ...]."""

@@ -75,3 +75,41 @@ def get_llamaindex_embedding(model: str, **kwargs: Any):
     from llama_index.embeddings.ollama import OllamaEmbedding as LlamaOllamaEmbedding
 
     return LlamaOllamaEmbedding(model_name=model, base_url=settings.ollama.base_url, **kwargs)
+
+
+def get_langchain_llm(model: str, temperature: float = 0.0, **kwargs: Any):
+    """A LangChain chat model for the given model, using Ollama in DEV and OpenAI in PROD.
+
+    Parallel to get_llamaindex_llm above, for the LangChain-based v2 RAG
+    pipeline (backend/mcp_servers/indexing, retrieval `..._v2` tools). Kept
+    separate from the llama_index helpers rather than shared, since the two
+    RAG pipelines use unrelated client libraries.
+    """
+    if settings.is_prod:
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(model=model, temperature=temperature, api_key=settings.openai.api_key, base_url=settings.openai.base_url, **kwargs)
+
+    from langchain_ollama import ChatOllama
+
+    kwargs.setdefault("num_ctx", settings.ollama.num_ctx)
+    return ChatOllama(model=model, base_url=settings.ollama.base_url, temperature=temperature, **kwargs)
+
+
+def get_langchain_embedding(model: str, **kwargs: Any):
+    """A LangChain embedding model for the given model, using Ollama in DEV and OpenAI in PROD.
+
+    Parallel to get_llamaindex_embedding above, for the LangChain-based v2
+    RAG pipeline. Must embed into the same vector space as the llama_index
+    pipeline's model (same `settings.embedding_model`) so DEV/PROD stay
+    consistent, but v2 writes to its own Chroma collections
+    (`settings.rag_v2.collection_prefix`) rather than sharing v1's.
+    """
+    if settings.is_prod:
+        from langchain_openai import OpenAIEmbeddings
+
+        return OpenAIEmbeddings(model=model, api_key=settings.openai.api_key, base_url=settings.openai.base_url, **kwargs)
+
+    from langchain_ollama import OllamaEmbeddings
+
+    return OllamaEmbeddings(model=model, base_url=settings.ollama.base_url, **kwargs)

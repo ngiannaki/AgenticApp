@@ -57,7 +57,6 @@ from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
 from backend.apps.api.streaming_agent import (
     _ASK_USER_TOOL_SCHEMA,
-    _USER_SCOPED_TOOLS,
     ASK_USER_TOOL_NAME,
     AgentRuntime,
     _extract_text,
@@ -160,7 +159,10 @@ class OrchestratedAgentRuntime:
                 if decision.action == "edit" and decision.arguments is not None:
                     arguments = decision.arguments
 
-            if name in _USER_SCOPED_TOOLS:
+            # Derived from this tool's own schema (see AgentRuntime.user_scoped_tool_names
+            # in streaming_agent.py) rather than a hardcoded name list — `schema` is this
+            # tool's own inputSchema, already in closure scope from _build_mcp_tool below.
+            if "user_id" in (schema.get("properties") or {}):
                 arguments["user_id"] = session.user_id
 
             await queue.put(events.status(f"calling {name}"))

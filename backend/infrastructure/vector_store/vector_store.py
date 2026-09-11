@@ -272,6 +272,20 @@ class VectorStore:
                 "error": str(e)
             }
     
+    def delete_collection(self, document_id: str) -> dict:
+        """
+        Delete a document's collection (and all its vectors) from ChromaDB.
+        Safe to call even if the collection doesn't exist.
+        """
+        collection_name = f"doc_{document_id}"
+        try:
+            self.chroma_client.delete_collection(name=collection_name)
+            logger.info(f"Deleted collection {collection_name}")
+            return {"success": True, "document_id": document_id}
+        except Exception as e:
+            logger.warning(f"Failed to delete collection {collection_name}: {str(e)}")
+            return {"success": False, "document_id": document_id, "error": str(e)}
+
     def search(self, query: str, document_id: str = None, top_k: int = 5) -> dict:
         """
         Search the vector store.

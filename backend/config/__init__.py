@@ -1,4 +1,11 @@
-from .llm_client import get_async_openai_client, get_llamaindex_embedding, get_llamaindex_llm, get_ollama_extra_body
+from .llm_client import (
+    get_async_openai_client,
+    get_langchain_embedding,
+    get_langchain_llm,
+    get_llamaindex_embedding,
+    get_llamaindex_llm,
+    get_ollama_extra_body,
+)
 from .settings import (
     ApiSettings,
     DbMcpSettings,
@@ -23,4 +30,6 @@ __all__ = [
     "get_ollama_extra_body",
     "get_llamaindex_llm",
     "get_llamaindex_embedding",
+    "get_langchain_llm",
+    "get_langchain_embedding",
 ]

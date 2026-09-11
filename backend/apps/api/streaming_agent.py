@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Any, AsyncIterator
 
@@ -39,7 +40,12 @@ ASK_USER_TOOL_NAME = "ask_user"
 # _handle_tool_call overwrites/injects this field itself right before
 # dispatch, so a model can't retrieve or index another user's documents no
 # matter what it puts in its own tool-call arguments.
-_USER_SCOPED_TOOLS = {"retrieval_retrieve_document", "retrieval_get_document_info", "indexing_upload_and_index_document"}
+#
+# Previously a hardcoded set of tool names, which silently stopped scoping a
+# tool the moment its name changed (e.g. a "_v2" tool) or a new user_id-taking
+# tool was added and someone forgot to list it here. Now computed from each
+# tool's own MCP-advertised input schema instead — see
+# AgentRuntime.user_scoped_tool_names — so this is automatic.
 
 # A local tool, not backed by any MCP server: handled entirely inside
 # _handle_tool_call by pausing the turn on a PendingQuestion, the same way a
@@ -75,27 +81,67 @@ _ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+
+
 def _with_attached_documents_note(session: ChatSession, question: str) -> str:
-    """Prepend a short note listing this session's attached documents so the
-    model knows which document_ids exist to call retrieve_document on. Only
-    the composed text sent to the model is affected — the persisted/displayed
-    chat history keeps the user's original `question` (see routers/chat.py,
-    which passes `body.message` to persistence separately)."""
-    if not session.attached_documents:
+    """Prepend a short note pointing the model at the right retrieval tools
+    for any document_id it needs to work with this turn — both documents
+    attached to this session (uploaded from the chat's own attach button)
+    and bare document_ids the user typed directly (the expected flow for a
+    document uploaded from the standalone Documents page, which isn't tied
+    to any session). Only the composed text sent to the model is affected —
+    the persisted/displayed chat history keeps the user's original
+    `question` (see routers/chat.py, which passes `body.message` to
+    persistence separately).
+
+    Tool names here must match the MCP-aggregated names in self.tool_names
+    (server key prefix + function name, e.g. "retrieval_retrieve_document_v2"
+    for retrieval/server.py's retrieve_document_v2) — not the bare function
+    names, which aren't valid tool calls and previously sent the model
+    chasing "retrieve_document"/"get_document_info"/"read_document" (all
+    404s from _handle_tool_call's unknown-tool check).
+
+    Points at the "_v2" (LangChain hybrid retrieval + reranking) tools,
+    matching upload_and_index in routers/files.py, which indexes into the
+    same v2 collections — a document attached/uploaded through the API is
+    only ever indexed with v2, so retrieval must use v2 too or it won't find
+    it. Switch both together if you move back to v1.
+    """
+    attached_ids = {doc["document_id"] for doc in session.attached_documents}
+    mentioned_ids = [m for m in _UUID_RE.findall(question) if m not in attached_ids]
+
+    if not session.attached_documents and not mentioned_ids:
         return question
-    listing = ", ".join(
-        f"{doc['filename']} (document_id={doc['document_id']}, type={doc['content_type']})"
-        for doc in session.attached_documents
-    )
+
+    lines = []
+    if session.attached_documents:
+        listing = ", ".join(
+            f"{doc['filename']} (document_id={doc['document_id']}, type={doc['content_type']})"
+            for doc in session.attached_documents
+        )
+        lines.append(f"[Attached files: {listing}]")
+    if mentioned_ids:
+        lines.append(
+            "[The message below also mentions this document_id, or these "
+            f"document_ids, directly: {', '.join(mentioned_ids)} — treat each as "
+            "a document already uploaded and indexed, e.g. via the Documents "
+            "page, even though it has no filename here.]"
+        )
+
     note = (
-        f"[Attached files: {listing}]\n"
-        "These files were already uploaded and indexed into the vector store — "
-        "there is no local file_path for them, so read_document (which needs a "
-        "server-local file_path) will not work here. To answer questions about "
-        "an attached file's content, call retrieve_document(document_id, query) "
-        "with a query describing what you're looking for (call it more than "
-        "once with different queries if you need several kinds of information), "
-        "or get_document_info(document_id) for metadata like section/page counts."
+        "\n".join(lines) + "\n"
+        "These documents were already uploaded and indexed into the vector "
+        "store — there is no local file_path for them, so indexing_read_document "
+        "(which needs a server-local file_path) will not work here. To answer "
+        "questions about a document's content, call "
+        "retrieval_retrieve_document_v2(document_id, query) with a query describing "
+        "what you're looking for (call it more than once with different queries "
+        "if you need several kinds of information), or "
+        "retrieval_get_document_info_v2(document_id) for metadata like section/page "
+        "counts."
     )
     return f"{note}\n\n{question}"
 
@@ -167,6 +213,17 @@ class AgentRuntime:
     @property
     def tool_names(self) -> list[str]:
         return [t["function"]["name"] for t in self.tools]
+
+    @property
+    def user_scoped_tool_names(self) -> set[str]:
+        """Names of tools whose MCP input schema declares a `user_id`
+        parameter — see _USER_SCOPED_TOOLS's comment above for why this is
+        derived rather than hardcoded."""
+        return {
+            t["function"]["name"]
+            for t in self.tools
+            if "user_id" in ((t["function"]["parameters"] or {}).get("properties") or {})
+        }
 
     async def _chat(
         self, session: ChatSession, tools_enabled: bool = True
@@ -330,7 +387,7 @@ class AgentRuntime:
             if decision.action == "edit" and decision.arguments is not None:
                 arguments = decision.arguments
 
-        if name in _USER_SCOPED_TOOLS:
+        if name in self.user_scoped_tool_names:
             arguments["user_id"] = session.user_id
 
         yield events.status(f"calling {name}")

@@ -19,6 +19,7 @@ from backend.mcp_servers.indexing.parsers.reader import read_document as _read_d
 from backend.mcp_servers.indexing.parsers.txt_reader import parse_txt
 from backend.mcp_servers.indexing.parsers.xlsx_reader import parse_xlsx
 from backend.infrastructure.vector_store import VectorStore
+from backend.mcp_servers.indexing.langchain_pipeline import LangchainIndexPipelineV2
 import logging
 from uuid import uuid4
 import base64
@@ -41,6 +42,7 @@ logger.setLevel(logging.INFO)
 
 store = DocumentStore()
 vector_store = VectorStore()
+indexer_v2 = LangchainIndexPipelineV2()
 mcp = FastMCP("indexing")
 
 @mcp.tool
@@ -184,7 +186,7 @@ def _parse_for_indexing(file_path: Path, content_type: str) -> dict:
     raise ValueError(f"Unsupported content type: {content_type}")
 
 
-@mcp.tool
+#@mcp.tool
 def upload_and_index_document(file_b64: str, filename: str, user_id: str) -> dict:
     """
     Upload and index a document of any supported type in one step:
@@ -267,7 +269,177 @@ def upload_and_index_document(file_b64: str, filename: str, user_id: str) -> dic
         return {"success": False, "document_id": document_id, "error": str(e)}
 
 
+#@mcp.tool
+def delete_document(document_id: str) -> dict:
+    """
+    Permanently delete a document: removes its stored file and its vector
+    collection from ChromaDB. Does not touch the per-user document registry
+    (the API layer owns that) — call this alongside removing the registry
+    entry, not instead of it.
+
+    Args:
+        document_id: UUID of the document to delete
+
+    Returns:
+        A dictionary with success and document_id
+    """
+    logger.info(f"[DELETE_DOCUMENT] Deleting {document_id}")
+    vector_result = vector_store.delete_collection(document_id)
+    try:
+        store.delete(document_id)
+    except Exception as e:
+        logger.error(f"[DELETE_DOCUMENT] Failed to delete stored file for {document_id}: {str(e)}")
+        return {"success": False, "document_id": document_id, "error": str(e)}
+
+    return {"success": True, "document_id": document_id, "vector_deleted": vector_result.get("success", False)}
+
+
 @mcp.tool
+def upload_and_index_document_v2(
+    file_b64: str | None = None,
+    filename: str = "",
+    user_id: str = "",
+    document_id: str | None = None,
+) -> dict:
+    """
+    LangChain-native equivalent of upload_and_index_document: same supported
+    types (pdf, csv, xlsx/xlsm, txt, md, log, docx, pptx), but parses with
+    LangChain document loaders and indexes into a separate v2 vector
+    collection using LangChain's text splitters + Chroma integration instead
+    of llama_index.
+
+    Use this (paired with retrieve_document_v2 in the retrieval server) when
+    you want the state-of-the-art hybrid retrieval + reranking pipeline;
+    use upload_and_index_document/retrieve_document for the original
+    pipeline. The two pipelines are fully independent — a document indexed
+    with one is invisible to the other (different Chroma collections), so
+    index with whichever tool you intend to later retrieve with.
+
+    Two ways to supply the file — pass exactly one:
+    - file_b64: raw bytes, base64-encoded, for a small file. FastMCP's
+      streamable-HTTP transport caps a single request body at 4MiB (see
+      mcp.server.streamable_http_manager.DEFAULT_MAX_REQUEST_BODY_SIZE), and
+      base64 alone inflates the payload ~33% on top of that, so this mode
+      413s well under 4MiB of actual file content.
+    - document_id: an existing document already written to the shared
+      document store (backend.core.storage.document_store.DocumentStore,
+      at settings.document_store.dir) by the caller — e.g. the API layer's
+      routers/files.py, which writes the upload straight to that shared
+      directory itself and passes only the (tiny) document_id here, so a
+      large file's bytes never travel over this MCP call at all. The
+      document_id must already have a file at
+      DocumentStore.get_file_path(document_id) or this returns an error;
+      the document is then indexed under that same document_id (a fresh one
+      is not minted, unlike the file_b64 path).
+
+    `user_id` scopes ownership exactly like upload_and_index_document — it
+    is always supplied by the calling application, never asked of an end
+    user.
+
+    Args:
+        file_b64: The file's raw bytes, base64-encoded (small-file mode).
+        filename: Original filename (used to detect type and for display)
+        user_id: Owner of this document
+        document_id: UUID of a file already stored via DocumentStore
+            (large-file mode — mutually exclusive with file_b64)
+
+    Returns:
+        A dictionary with document_id, content_type, chunks_indexed, and
+        pipeline="langchain_v2".
+    """
+    if not filename:
+        return {"success": False, "error": "filename is required"}
+
+    file_path = None
+    file_bytes = None
+    if document_id:
+        logger.info(f"[UPLOAD_AND_INDEX_V2] user={user_id} filename={filename} using pre-stored document_id={document_id}")
+        file_path = store.get_file_path(document_id)
+        if file_path is None:
+            logger.warning(f"[UPLOAD_AND_INDEX_V2] user={user_id} no stored file for document_id={document_id}")
+            return {"success": False, "document_id": document_id, "error": f"No stored file found for document_id={document_id}"}
+        fallback_bytes = file_path.read_bytes()[:4096]
+    elif file_b64:
+        document_id = str(uuid4())
+        logger.info(f"[UPLOAD_AND_INDEX_V2] user={user_id} filename={filename} UUID: {document_id}")
+        try:
+            file_bytes = base64.b64decode(file_b64)
+        except Exception as e:
+            logger.warning(f"[UPLOAD_AND_INDEX_V2] user={user_id} invalid base64 for {filename}: {e}")
+            return {"success": False, "error": f"Invalid base64 file content: {e}"}
+        fallback_bytes = file_bytes[:4096]
+    else:
+        return {"success": False, "error": "Either file_b64 or document_id (for an already-stored file) must be provided"}
+
+    try:
+        content_type = detect_document_type_from_filename(filename, fallback_bytes=fallback_bytes)
+    except ValueError as e:
+        logger.warning(f"[UPLOAD_AND_INDEX_V2] user={user_id} rejected {filename}: {e}")
+        return {"success": False, "document_id": document_id, "error": str(e)}
+
+    try:
+        if file_path is None:  # file_b64 mode — not yet written to disk
+            assert file_bytes is not None
+            file_path = store.create_document(file_bytes=file_bytes, document_id=document_id, filename=filename)
+            logger.info(f"[UPLOAD_AND_INDEX_V2] user={user_id} stored {document_id} as {content_type} ({len(file_bytes)} bytes)")
+
+        index_result = indexer_v2.index_document(
+            document_id=document_id,
+            file_path=file_path,
+            content_type=content_type,
+            document_name=filename,
+            user_id=user_id,
+        )
+
+        if not index_result.get("success"):
+            logger.error(f"[UPLOAD_AND_INDEX_V2] user={user_id} indexing failed for {document_id}: {index_result.get('error')}")
+            return {"success": False, "document_id": document_id, "error": index_result.get("error", "Indexing failed")}
+
+        logger.info(
+            f"[UPLOAD_AND_INDEX_V2] user={user_id} indexed {document_id}: "
+            f"{index_result.get('chunks_indexed', 0)} chunks"
+        )
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "filename": filename,
+            "content_type": content_type,
+            "chunks_indexed": index_result.get("chunks_indexed", 0),
+            "pipeline": "langchain_v2",
+        }
+    except Exception as e:
+        logger.error(f"[UPLOAD_AND_INDEX_V2] user={user_id} failed for {document_id}: {str(e)}", exc_info=True)
+        return {"success": False, "document_id": document_id, "error": str(e)}
+
+
+@mcp.tool
+def delete_document_v2(document_id: str) -> dict:
+    """
+    Permanently delete a document indexed via upload_and_index_document_v2:
+    removes its stored file and its v2 vector collection from ChromaDB.
+
+    This does not touch a v1 collection for the same document_id (if any) —
+    call delete_document too if the document was also indexed with v1.
+
+    Args:
+        document_id: UUID of the document to delete
+
+    Returns:
+        A dictionary with success and document_id
+    """
+    logger.info(f"[DELETE_DOCUMENT_V2] Deleting {document_id}")
+    vector_result = indexer_v2.delete_document(document_id)
+    try:
+        store.delete(document_id)
+    except Exception as e:
+        logger.error(f"[DELETE_DOCUMENT_V2] Failed to delete stored file for {document_id}: {str(e)}")
+        return {"success": False, "document_id": document_id, "error": str(e)}
+
+    return {"success": True, "document_id": document_id, "vector_deleted": vector_result.get("success", False)}
+
+
+#@mcp.tool
 def read_document(file_path: str, format: str = "markdown") -> dict:
     """Read a PDF, CSV, XLSX, or TXT/MD/LOG file and return its content.
 
@@ -467,7 +639,7 @@ def parse_and_index(document_id: str, use_hierarchical: bool = True) -> dict:
             "error": str(e)
         }
 
-@mcp.tool
+#@mcp.tool
 def parse_and_index_enhanced(
     document_id: str,
     document_name: str = "Untitled",

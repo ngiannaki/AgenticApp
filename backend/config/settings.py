@@ -391,6 +391,35 @@ class RerankingSettings(BaseSettings):
     retrieval_threshold: float = Field(default=0.1, description="Relevance threshold used by the retrieval MCP server's reranker.")
 
 
+class LangchainRagSettings(BaseSettings):
+    """Config for the LangChain-based v2 indexing/retrieval tools
+    (backend/mcp_servers/indexing, retrieval `..._v2` tools).
+
+    This is a parallel pipeline to the llama_index-based v1 tools, not a
+    replacement — it writes/reads its own Chroma collections (named
+    `collection_prefix + document_id`) on the same Chroma server, so v1 and
+    v2 never see each other's data.
+    """
+
+    model_config = _settings_config("RAG_V2_")
+
+    collection_prefix: str = "docv2_"
+
+    # --- Chunking (indexing) -------------------------------------------------
+    chunk_size: int = Field(default=1000, gt=0, description="Target chunk size (characters) for RecursiveCharacterTextSplitter.")
+    chunk_overlap: int = Field(default=150, ge=0, description="Overlap (characters) between adjacent chunks.")
+
+    # --- Hybrid retrieval + reranking ----------------------------------------
+    default_top_k: int = Field(default=5, gt=0, description="Chunks returned when the caller doesn't specify top_k.")
+    max_top_k: int = Field(default=25, gt=0, description="Hard ceiling on top_k accepted from a caller.")
+    fetch_k_multiplier: int = Field(default=4, gt=0, description="Each of the dense/sparse retrievers fetches top_k * this many candidates before ensembling/reranking.")
+    max_fetch_k: int = Field(default=40, gt=0, description="Hard ceiling on the fetch_k computed above.")
+    dense_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the vector (Chroma) retriever.")
+    sparse_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the keyword (BM25) retriever.")
+    use_reranker: bool = Field(default=True, description="Rerank the ensembled candidates with a cross-encoder before truncating to top_k.")
+    rerank_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-12-v2", description="HuggingFace cross-encoder model id used by the reranker.")
+
+
 class AuthSettings(BaseSettings):
     """Email/password auth for the API (backend/apps/api/auth.py)."""
 
@@ -452,6 +481,7 @@ class Settings:
         self.document_store = DocumentStoreSettings()
         self.artifact_store = ArtifactStoreSettings()
         self.reranking = RerankingSettings()
+        self.rag_v2 = LangchainRagSettings()
         self.google_docai = GoogleDocAISettings()
         self.auth = AuthSettings()
 
