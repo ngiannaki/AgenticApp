@@ -248,7 +248,7 @@ def delete_data(
 
 
 @mcp.tool
-def query_data(sql: str) ->dict: #, parameters: Optional[list] = None) -> dict:
+def query_data(sql: str, parameters: Optional[list] = None) -> dict:
     """Run a postgres read-only SQL query (SELECT, with JOIN/WHERE/GROUP BY/HAVING/
     ORDER BY/LIMIT/OFFSET/CTEs) and return the matching rows.
 
@@ -256,14 +256,17 @@ def query_data(sql: str) ->dict: #, parameters: Optional[list] = None) -> dict:
     SQL executor: every query is parsed into an AST and validated before
     execution. INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE/GRANT/REVOKE,
     multiple statements, transaction control, and dangerous administrative
-    functions are all rejected. Use `%s` placeholders for parameters, e.g.
+    functions are all rejected. Use `%s` placeholders for any value in the
+    query and pass the actual values in `parameters`, e.g.
     `sql="SELECT id, title FROM documents WHERE source = %s LIMIT 20"`,
-    `parameters=["internal"]` — values are always bound, never interpolated.
+    `parameters=["internal"]` — values are always bound at execution time,
+    never string-interpolated into `sql` yourself. `parameters` must have
+    exactly as many entries as there are `%s` placeholders, in order.
     Results are capped in row count and byte size by server configuration;
     check the `truncated` field in the response.
     """
 
-    request = QueryDataRequest(sql=sql, parameters=[])
+    request = QueryDataRequest(sql=sql, parameters=parameters or [])
     return _handle(
         "query_data", _query_data, request,
         settings=settings, permissions=permissions, db=db,

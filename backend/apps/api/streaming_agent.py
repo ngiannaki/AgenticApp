@@ -26,13 +26,22 @@ import openai
 from fastmcp import Client
 
 from backend.apps.api import events
+from backend.apps.api import skills as skills_lib
 from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
-from backend.config import get_async_openai_client, get_ollama_extra_body, settings as app_settings
+from backend.config import get_async_openai_client, get_chat_extra_body, settings as app_settings
 
 logger = logging.getLogger("agentic_api")
 
 ASK_USER_TOOL_NAME = "ask_user"
+GET_SKILL_TOOL_NAME = "get_skill"
+
+# Registered as MCP tools (so FastAPI routes can call them via
+# runtime.mcp.call_tool) but deliberately withheld from the model's own
+# tool list in _load_tools — each is a raw/unscored data dump meant for a
+# specific UI (the Documents page's chunk browser + citation preview), not
+# something the chat agent should ever reach for to answer a question.
+_INTERNAL_ONLY_TOOLS = {"retrieval_get_document_chunks_v2"}
 
 # Tool calls whose user_id argument must come from the authenticated session,
 # never from the model. The model is told which document_ids are attached
@@ -81,6 +90,33 @@ _ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# One more local (non-MCP) tool, gated behind settings.api.skills_enabled —
+# see backend/apps/api/skills.py. The skill *index* (name + description) is
+# not a tool: it's injected straight into the session's system prompt by
+# system_prompt_for() below, because a model cannot choose to look up a menu
+# it doesn't know exists. get_skill fetches one skill's full body on demand,
+# which is the only part that belongs behind a tool call.
+_GET_SKILL_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": GET_SKILL_TOOL_NAME,
+        "description": (
+            "Read one skill's full step-by-step instructions by name. The available "
+            "skills and what each one covers are listed in your system prompt. Call "
+            "this BEFORE starting a task a listed skill covers, then follow what it "
+            "says — it overrides your default approach for that task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The skill's exact name as listed in the system prompt."},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+
 _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
@@ -109,6 +145,13 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
     same v2 collections — a document attached/uploaded through the API is
     only ever indexed with v2, so retrieval must use v2 too or it won't find
     it. Switch both together if you move back to v1.
+
+    Also nudges the model toward get_table_of_contents_v2 first for
+    structural questions, then retrieve_document_v2's `filters` param to
+    scope the search — otherwise the model tends to skip straight to a blind
+    top-k query, since this note is what it actually reads each turn (the
+    full filters/TOC guidance lives in retrieve_document_v2's own docstring,
+    but that's easy to miss buried in the tool list).
     """
     attached_ids = {doc["document_id"] for doc in session.attached_documents}
     mentioned_ids = [m for m in _UUID_RE.findall(question) if m not in attached_ids]
@@ -135,15 +178,147 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
         "\n".join(lines) + "\n"
         "These documents were already uploaded and indexed into the vector "
         "store — there is no local file_path for them, so indexing_read_document "
-        "(which needs a server-local file_path) will not work here. To answer "
-        "questions about a document's content, call "
-        "retrieval_retrieve_document_v2(document_id, query) with a query describing "
-        "what you're looking for (call it more than once with different queries "
-        "if you need several kinds of information), or "
+        "(which needs a server-local file_path) will not work here. If the "
+        "question asks about the document's structure, sections, or where "
+        "something is located (e.g. \"what's in this document\", \"which section "
+        "covers X\"), call retrieval_get_table_of_contents_v2(document_id) first "
+        "to see the heading outline (or page/sheet coverage if no outline was "
+        "captured) before searching — then use what you learn to scope the "
+        "search, e.g. retrieval_retrieve_document_v2(document_id, query, "
+        "filters={\"h1\": \"<heading>\"}) or filters={\"page\": N}, instead of a "
+        "blind top-k query. If the user is specifically asking about tables "
+        "(e.g. \"show me the tables\", \"what's in the pricing table\", \"only "
+        "tabular data\"), add filters={\"chunk_content_type\": \"table\"} to "
+        "restrict retrieval to table chunks only and exclude prose. For a plain "
+        "content question, call retrieval_retrieve_document_v2(document_id, query) "
+        "with a query describing what you're looking for (call it more than once "
+        "with different queries if you need several kinds of information), or "
         "retrieval_get_document_info_v2(document_id) for metadata like section/page "
         "counts."
     )
     return f"{note}\n\n{question}"
+
+
+def _collect_and_stamp_citations(
+    citations: list[dict[str, Any]], chunk_numbers: dict[str, int], name: str, ok: bool, text: str
+) -> str:
+    """Pull grounding out of a retrieve_document_v2 tool result, fold any
+    not-yet-seen chunk into `citations` (first-appearance order across the
+    whole turn — a later call re-returning an already-cited chunk reuses its
+    number rather than renumbering), and stamp a `<citation id="..."/>` tag
+    directly into the JSON handed back to the model, carrying that chunk's
+    own opaque `chunk_id`.
+
+    The stamping — and the choice of an id tag over a bracket number — is
+    what actually makes citations reliable. Asking the model to write "[n]"
+    itself requires it to reconstruct which ordinal a chunk was first
+    assigned, purely from memory, across however many retrieval calls it's
+    made this turn — the rag-retrieval-strategy skill's retry loop can mean
+    3-4 calls and dozens of candidate chunks, and that cross-call
+    bookkeeping is exactly the kind of thing a smaller model gets wrong.
+    Observed in practice: the model correctly identified and quoted the
+    right chunk (a financial statement table, correctly stating "page 51"
+    pulled from the TOC) but emitted a "[n]" marker that actually resolved
+    to an unrelated chunk from an earlier, broader retrieval call that had
+    been numbered "[n]" first (a decoy percentage table on a different
+    page) — a plausible-looking number pointing at the wrong source.
+
+    A `chunk_id` tag fixes this by turning citing into a copy task instead
+    of arithmetic: the model reproduces a string it just read seconds
+    earlier. It also fails *safe* on a mistake — a typo'd id matches no real
+    chunk and is simply dropped (see _render_citations), whereas a typo'd
+    number can silently land on a different real, wrong chunk, exactly as
+    happened here.
+
+    Returns the (possibly modified) text to actually store in conversation
+    memory and show in the tool-result event, so the model reads the same
+    stamped version this function computed from.
+    """
+    if not ok or not name.endswith("retrieve_document_v2"):
+        return text
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+
+    stamped = False
+    for chunk in data.get("source_chunks") or []:
+        grounding = chunk.get("grounding") or {}
+        chunk_id = grounding.get("chunk_id")
+        if not chunk_id:
+            continue
+        number = chunk_numbers.get(chunk_id)
+        if number is None:
+            number = len(citations) + 1
+            chunk_numbers[chunk_id] = number
+            citations.append({"number": number, "text": chunk.get("text", ""), "grounding": grounding})
+        chunk["cite_as"] = f'<citation id="{chunk_id}"/>'
+        stamped = True
+
+    return json.dumps(data) if stamped else text
+
+
+_CITATION_TAG_RE = re.compile(r'<citation\s+id="([^"]*)"\s*/?>')
+
+
+def _render_citations(
+    answer: str, citations: list[dict[str, Any]]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Turn the model's inline `<citation id="..."/>` tags into the
+    user-facing answer text plus the filtered, display-numbered Sources
+    list, in one pass.
+
+    Per tag found in `answer`, in reading order:
+    - Known id (matches a chunk actually stamped this turn, per `citations`)
+      -> replaced with a clean "[n]" marker, where n is assigned fresh here
+      — 1 for the first distinct chunk id encountered while scanning
+      `answer` left to right, 2 for the next new one, and so on. This is
+      deliberately *not* the chunk's original stamp-time number (its
+      first-appearance order across all of this turn's tool calls, which
+      can run into double digits after a few retries) — a turn that
+      retrieved a dozen candidates but only ended up citing two of them
+      should show "[1]" and "[2]" in the Sources strip, not e.g. "[4]" and
+      "[7]" inherited from how many chunks came before them in tool
+      results the user never sees.
+    - Unknown id (typo, invented, or left over from stale context) -> the
+      tag is silently removed. No raw markup or misleading marker is ever
+      shown to the user.
+
+    A citation never tagged anywhere in the answer is dropped from the
+    Sources list entirely — `citations` deliberately holds every chunk every
+    retrieve_document_v2 call returned this turn (so the list can't be
+    hallucinated), but a turn that retried retrieval can mean dozens of
+    candidates the answer never actually used; keeping only the tagged ones
+    is what makes the strip read as "these support the answer" rather than
+    "these were looked at".
+
+    Falls back to returning every collected citation, un-renumbered, when
+    the answer contains no tags at all, so a model that skipped the
+    instruction still shows sources rather than none.
+    """
+    by_chunk_id = {c["grounding"].get("chunk_id"): c for c in citations}
+    display_numbers: dict[str, int] = {}
+
+    def _replace(match: "re.Match[str]") -> str:
+        chunk_id = match.group(1)
+        if chunk_id not in by_chunk_id:
+            return ""
+        number = display_numbers.get(chunk_id)
+        if number is None:
+            number = len(display_numbers) + 1
+            display_numbers[chunk_id] = number
+        return f"[{number}]"
+
+    clean_answer = _CITATION_TAG_RE.sub(_replace, answer)
+
+    if not display_numbers:
+        return clean_answer, citations
+
+    cited = [
+        {**by_chunk_id[chunk_id], "number": number}
+        for chunk_id, number in sorted(display_numbers.items(), key=lambda kv: kv[1])
+    ]
+    return clean_answer, cited
 
 
 def _extract_reasoning(message: Any) -> str | None:
@@ -151,7 +326,7 @@ def _extract_reasoning(message: Any) -> str | None:
 
     Ollama's OpenAI-compatible endpoint adds a non-standard "reasoning" field
     to the message for thinking-capable models (e.g. gpt-oss:20b) when
-    `reasoning_effort` is set (see get_ollama_extra_body). It isn't part of
+    `reasoning_effort` is set (see get_chat_extra_body). It isn't part of
     the openai SDK's typed model, so it only surfaces via `model_extra`.
     """
     reasoning = getattr(message, "reasoning", None)
@@ -181,6 +356,7 @@ class AgentRuntime:
         self.llm = llm_client
         self.settings = settings
         self.tools: list[dict[str, Any]] = []
+        self._skill_index: list[skills_lib.SkillMeta] = []
 
     @classmethod
     async def connect(cls, servers: dict, settings: ApiSettings) -> "AgentRuntime":
@@ -206,9 +382,62 @@ class AgentRuntime:
                 },
             }
             for t in mcp_tools
+            if t.name not in _INTERNAL_ONLY_TOOLS
         ]
         self.tools.append(_ASK_USER_TOOL_SCHEMA)
-        logger.info("Connected to %d MCP tool(s) + ask_user: %s", len(self.tools) - 1, ", ".join(self.tool_names))
+
+        if self.settings.skills_enabled:
+            self._skill_index = skills_lib.load_skill_index(self.settings.skills_dir)
+            if self._skill_index:
+                self.tools.append(_GET_SKILL_TOOL_SCHEMA)
+            logger.info(
+                "Skills enabled: %d skill(s) found in %s: %s",
+                len(self._skill_index),
+                self.settings.skills_dir,
+                ", ".join(s.name for s in self._skill_index) or "(none)",
+            )
+
+        logger.info("Connected to %d MCP tool(s) + local tools: %s", len(self.tools), ", ".join(self.tool_names))
+
+    def system_prompt_for(self, base: str) -> str:
+        """Append the skills index to a session's system prompt.
+
+        The index is deliberately eager rather than behind a tool call. The
+        first version of this feature exposed a `list_skills` tool instead,
+        and the model never called it once — it cannot decide to consult a
+        menu it doesn't know exists. The Agent Skills format expects exactly
+        this split: name + description loaded up front for every skill, and
+        only the (much larger) body fetched on demand, which is get_skill's
+        whole job.
+
+        Returns `base` unchanged when skills are disabled or none loaded, so
+        a session's prompt is byte-for-byte what it was before this feature.
+
+        The reconciling sentence below (about "only call a tool when
+        needed") exists because `base` is normally DEFAULT_SYSTEM_PROMPT,
+        whose very first rule is not to call a tool speculatively or just
+        because it's available — from the model's side, get_skill looks
+        exactly like that: a call that doesn't itself answer anything. Left
+        unaddressed, that earlier, more foundational-sounding rule tends to
+        suppress the very calls this block is asking for. Kept here rather
+        than folded into DEFAULT_SYSTEM_PROMPT itself so the base prompt
+        stays correct on its own when skills are disabled.
+        """
+        if not self._skill_index:
+            return base
+        catalog = "\n".join(f"- {s.name}: {s.description}" for s in self._skill_index)
+        return (
+            f"{base}\n\n"
+            "AVAILABLE SKILLS\n"
+            "Each skill below is a step-by-step procedure written for this system. "
+            "Before you start a task that one of them covers, call get_skill with its "
+            "exact name, read it, and follow it — a skill's instructions take priority "
+            "over your own default approach for that task. This is required preparation, "
+            "not a speculative or demonstrative tool call, so it is not covered by the "
+            "'only call a tool when needed' rule above. Call get_skill at most once per "
+            "skill per turn, and don't call it at all when no skill matches.\n\n"
+            f"{catalog}"
+        )
 
     @property
     def tool_names(self) -> list[str]:
@@ -249,7 +478,7 @@ class AgentRuntime:
                     messages=session.memory.messages(),
                     tools=(self.tools or None) if tools_enabled else None,
                     temperature=self.settings.temperature,
-                    extra_body=get_ollama_extra_body(),
+                    extra_body=get_chat_extra_body(),
                 )
                 yield ("response", response)
                 return
@@ -283,6 +512,8 @@ class AgentRuntime:
         session.touch()
         session.memory.add_user(_with_attached_documents_note(session, question))
         max_iterations = self.settings.max_iterations
+        citations: list[dict[str, Any]] = []
+        chunk_numbers: dict[str, int] = {}
 
         for iteration in range(1, max_iterations + 1):
             session.touch()
@@ -305,11 +536,14 @@ class AgentRuntime:
                 yield events.reasoning(reasoning)
 
             if not message.tool_calls:
-                answer = message.content or ""
+                raw_answer = message.content or ""
+                answer, cited = _render_citations(raw_answer, citations)
                 session.memory.add_assistant(answer)
-                if not answer and iteration < max_iterations:
+                if not raw_answer.strip() and iteration < max_iterations:
                     yield events.status("empty response from model, retrying")
                     continue
+                if citations:
+                    yield events.citations(cited)
                 yield events.message(answer)
                 yield events.done(answer, iteration)
                 return
@@ -320,7 +554,7 @@ class AgentRuntime:
             )
 
             for call in message.tool_calls:
-                async for event in self._handle_tool_call(session, call):
+                async for event in self._handle_tool_call(session, call, citations, chunk_numbers):
                     yield event
 
         # Iteration budget exhausted: ask once more, tools disabled, to force an answer.
@@ -339,13 +573,22 @@ class AgentRuntime:
         reasoning = _extract_reasoning(final_message)
         if reasoning:
             yield events.reasoning(reasoning)
-        final = final_message.content or "Unable to produce a final answer in the allotted iterations."
+        raw_final = final_message.content or "Unable to produce a final answer in the allotted iterations."
+        final, cited = _render_citations(raw_final, citations)
 
         session.memory.add_assistant(final)
+        if citations:
+            yield events.citations(cited)
         yield events.message(final)
         yield events.done(final, max_iterations)
 
-    async def _handle_tool_call(self, session: ChatSession, call: Any) -> AsyncIterator[dict[str, Any]]:
+    async def _handle_tool_call(
+        self,
+        session: ChatSession,
+        call: Any,
+        citations: list[dict[str, Any]],
+        chunk_numbers: dict[str, int],
+    ) -> AsyncIterator[dict[str, Any]]:
         name = call.function.name
         arguments = json.loads(call.function.arguments) if call.function.arguments else {}
         call_id = str(uuid.uuid4())
@@ -355,6 +598,19 @@ class AgentRuntime:
         if name == ASK_USER_TOOL_NAME:
             async for event in self._handle_ask_user(session, call, call_id, arguments):
                 yield event
+            return
+
+        if name == GET_SKILL_TOOL_NAME:
+            skill_name = str(arguments.get("name") or "").strip()
+            body = skills_lib.read_skill_body(self.settings.skills_dir, skill_name) if skill_name else None
+            if body is None:
+                available = ", ".join(s.name for s in self._skill_index)
+                text = f"Error calling tool 'get_skill': unknown skill {skill_name!r}. Available skills: {available}."
+                yield events.tool_result(call_id, name, False, text)
+            else:
+                yield events.tool_result(call_id, name, True, body)
+                text = body
+            session.memory.add_tool_result(name, text, tool_call_id=call.id)
             return
 
         if name not in self.tool_names:
@@ -400,6 +656,7 @@ class AgentRuntime:
             ok = False
             logger.error(text)
 
+        text = _collect_and_stamp_citations(citations, chunk_numbers, name, ok, text)
         yield events.tool_result(call_id, name, ok, text)
         session.memory.add_tool_result(name, text, tool_call_id=call.id)
 

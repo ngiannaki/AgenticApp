@@ -36,15 +36,25 @@ def get_async_openai_client() -> AsyncOpenAI:
     return AsyncOpenAI(**_client_kwargs())
 
 
-def get_ollama_extra_body() -> dict[str, Any]:
-    """`extra_body` to pass into every `chat.completions.create()` call so Ollama
-    honors `settings.ollama.num_ctx` instead of silently truncating to its own
-    2048-token default, and requests a reasoning effort from thinking-capable
-    models (e.g. gpt-oss:20b) so their chain-of-thought comes back in the
-    response message's "reasoning" field. No-op in PROD, where the client
-    talks to real OpenAI.
+def get_chat_extra_body() -> dict[str, Any]:
+    """`extra_body` to pass into every `chat.completions.create()` call.
+
+    DEV (Ollama): requests `num_ctx` (Ollama's own default is a mere 2048
+    tokens regardless of what the model supports) and, for a thinking-capable
+    model like gpt-oss:20b, a reasoning effort so its chain-of-thought comes
+    back in the response message's "reasoning" field.
+
+    PROD (real OpenAI): empty unless `settings.openai.reasoning_effort` is
+    set. Only set that when CHAT_MODEL_PROD (or whichever _PROD model this
+    call is using) is itself a reasoning-capable model — OpenAI's
+    /v1/chat/completions rejects `reasoning_effort` outright for a classic
+    model like gpt-4o-mini, and separately rejects tool calls for a reasoning
+    model with *no* `reasoning_effort` at all, so the two must be kept in
+    sync with the model actually configured.
     """
     if settings.is_prod:
+        if settings.openai.reasoning_effort:
+            return {"reasoning_effort": settings.openai.reasoning_effort}
         return {}
     body: dict[str, Any] = {"options": {"num_ctx": settings.ollama.num_ctx}}
     if settings.ollama.reasoning_effort:

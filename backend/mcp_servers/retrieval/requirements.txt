@@ -25,3 +25,13 @@ langchain-openai>=0.3,<0.4
 langchain-ollama>=0.3,<0.4
 rank_bm25>=0.2,<1
 sentence-transformers>=3.0,<4
+
+# --- web_search / fetch_page tools (backend/mcp_servers/retrieval/web_search.py) ---
+#
+# ddgs (formerly duckduckgo_search) backs web_search - no API key needed.
+# trafilatura extracts main readable text from a fetched page's HTML for
+# fetch_page, stripping nav/ads/scripts. httpx (fetch_page's HTTP client)
+# is already a transitive dependency of fastmcp, so it isn't listed here.
+
+ddgs>=9,<10
+trafilatura>=1.12,<2

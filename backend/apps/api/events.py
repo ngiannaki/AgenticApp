@@ -15,6 +15,10 @@ interrupt - a tool call is paused pending human approval (interrupt_id, ...)
 question  - the model is asking the human a question and needs an answer
             before it can continue (question_id, prompt, options, allow_other)
 tool_result - a tool call finished (call_id, name, ok, result)
+citations - the distinct source chunks retrieved this turn (deduped by
+            chunk_id, numbered in first-appearance order), sent once right
+            before "message" so the frontend can resolve any [n] markers
+            the model wrote in its answer against this list
 message   - the assistant's final natural-language answer for this turn
 error     - something went wrong; the stream ends after this
 done      - turn finished (echoes the answer + iteration count)
@@ -75,6 +79,10 @@ def question(
 
 def tool_result(call_id: str, name: str, ok: bool, result: str) -> dict[str, Any]:
     return sse("tool_result", {"call_id": call_id, "name": name, "ok": ok, "result": result})
+
+
+def citations(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return sse("citations", {"items": items})
 
 
 def message(content: str) -> dict[str, Any]:

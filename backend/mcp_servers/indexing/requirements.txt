@@ -24,6 +24,13 @@ llama-index-core>=0.14,<0.15
 python-docx>=1.1,<2
 python-pptx>=1.0,<2
 
+# Legacy/OpenDocument spreadsheets (.xls / .ods) — openpyxl can't open
+# either, so parsers/xlsx_reader.py routes them through pandas with
+# engine="xlrd"/"odf" instead. Soft dependency: only imported on that path.
+pandas>=2.0,<3
+xlrd>=2.0,<3
+odfpy>=1.4,<2
+
 # --- v2 (LangChain) pipeline: upload_and_index_document_v2 / delete_document_v2 ---
 # (backend/mcp_servers/indexing/langchain_loaders.py, langchain_pipeline.py)
 #
@@ -32,12 +39,20 @@ python-pptx>=1.0,<2
 # langchain-ollama back get_langchain_embedding (backend/config/llm_client.py) —
 # OpenAI in PROD, Ollama in DEV, mirroring the llama_index embedding switch.
 #
-# docx2txt backs langchain_community's Docx2txtLoader (.docx). unstructured
-# backs UnstructuredPowerPointLoader (.pptx) and UnstructuredExcelLoader
-# (.xlsx) — a soft dependency in practice: langchain_loaders.py falls back to
-# this server's own docx/pptx/xlsx parsers if `unstructured` (or its own
-# extras) isn't installed, so v2 indexing still works for those types
-# without it, just via the fallback path.
+# docx2txt backs langchain_community's Docx2txtLoader (.docx, fallback only —
+# parse_docx is now the primary docx path, see langchain_loaders.py).
+# unstructured backs UnstructuredPowerPointLoader (.pptx) and
+# UnstructuredExcelLoader (.xlsx) — a soft dependency in practice:
+# langchain_loaders.py falls back to this server's own docx/pptx/xlsx
+# parsers if `unstructured` (or its own extras) isn't installed, so v2
+# indexing still works for those types without it, just via the fallback
+# path.
+#
+# pymupdf4llm backs langchain_structure.py's pymupdf4llm PDF engine
+# (RAG_V2_PDF_ENGINE=pymupdf4llm) — the lightweight alternative to the
+# default docling engine (docling is already required above). Soft
+# dependency: only imported when that engine is selected; falls back to
+# plain pymupdf text extraction if missing.
 langchain-core>=0.3,<0.4
 langchain-text-splitters>=0.3,<0.4
 langchain-community>=0.3,<0.4
@@ -46,3 +61,4 @@ langchain-openai>=0.3,<0.4
 langchain-ollama>=0.3,<0.4
 docx2txt>=0.8,<1
 unstructured[pptx,xlsx]>=0.16,<1
+pymupdf4llm>=0.0.17,<1

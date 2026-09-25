@@ -12,6 +12,11 @@
 # that litellm and llama-index-llms-openai in this repo aren't compatible
 # with yet — 0.19.x is the newest release that still works with the
 # openai>=2.45,<3 already pinned elsewhere.
+#
+# pyyaml is used by skills.py to parse SKILL.md frontmatter (the
+# list_skills/get_skill local tools, gated behind API_SKILLS_ENABLED —
+# already installed repo-wide as a dependency of backend/mcp_servers/db).
 
 bcrypt>=4.1,<6
 openai-agents>=0.19.4,<0.20
+pyyaml>=6.0,<7

@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from backend.config import get_async_openai_client, get_ollama_extra_body, settings
+from backend.config import get_async_openai_client, get_chat_extra_body, settings
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +339,7 @@ Rules:
             ],
             temperature=0,
             response_format={"type":"json_object"},
-            extra_body=get_ollama_extra_body(),
+            extra_body=get_chat_extra_body(),
         )
 
         content = (
@@ -417,7 +417,7 @@ Instructions:
                 },
             ],
             temperature=0,
-            extra_body=get_ollama_extra_body(),
+            extra_body=get_chat_extra_body(),
         )
 
         content = (

@@ -1,10 +1,10 @@
 from .llm_client import (
     get_async_openai_client,
+    get_chat_extra_body,
     get_langchain_embedding,
     get_langchain_llm,
     get_llamaindex_embedding,
     get_llamaindex_llm,
-    get_ollama_extra_body,
 )
 from .settings import (
     ApiSettings,
@@ -27,7 +27,7 @@ __all__ = [
     "get_api_settings",
     "get_db_mcp_settings",
     "get_async_openai_client",
-    "get_ollama_extra_body",
+    "get_chat_extra_body",
     "get_llamaindex_llm",
     "get_llamaindex_embedding",
     "get_langchain_llm",

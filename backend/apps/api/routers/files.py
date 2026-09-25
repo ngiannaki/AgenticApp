@@ -190,6 +190,35 @@ async def get_document_content(
     )
 
 
+@documents_router.get("/api/documents/{document_id}/chunks")
+async def get_document_chunks(
+    document_id: str, request: Request, user: AuthUser = Depends(get_current_user)
+) -> list[dict]:
+    """Every chunk of a document's v2 collection, in chunk_index order,
+    with its full text/metadata/grounding (chunk_id, chunk_content_type,
+    page/sheet/row, h1/h2/h3, ...). Backs the Documents page's chunk
+    preview only — chat retrieval always goes through the scored
+    retrieve_document_v2 tool instead, never this raw listing."""
+    registry = request.app.state.document_registry
+    if registry is None or not await registry.is_owner(document_id, user.user_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    runtime = request.app.state.runtime
+    try:
+        result = await runtime.mcp.call_tool(
+            "retrieval_get_document_chunks_v2",
+            {"document_id": document_id, "user_id": user.user_id},
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a normal HTTP error, not a 500 stack trace
+        logger.exception("get_document_chunks_v2 call failed for %s", document_id)
+        raise HTTPException(status_code=502, detail=f"Failed to load chunks: {exc}")
+
+    data = _tool_result_json(result)
+    if not data.get("success"):
+        raise HTTPException(status_code=404, detail=data.get("error", "Document not found"))
+    return data.get("chunks", [])
+
+
 @documents_router.delete("/api/documents/{document_id}", status_code=204)
 async def delete_document(
     document_id: str, request: Request, user: AuthUser = Depends(get_current_user)

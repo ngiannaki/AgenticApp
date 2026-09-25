@@ -31,7 +31,7 @@ async def rehydrate_session(request: Request, session_id: str, user_id: str) -> 
     history = await store.get_messages(session_id)
     session = request.app.state.session_manager.restore(
         session_id=session_id,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=request.app.state.runtime.system_prompt_for(DEFAULT_SYSTEM_PROMPT),
         max_history_messages=settings.max_history_messages,
         approval_required_tools=settings.approval_required_tools,
         history=history,

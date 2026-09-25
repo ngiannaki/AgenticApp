@@ -42,25 +42,12 @@ def _fallback_pdf(file_path: Path) -> list[Document]:
 
 
 def _load_pdf(file_path: Path) -> list[Document]:
-    try:
-        from langchain_community.document_loaders import PyMuPDFLoader
+    from backend.mcp_servers.indexing.langchain_structure import pdf_to_documents
 
-        docs = PyMuPDFLoader(str(file_path)).load()
-        if docs:
-            return docs
-    except Exception as e:
-        logger.warning(f"[LOADER_V2] PyMuPDFLoader failed for {file_path.name}, falling back: {e}")
-    return _fallback_pdf(file_path)
+    return pdf_to_documents(file_path)
 
 
 def _fallback_docx(file_path: Path) -> list[Document]:
-    from backend.mcp_servers.indexing.parsers.docx_reader import parse_docx
-
-    parsed = parse_docx(file_path)
-    return [Document(page_content=parsed.get("full_text", ""), metadata={"source": file_path.name})]
-
-
-def _load_docx(file_path: Path) -> list[Document]:
     try:
         from langchain_community.document_loaders import Docx2txtLoader
 
@@ -68,7 +55,27 @@ def _load_docx(file_path: Path) -> list[Document]:
         if docs and any(d.page_content.strip() for d in docs):
             return docs
     except Exception as e:
-        logger.warning(f"[LOADER_V2] Docx2txtLoader failed for {file_path.name}, falling back: {e}")
+        logger.warning(f"[LOADER_V2] Docx2txtLoader failed for {file_path.name}: {e}")
+    from backend.mcp_servers.indexing.parsers.docx_reader import parse_docx
+
+    parsed = parse_docx(file_path)
+    return [Document(page_content=parsed.get("full_text", ""), metadata={"source": file_path.name})]
+
+
+def _load_docx(file_path: Path) -> list[Document]:
+    """Primary path uses this repo's own docx reader (parsers/docx_reader.py),
+    which already renders headings as `#`-markdown and tables inline as
+    markdown tables — structure Docx2txtLoader's plain-text extraction
+    throws away. Docx2txtLoader is the fallback if that raises."""
+    try:
+        from backend.mcp_servers.indexing.parsers.docx_reader import parse_docx
+
+        parsed = parse_docx(file_path)
+        markdown = parsed.get("markdown", "")
+        if markdown.strip():
+            return [Document(page_content=markdown, metadata={"source": file_path.name})]
+    except Exception as e:
+        logger.warning(f"[LOADER_V2] parse_docx failed for {file_path.name}, falling back: {e}")
     return _fallback_docx(file_path)
 
 
@@ -146,6 +153,11 @@ def _fallback_xlsx(file_path: Path) -> list[Document]:
 
 
 def _load_xlsx(file_path: Path) -> list[Document]:
+    # UnstructuredExcelLoader only handles modern .xlsx/.xlsm; legacy .xls
+    # and OpenDocument .ods go straight to the pandas-backed fallback
+    # (xlsx_reader.py's engine="xlrd"/"odf" path).
+    if file_path.suffix.lower() in (".xls", ".ods"):
+        return _fallback_xlsx(file_path)
     try:
         from langchain_community.document_loaders import UnstructuredExcelLoader
 
@@ -193,4 +205,11 @@ def load_documents_v2(file_path: Path, content_type: str) -> list[Document]:
     if loader is None:
         raise ValueError(f"Unsupported content type for v2 loader: {content_type}")
     docs = loader(Path(file_path))
-    return [d for d in docs if d.page_content and d.page_content.strip()]
+    docs = [d for d in docs if d.page_content and d.page_content.strip()]
+    if content_type in ("csv", "xlsx"):
+        # Whole-file-is-tabular formats: tag every Document as table content
+        # up front so retrieval's chunk_content_type filter works for them
+        # too, without depending on unstructured's element categories.
+        for d in docs:
+            d.metadata.setdefault("chunk_content_type", "table")
+    return docs

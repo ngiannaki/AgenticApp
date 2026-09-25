@@ -15,6 +15,12 @@ _EXTENSION_MAP = {
     ".csv": "csv",
     ".xlsx": "xlsx",
     ".xlsm": "xlsx",
+    # Legacy/OpenDocument spreadsheets: openpyxl can't open either (it raises
+    # InvalidFileException), so they're routed through pandas'
+    # engine="xlrd"/"odf" fallback in parsers/xlsx_reader.py instead — see
+    # that module for the engine selection.
+    ".xls": "xlsx",
+    ".ods": "xlsx",
     ".txt": "txt",
     ".md": "txt",
     ".log": "txt",

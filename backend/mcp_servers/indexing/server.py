@@ -303,8 +303,8 @@ def upload_and_index_document_v2(
 ) -> dict:
     """
     LangChain-native equivalent of upload_and_index_document: same supported
-    types (pdf, csv, xlsx/xlsm, txt, md, log, docx, pptx), but parses with
-    LangChain document loaders and indexes into a separate v2 vector
+    types (pdf, csv, xlsx/xlsm/xls/ods, txt, md, log, docx, pptx), but parses
+    with LangChain document loaders and indexes into a separate v2 vector
     collection using LangChain's text splitters + Chroma integration instead
     of llama_index.
 

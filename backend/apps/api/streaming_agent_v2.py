@@ -42,7 +42,7 @@ from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
 from backend.apps.api.streaming_agent import AgentRuntime, _extract_reasoning, _with_attached_documents_note
 from backend.apps.client.memory import ConversationMemory
-from backend.config import get_ollama_extra_body, settings as app_settings
+from backend.config import get_chat_extra_body, settings as app_settings
 
 logger = logging.getLogger("agentic_api")
 
@@ -234,7 +234,7 @@ class OrchestratedAgentRuntime:
             model=app_settings.chat_model,
             messages=messages,
             temperature=self.base.settings.temperature,
-            extra_body=get_ollama_extra_body(),
+            extra_body=get_chat_extra_body(),
         )
         return response.choices[0].message.content or ""
 

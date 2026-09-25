@@ -13,6 +13,48 @@
 
 $ErrorActionPreference = "Stop"
 
+function Start-PythonServer {
+    <#
+        Launches a Python MCP server module in its own persistent console window.
+
+        Runs via a nested `powershell -NoExit` (not Start-Process -FilePath
+        $pythonExe directly) so that if the module throws on import/startup,
+        the window stays open with the traceback visible instead of flashing
+        shut the instant python.exe exits. Output is also captured to a log
+        file under .\logs (via Start-Transcript) for post-mortem.
+
+        Deliberately does NOT redirect/merge the child's stderr with 2>&1:
+        in Windows PowerShell 5.1 that wraps every stderr line (which is
+        where uvicorn/FastMCP write their INFO logs) in a fake
+        NativeCommandError, spamming the window with bogus errors even on a
+        clean startup. Start-Transcript logs the console as-is instead.
+
+        Wrapped in try/catch so one failed launch (e.g. transient resource
+        contention) is reported as a warning instead of aborting the rest of
+        this script under $ErrorActionPreference = "Stop".
+    #>
+    param(
+        [string]$Name,
+        [string]$Module,
+        [string]$PythonExe,
+        [string]$WorkDir,
+        [string]$LogDir
+    )
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $logFile = Join-Path $LogDir ("{0}.log" -f ($Name -replace '[^\w\-]', '_'))
+    $innerCommand = "Start-Transcript -Path '$logFile' | Out-Null; & '$PythonExe' -u -m $Module"
+    try {
+        $proc = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList "-NoExit", "-Command", $innerCommand `
+            -WorkingDirectory $WorkDir `
+            -PassThru -WindowStyle Normal
+        return $proc
+    } catch {
+        Write-Warning "Failed to launch $Name`: $_"
+        return $null
+    }
+}
+
 function Wait-ForPort {
     param(
         [string]$ServerName,
@@ -42,6 +84,7 @@ function Wait-ForPort {
 # --- Config: adjust these if needed ---
 $pythonExe = "C:\Users\Nigia\source\repos\AgenticApp\.venv\Scripts\python.exe"   # or full path to your venv's python.exe (e.g. venv\Scripts\python.exe)
 $repoRoot  = "C:\Users\Nigia\source\repos\AgenticApp"
+$logDir    = Join-Path $repoRoot "logs"   # each server's console output is tee'd here for post-mortem
 
 $indexingModule  = "backend.mcp_servers.indexing.server"
 $retrievalModule = "backend.mcp_servers.retrieval.server"
@@ -208,31 +251,23 @@ if (-not (Test-Path $chromaExe)) {
 
 # --- Start Indexing server (port 8000, hardcoded in server.py) ---
 Write-Host "Starting Indexing MCP server (port 8000)..." -ForegroundColor Cyan
-$indexingProc = Start-Process -FilePath $pythonExe `
-    -ArgumentList "-m", $indexingModule `
-    -WorkingDirectory $repoRoot `
-    -PassThru -WindowStyle Normal
+$indexingProc = Start-PythonServer -Name "indexing" -Module $indexingModule `
+    -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
 
 # --- Start Retrieval server (port 8001, assumed hardcoded in server.py) ---
 Write-Host "Starting Retrieval MCP server (port 8001)..." -ForegroundColor Cyan
-$retrievalProc = Start-Process -FilePath $pythonExe `
-    -ArgumentList "-m", $retrievalModule `
-    -WorkingDirectory $repoRoot `
-    -PassThru -WindowStyle Normal
+$retrievalProc = Start-PythonServer -Name "retrieval" -Module $retrievalModule `
+    -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
 
 # --- Start DB server (port 8002, assumed hardcoded in server.py) ---
 Write-Host "Starting DB MCP server (port 8002)..." -ForegroundColor Cyan
-$dbProc = Start-Process -FilePath $pythonExe `
-    -ArgumentList "-m", $dbModule `
-    -WorkingDirectory $repoRoot `
-    -PassThru -WindowStyle Normal
+$dbProc = Start-PythonServer -Name "db" -Module $dbModule `
+    -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
 
 # --- Start Code Execution server (port 8003, assumed hardcoded in server.py) ---
 Write-Host "Starting Code Execution MCP server (port 8003)..." -ForegroundColor Cyan
-$codeProc = Start-Process -FilePath $pythonExe `
-    -ArgumentList "-m", $codeModule `
-    -WorkingDirectory $repoRoot `
-    -PassThru -WindowStyle Normal
+$codeProc = Start-PythonServer -Name "code" -Module $codeModule `
+    -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
 
 Write-Host "DB server PID:        $($dbProc.Id)"
 Write-Host "Code server PID:      $($codeProc.Id)"
@@ -251,10 +286,8 @@ $codeReady      = Wait-ForPort -ServerName "Code Execution MCP server" -Port 800
 
 if ($indexingReady -and $retrievalReady -and $dbReady -and $codeReady) {
     Write-Host "Starting Agentic API server (port 8100)..." -ForegroundColor Cyan
-    $apiProc = Start-Process -FilePath $pythonExe `
-        -ArgumentList "-m", $apiModule `
-        -WorkingDirectory $repoRoot `
-        -PassThru -WindowStyle Normal
+    $apiProc = Start-PythonServer -Name "api" -Module $apiModule `
+        -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
     Write-Host "Agentic API server PID: $($apiProc.Id)"
 } else {
     Write-Warning "Skipping Agentic API startup - one or more MCP servers never came up. Start it manually once they're ready: python -m $apiModule"

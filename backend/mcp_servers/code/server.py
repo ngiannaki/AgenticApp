@@ -248,6 +248,21 @@ if settings.allow_ui_generation:
         completely isolated from this conversation and from the rest of the app
         (no access to cookies, local storage, or any other page's data).
 
+        For charts and dashboards specifically: prefer self-contained inline
+        SVG + vanilla JS over pulling in an external charting library (Plotly,
+        Chart.js, etc.) via CDN. The sandbox has no storage access at all (see
+        above), and most charting libraries touch localStorage/sessionStorage
+        somewhere in their init path — that throws in this sandbox and silently
+        halts *all* script execution on the page before anything renders, with
+        no console visible to the user to explain why it's blank. Plain SVG
+        elements plus a `<script>` you write yourself for hover tooltips
+        (mouseover/mouseout on each shape), legend filtering (toggle a series'
+        visibility on click), and control inputs (a `<select>`/slider that
+        redraws on `change`) has no such dependency and reliably works — it's
+        also usually less code than wiring up a charting library for the same
+        result. Reach for a CDN library only for something that specifically
+        needs it (e.g. a physics/game engine), not for charts.
+
         The page runs in a browser iframe sandbox with scripts allowed but no
         access to the parent page or its storage, so: don't rely on `window.top`,
         `postMessage` to a parent you don't control, or reading/writing outside

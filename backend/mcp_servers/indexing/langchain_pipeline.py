@@ -11,18 +11,27 @@ never mix.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from uuid import uuid4
 
 import chromadb
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.config import get_langchain_embedding, settings
 from backend.mcp_servers.indexing.langchain_loaders import load_documents_v2
+from backend.mcp_servers.indexing.langchain_structure import split_markdown_preserving_structure
 
 logger = logging.getLogger(__name__)
+
+# content types whose raw Documents are already markdown-flavored (headings +
+# inline tables) and should go through the structure-preserving splitter;
+# everything else (csv/xlsx row-docs, pptx slides) is already
+# atomic/structured enough for a plain character split.
+_MARKDOWN_STRUCTURED_TYPES = {"pdf", "docx", "txt"}
 
 
 class LangchainIndexPipelineV2:
@@ -47,6 +56,32 @@ class LangchainIndexPipelineV2:
             add_start_index=True,
         )
 
+    def _split(self, raw_docs: list[Document], content_type: str) -> tuple[list[Document], list[dict]]:
+        """Split `raw_docs` into final chunks. Markdown-flavored types
+        (pdf/docx/txt) go through the structure-preserving splitter (table-
+        atomic chunks, header-aware section metadata); everything else uses
+        the plain character splitter since those Documents are already
+        atomic/structured (csv/xlsx rows, pptx slides).
+
+        Returns (chunks, toc_entries) — toc_entries is the deduped, ordered
+        list of headings seen across `raw_docs`, for the collection's TOC.
+        """
+        if content_type not in _MARKDOWN_STRUCTURED_TYPES:
+            return self._splitter().split_documents(raw_docs), []
+
+        split_docs: list[Document] = []
+        toc_entries: list[dict] = []
+        seen = set()
+        for doc in raw_docs:
+            chunks, headings = split_markdown_preserving_structure(doc, self.cfg.chunk_size, self.cfg.chunk_overlap)
+            split_docs.extend(chunks)
+            for h in headings:
+                key = (h["level"], h["title"], h.get("page"))
+                if key not in seen:
+                    seen.add(key)
+                    toc_entries.append(h)
+        return split_docs, toc_entries
+
     def index_document(
         self,
         document_id: str,
@@ -67,7 +102,7 @@ class LangchainIndexPipelineV2:
             if not raw_docs:
                 return {"success": False, "document_id": document_id, "error": "No content extracted from document"}
 
-            split_docs = self._splitter().split_documents(raw_docs)
+            split_docs, toc_entries = self._split(raw_docs, content_type)
             if not split_docs:
                 return {"success": False, "document_id": document_id, "error": "No chunks produced after splitting"}
 
@@ -101,6 +136,11 @@ class LangchainIndexPipelineV2:
             collection_metadata = {"hnsw:space": "cosine", "document_id": document_id, "pipeline": "langchain_v2"}
             if user_id:
                 collection_metadata["user_id"] = user_id
+            if toc_entries:
+                # Chroma collection metadata only accepts scalar values, so
+                # the outline is stored as a JSON string and parsed back out
+                # by LangchainRetrievalPipelineV2.get_table_of_contents.
+                collection_metadata["toc"] = json.dumps(toc_entries)
 
             collection_name = self._collection_name(document_id)
             vectorstore = Chroma(

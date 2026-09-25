@@ -94,7 +94,18 @@ class OpenAISettings(BaseSettings):
     api_key: str | None = None
     base_url: str | None = Field(default=None, description="Override for Azure OpenAI or another OpenAI-compatible endpoint. None = api.openai.com.")
 
-    _normalize = field_validator("api_key", "base_url", mode="before")(_blank_to_none)
+    # Reasoning effort for a reasoning-capable PROD model (e.g. an o-series or
+    # "-thinking"/"-luna" style model): "low"/"medium"/"high"/"none", or blank
+    # (the default) to send nothing. This MUST stay blank for a classic
+    # non-reasoning model like gpt-4o-mini — OpenAI's /v1/chat/completions
+    # rejects the reasoning_effort parameter outright for those with a 400
+    # ("Unsupported parameter"), the same way it rejects it for a reasoning
+    # model when tools are present without any value at all. Pair this with
+    # CHAT_MODEL_PROD/RETRIEVAL_MODEL_PROD/etc. — set both together when
+    # switching to a reasoning model, clear both together when switching back.
+    reasoning_effort: str | None = None
+
+    _normalize = field_validator("api_key", "base_url", "reasoning_effort", mode="before")(_blank_to_none)
 
 
 class ChatModelSettings(BaseSettings):
@@ -164,14 +175,26 @@ class ApiSettings(BaseSettings):
     temperature: float = 0.3
     max_history_messages: int = 40
 
-    max_tool_result_chars: int = 8000
+    max_tool_result_chars: int = 32_000
     """Hard cap on a single tool result's length before it enters conversation
     memory (and therefore gets resent to the LLM on every following turn).
     Tool authors are told to return a URL for large payloads (files, images)
     rather than inlining them, but this is a backstop for when a tool — or a
     model that ignores that instruction, e.g. base64-encoding an image into
     stdout instead of saving it — doesn't cooperate. Truncated, not the raw
-    tool output shown to the user in the UI, which is unaffected."""
+    tool output shown to the user in the UI, which is unaffected.
+
+    Was 8000 (~2K tokens) until a real production document's
+    get_table_of_contents_v2 result (251 headings, 23,596 chars) got
+    silently truncated well before the specific heading the model needed —
+    it never saw the page number and burned 6 extra retrieval calls
+    guessing instead. 8000 was sized against nothing in particular; 32_000
+    (~8K tokens) covers that real payload with headroom for a larger filing
+    while staying well under a single turn's context budget (DEV:
+    OLLAMA_NUM_CTX minus ~4K reserved for generation — see
+    sessions.py's _max_context_tokens) and still catching a genuinely
+    pathological dump (a raw image/file inlined instead of returned as a
+    URL, as tool authors are asked to do)."""
 
     log_level: str = "INFO"
 
@@ -198,6 +221,19 @@ class ApiSettings(BaseSettings):
 
     mongo_db_name: str = "agentic_chat"
     """MongoDB database name for conversation persistence."""
+
+    skills_enabled: bool = Field(
+        default=True,
+        description=(
+            "Feature flag for the agent-skills wiki (backend/skills/): when true, the "
+            "chat agent gets two extra local tools, list_skills and get_skill, that let "
+            "it discover and read markdown skill files on demand (Anthropic Agent Skills "
+            "format, agentskills.io). Off by default so this is purely additive — "
+            "existing tool-calling behavior is unchanged until explicitly enabled."
+        ),
+    )
+    skills_dir: Path = _BACKEND_DIR / "skills"
+    """Directory of skill folders (each `<skills_dir>/<name>/SKILL.md`) the agent can list/read when skills_enabled is true."""
 
 
 class DbMcpSettings(BaseSettings):
@@ -340,6 +376,26 @@ class RetrievalServerSettings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8001
 
+    # --- Web search (web_search / fetch_page tools) --------------------------
+    web_search_backend: str = Field(
+        default="duckduckgo",
+        description="Search backend for web_search. Only 'duckduckgo' is implemented (no API key required).",
+    )
+    web_search_region: str = Field(default="wt-wt", description="DuckDuckGo region code, e.g. 'us-en'. 'wt-wt' = no region bias.")
+    web_search_safesearch: str = Field(default="moderate", description="One of 'on', 'moderate', 'off'.")
+    web_search_default_max_results: int = Field(default=5, gt=0, description="Results returned when web_search doesn't specify max_results.")
+    web_search_max_results_ceiling: int = Field(default=10, gt=0, description="Hard cap on web_search's max_results, regardless of what the caller asks for.")
+    web_search_max_query_length: int = Field(default=400, gt=0, description="Max characters accepted in a web_search query string.")
+    web_search_timeout_seconds: int = Field(default=10, gt=0, description="Timeout for the outbound HTTP request to the search backend.")
+
+    fetch_page_timeout_seconds: int = Field(default=10, gt=0, description="Timeout for the outbound HTTP request in fetch_page.")
+    fetch_page_max_content_chars: int = Field(default=8_000, gt=0, description="Extracted page text is truncated beyond this many characters.")
+    fetch_page_max_response_bytes: int = Field(default=5_000_000, gt=0, description="Pages larger than this are rejected before extraction, to bound memory use.")
+    fetch_page_allowed_schemes: list[str] = Field(
+        default_factory=lambda: ["http", "https"],
+        description="URL schemes fetch_page will follow. Blocks file://, data://, etc.",
+    )
+
 
 class RetrievalAgentSettings(BaseSettings):
     """Process/networking config for the standalone A2A retrieval agent."""
@@ -405,19 +461,34 @@ class LangchainRagSettings(BaseSettings):
 
     collection_prefix: str = "docv2_"
 
+    # --- Parsing (indexing) ---------------------------------------------------
+    pdf_engine: str = Field(
+        default="docling",
+        description=(
+            "Markdown-producing PDF engine for v2 indexing: 'docling' (layout-aware, "
+            "richer table cell structure, heavier) or 'pymupdf4llm' (fast, dependency-light). "
+            "Both preserve headings/tables as markdown; falls back to plain PyMuPDFLoader "
+            "text if the selected engine's import/parse fails."
+        ),
+    )
+
     # --- Chunking (indexing) -------------------------------------------------
     chunk_size: int = Field(default=1000, gt=0, description="Target chunk size (characters) for RecursiveCharacterTextSplitter.")
     chunk_overlap: int = Field(default=150, ge=0, description="Overlap (characters) between adjacent chunks.")
 
     # --- Hybrid retrieval + reranking ----------------------------------------
-    default_top_k: int = Field(default=5, gt=0, description="Chunks returned when the caller doesn't specify top_k.")
+    default_top_k: int = Field(default=8, gt=0, description="Chunks returned when the caller doesn't specify top_k.")
     max_top_k: int = Field(default=25, gt=0, description="Hard ceiling on top_k accepted from a caller.")
-    fetch_k_multiplier: int = Field(default=4, gt=0, description="Each of the dense/sparse retrievers fetches top_k * this many candidates before ensembling/reranking.")
-    max_fetch_k: int = Field(default=40, gt=0, description="Hard ceiling on the fetch_k computed above.")
+    fetch_k_multiplier: int = Field(default=6, gt=0, description="Each of the dense/sparse retrievers fetches top_k * this many candidates before ensembling/reranking.")
+    max_fetch_k: int = Field(default=60, gt=0, description="Hard ceiling on the fetch_k computed above.")
     dense_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the vector (Chroma) retriever.")
     sparse_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the keyword (BM25) retriever.")
     use_reranker: bool = Field(default=True, description="Rerank the ensembled candidates with a cross-encoder before truncating to top_k.")
     rerank_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-12-v2", description="HuggingFace cross-encoder model id used by the reranker.")
+
+    # --- Grounding / citation context ----------------------------------------
+    neighbor_expansion: bool = Field(default=True, description="Splice adjacent chunks (by chunk_index) around each returned hit for extra citation context.")
+    neighbor_window: int = Field(default=1, ge=0, description="Number of adjacent chunks on each side to splice in when neighbor_expansion is on.")
 
 
 class AuthSettings(BaseSettings):

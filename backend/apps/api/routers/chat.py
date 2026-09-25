@@ -79,6 +79,8 @@ def _to_step(event: dict[str, Any]) -> dict[str, Any] | None:
             "ok": data.get("ok"),
             "result": data.get("result"),
         }
+    if kind == "citations":
+        return {"id": step_id, "type": "citations", "items": data.get("items")}
     if kind == "error":
         return {"id": step_id, "type": "error", "detail": data.get("detail")}
     return None

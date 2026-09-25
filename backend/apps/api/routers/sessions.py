@@ -31,7 +31,7 @@ async def create_session(
     )
 
     session = session_manager.create(
-        system_prompt=body.system_prompt or DEFAULT_SYSTEM_PROMPT,
+        system_prompt=runtime.system_prompt_for(body.system_prompt or DEFAULT_SYSTEM_PROMPT),
         max_history_messages=settings.max_history_messages,
         approval_required_tools=approval_required_tools,
         user_id=user.user_id,

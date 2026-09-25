@@ -62,7 +62,7 @@ from backend.apps.api.streaming_agent import (
     _extract_text,
     _with_attached_documents_note,
 )
-from backend.config import get_ollama_extra_body, settings as app_settings
+from backend.config import get_chat_extra_body, settings as app_settings
 
 logger = logging.getLogger("agentic_api")
 
@@ -275,7 +275,7 @@ class OrchestratedAgentRuntime:
                     model=model,
                     model_settings=ModelSettings(
                         temperature=self.base.settings.temperature,
-                        extra_body=get_ollama_extra_body(),
+                        extra_body=get_chat_extra_body(),
                     ),
                     workflow_name="orchestrated-chat",
                 )
