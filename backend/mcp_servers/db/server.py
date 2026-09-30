@@ -11,6 +11,7 @@ validator before anything reaches the database. See README.md.
 """
 
 import logging
+import os
 import sys
 import time
 import uuid
@@ -274,8 +275,14 @@ def query_data(sql: str, parameters: Optional[list] = None) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host=settings.host,
-        port=settings.port,
-    )
+    # MCP_TRANSPORT=stdio lets this server be launched as a subprocess
+    # (e.g. from servers.docker.json) instead of a standalone HTTP service —
+    # see backend/apps/client/servers.docker.json and the root Dockerfile.
+    if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(
+            transport="http",
+            host=settings.host,
+            port=settings.port,
+        )

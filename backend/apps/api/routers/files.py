@@ -30,6 +30,17 @@ _SUPPORTED_UPLOAD_EXTENSIONS = {
 }
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25MB
 
+# Attached in the chat inbox (upload_file below), these skip indexing
+# entirely — the chat agent analyzes them directly via the code MCP server's
+# profile_spreadsheet/run_python_code_on_document (real pandas against the
+# actual file), since row-per-chunk vector retrieval can't guarantee "every
+# row" or a trustworthy aggregate the way a real dataframe query can. Only
+# affects the session-scoped upload endpoint — the standalone Documents page
+# (upload_document below) always indexes, regardless of extension, since
+# that flow is about durable cross-conversation search rather than one
+# chat's worth of analysis.
+_SPREADSHEET_EXTENSIONS = {".csv", ".xlsx", ".xlsm"}
+
 # Types the browser should render in place (an <img>, or a generate_ui page
 # loaded into an iframe) rather than offer as a "Save As" download. Everything
 # else (docx/xlsx/csv/...) keeps the default "attachment" disposition, since
@@ -57,10 +68,10 @@ def get_file(artifact_id: str, filename: str) -> FileResponse:
 documents_router = APIRouter(tags=["documents"])
 
 
-async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) -> dict:
-    """Shared by the session-scoped and standalone upload endpoints: stores +
-    parses + chunks + embeds `file` and registers it in the per-user document
-    registry. Returns the same shape both endpoints respond with."""
+async def _store_uploaded_file(request: Request, file: UploadFile, user: AuthUser) -> dict:
+    """Shared by every upload path: validates, reads, and persists the raw
+    bytes into the document store. Returns {document_id, filename, extension,
+    file_bytes} — callers decide from there whether to index or not."""
     filename = file.filename or "upload"
     extension = Path(filename).suffix.lower()
     if extension not in _SUPPORTED_UPLOAD_EXTENSIONS:
@@ -73,7 +84,6 @@ async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) 
     if len(file_bytes) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"File too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB)")
 
-    runtime = request.app.state.runtime
     logger.info("[UPLOAD] user=%s filename=%s size=%d", user.user_id, filename, len(file_bytes))
 
     # Write straight into the shared document store (settings.document_store.dir,
@@ -86,6 +96,17 @@ async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) 
     document_id = str(uuid4())
     _document_store.create_document(file_bytes=file_bytes, document_id=document_id, filename=filename)
 
+    return {"document_id": document_id, "filename": filename, "extension": extension, "file_bytes": file_bytes}
+
+
+async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) -> dict:
+    """Stores + parses + chunks + embeds `file` and registers it in the
+    per-user document registry, indexed status. Used by both the standalone
+    Documents page and, for non-spreadsheet types, the chat inbox."""
+    stored = await _store_uploaded_file(request, file, user)
+    document_id, filename, extension = stored["document_id"], stored["filename"], stored["extension"]
+
+    runtime = request.app.state.runtime
     try:
         # Uses the "_v2" (LangChain) indexing pipeline — retrieval on these
         # documents (streaming_agent.py's _with_attached_documents_note) is
@@ -131,6 +152,36 @@ async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) 
     }
 
 
+async def _upload_without_indexing(request: Request, file: UploadFile, user: AuthUser) -> dict:
+    """Chat-inbox path for a spreadsheet: store the raw bytes only, skip
+    indexing/embedding entirely. The chat agent analyzes it directly with
+    the code MCP server's profile_spreadsheet / run_python_code_on_document
+    (real pandas against the actual file) instead of row-chunk retrieval —
+    see the module-level comment on _SPREADSHEET_EXTENSIONS for why."""
+    stored = await _store_uploaded_file(request, file, user)
+    document_id, filename, extension = stored["document_id"], stored["filename"], stored["extension"]
+    content_type = extension.lstrip(".")
+
+    registry = request.app.state.document_registry
+    if registry is not None:
+        await registry.create(
+            document_id=document_id,
+            user_id=user.user_id,
+            original_name=filename,
+            stored_name=f"original{extension}",
+            file_type=content_type,
+            status="stored",
+            chunks_indexed=0,
+        )
+
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "content_type": content_type,
+        "chunks_indexed": 0,
+    }
+
+
 @documents_router.post("/api/sessions/{session_id}/upload")
 async def upload_file(
     session_id: str,
@@ -142,7 +193,11 @@ async def upload_file(
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    result = await _upload_and_index(request, file, user)
+    extension = Path(file.filename or "upload").suffix.lower()
+    if extension in _SPREADSHEET_EXTENSIONS:
+        result = await _upload_without_indexing(request, file, user)
+    else:
+        result = await _upload_and_index(request, file, user)
     session.add_attached_document(result["document_id"], result["filename"], result["content_type"])
     return result
 

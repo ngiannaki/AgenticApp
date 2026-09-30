@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -47,6 +48,18 @@ def _load_servers(servers_path: Path) -> dict:
     raw = json.loads(servers_path.read_text(encoding="utf-8"))
     mapping = raw.get("mcpServers", raw)
     mapping = {k: v for k, v in mapping.items() if not k.startswith("_")}
+    for entry in mapping.values():
+        # For stdio-launched servers (servers.docker.json), the MCP client
+        # only forwards a small safe-env allowlist to the child process by
+        # default, not this process's actual environment — so an override
+        # set at the container level (e.g. docker-compose's DB_MCP_DATABASE_URL
+        # pointing at the "postgres" service instead of localhost) would
+        # silently not reach the subprocess. These are our own trusted
+        # subprocesses, not third-party servers, so full inheritance is safe
+        # and matches how every server behaves when run standalone (each
+        # just reads backend/.env directly).
+        if "command" in entry:
+            entry["env"] = {**os.environ, **entry.get("env", {})}
     return {"mcpServers": mapping}
 
 

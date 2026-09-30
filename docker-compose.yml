@@ -1,0 +1,67 @@
+# Local/single-host way to run the whole stack with one command:
+#   docker compose up --build
+#
+# This is the Docker alternative to start_mcp_servers.ps1 — see RUNNING.md
+# for how the two compare. It reuses backend/.env for every setting (API
+# keys, model names, feature flags, ...) except the two that must point at
+# this compose network's service names instead of localhost (Mongo,
+# Postgres), which are overridden below.
+services:
+  app:
+    build: .
+    ports:
+      - "8100:8100"
+    env_file:
+      - backend/.env
+    environment:
+      API_MONGO_URL: mongodb://mongo:27017
+      DB_MCP_DATABASE_URL: postgresql://raguser:changeme@postgres:5432/ragdb
+      VECTOR_STORE_HOST: chroma
+      # 8000, not the host-mapped 8010 below: container-to-container traffic
+      # uses chroma's actual listening port, not its host port mapping.
+      VECTOR_STORE_PORT: "8000"
+    depends_on:
+      mongo:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - agenticapp_mongodata:/data/db
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: ragdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - agenticapp_pgdata:/var/lib/postgresql/data
+      - ./backend/mcp_servers/db/migrations/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "8010:8000"
+    volumes:
+      - ./data/vector_store:/data
+
+volumes:
+  agenticapp_mongodata:
+  agenticapp_pgdata:

@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -463,8 +464,14 @@ def fetch_page(url: str) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host=settings.retrieval_server.host,
-        port=settings.retrieval_server.port,
-    )
+    # MCP_TRANSPORT=stdio lets this server be launched as a subprocess
+    # (e.g. from servers.docker.json) instead of a standalone HTTP service —
+    # see backend/apps/client/servers.docker.json and the root Dockerfile.
+    if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(
+            transport="http",
+            host=settings.retrieval_server.host,
+            port=settings.retrieval_server.port,
+        )

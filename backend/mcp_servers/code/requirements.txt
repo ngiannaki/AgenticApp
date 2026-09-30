@@ -5,6 +5,12 @@
 # generate_file needs python-docx and openpyxl — both already installed in
 # this repo's venv (used elsewhere for document parsing), listed here only
 # so this file documents the server's real dependency surface.
+# profile_spreadsheet/run_python_code_on_document (execution/spreadsheet.py)
+# need pandas plus the same xlrd/odfpy engines the indexing server declares,
+# for legacy .xls/.ods — also already present in the shared venv.
 
 python-docx>=1.1,<2
 openpyxl>=3.1,<4
+pandas>=2.0,<3
+xlrd>=2.0,<3
+odfpy>=1.4,<2

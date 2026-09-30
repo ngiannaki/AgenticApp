@@ -152,6 +152,17 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
     top-k query, since this note is what it actually reads each turn (the
     full filters/TOC guidance lives in retrieve_document_v2's own docstring,
     but that's easy to miss buried in the tool list).
+
+    A spreadsheet attached here (content_type csv/xlsx/xlsm) is a special
+    case: routers/files.py's upload_file skips indexing for these entirely
+    (see _SPREADSHEET_EXTENSIONS there), so no vector store exists for them
+    and the retrieval guidance below does not apply. Those get a separate
+    paragraph pointing at the code server's profile_spreadsheet /
+    run_python_code_on_document instead — see spreadsheet-data-strategy
+    skill for why (row-per-chunk retrieval can't guarantee completeness for
+    tabular data the way a real dataframe query can). A bare document_id the
+    user typed directly is always treated as indexed (Documents-page
+    uploads always index, regardless of type), never as a raw spreadsheet.
     """
     attached_ids = {doc["document_id"] for doc in session.attached_documents}
     mentioned_ids = [m for m in _UUID_RE.findall(question) if m not in attached_ids]
@@ -159,13 +170,23 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
     if not session.attached_documents and not mentioned_ids:
         return question
 
+    _SPREADSHEET_CONTENT_TYPES = {"csv", "xlsx", "xlsm"}
+    spreadsheet_docs = [d for d in session.attached_documents if d["content_type"] in _SPREADSHEET_CONTENT_TYPES]
+    indexed_docs = [d for d in session.attached_documents if d["content_type"] not in _SPREADSHEET_CONTENT_TYPES]
+
     lines = []
-    if session.attached_documents:
+    if indexed_docs:
         listing = ", ".join(
             f"{doc['filename']} (document_id={doc['document_id']}, type={doc['content_type']})"
-            for doc in session.attached_documents
+            for doc in indexed_docs
         )
-        lines.append(f"[Attached files: {listing}]")
+        lines.append(f"[Attached files (indexed): {listing}]")
+    if spreadsheet_docs:
+        listing = ", ".join(
+            f"{doc['filename']} (document_id={doc['document_id']}, type={doc['content_type']})"
+            for doc in spreadsheet_docs
+        )
+        lines.append(f"[Attached spreadsheets (NOT indexed): {listing}]")
     if mentioned_ids:
         lines.append(
             "[The message below also mentions this document_id, or these "
@@ -174,28 +195,48 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
             "page, even though it has no filename here.]"
         )
 
-    note = (
-        "\n".join(lines) + "\n"
-        "These documents were already uploaded and indexed into the vector "
-        "store — there is no local file_path for them, so indexing_read_document "
-        "(which needs a server-local file_path) will not work here. If the "
-        "question asks about the document's structure, sections, or where "
-        "something is located (e.g. \"what's in this document\", \"which section "
-        "covers X\"), call retrieval_get_table_of_contents_v2(document_id) first "
-        "to see the heading outline (or page/sheet coverage if no outline was "
-        "captured) before searching — then use what you learn to scope the "
-        "search, e.g. retrieval_retrieve_document_v2(document_id, query, "
-        "filters={\"h1\": \"<heading>\"}) or filters={\"page\": N}, instead of a "
-        "blind top-k query. If the user is specifically asking about tables "
-        "(e.g. \"show me the tables\", \"what's in the pricing table\", \"only "
-        "tabular data\"), add filters={\"chunk_content_type\": \"table\"} to "
-        "restrict retrieval to table chunks only and exclude prose. For a plain "
-        "content question, call retrieval_retrieve_document_v2(document_id, query) "
-        "with a query describing what you're looking for (call it more than once "
-        "with different queries if you need several kinds of information), or "
-        "retrieval_get_document_info_v2(document_id) for metadata like section/page "
-        "counts."
-    )
+    note_parts = ["\n".join(lines)]
+
+    if indexed_docs or mentioned_ids:
+        note_parts.append(
+            "The indexed documents above were already uploaded and indexed into "
+            "the vector store — there is no local file_path for them, so "
+            "indexing_read_document (which needs a server-local file_path) will "
+            "not work here. If the question asks about the document's structure, "
+            "sections, or where something is located (e.g. \"what's in this "
+            "document\", \"which section covers X\"), call "
+            "retrieval_get_table_of_contents_v2(document_id) first to see the "
+            "heading outline (or page/sheet coverage if no outline was captured) "
+            "before searching — then use what you learn to scope the search, e.g. "
+            "retrieval_retrieve_document_v2(document_id, query, filters={\"h1\": "
+            "\"<heading>\"}) or filters={\"page\": N}, instead of a blind top-k "
+            "query. If the user is specifically asking about tables (e.g. \"show "
+            "me the tables\", \"what's in the pricing table\", \"only tabular "
+            "data\"), add filters={\"chunk_content_type\": \"table\"} to restrict "
+            "retrieval to table chunks only and exclude prose. For a plain content "
+            "question, call retrieval_retrieve_document_v2(document_id, query) with "
+            "a query describing what you're looking for (call it more than once "
+            "with different queries if you need several kinds of information), or "
+            "retrieval_get_document_info_v2(document_id) for metadata like "
+            "section/page counts."
+        )
+
+    if spreadsheet_docs:
+        note_parts.append(
+            "The spreadsheets above were NOT indexed — there is no vector store "
+            "for them, so retrieval_retrieve_document_v2/"
+            "retrieval_get_table_of_contents_v2/retrieval_get_document_info_v2 will "
+            "not find them; don't call those with these document_ids. Instead, call "
+            "code_profile_spreadsheet(document_id) first to see sheet names, exact "
+            "row/column counts, and column headers, then "
+            "code_run_python_code_on_document(document_id, code) to actually answer "
+            "the question with real pandas code against the full file — required "
+            "for anything needing completeness or computation (\"sum this column\", "
+            "\"every row where X\", \"how many rows match Y\"), which profiling "
+            "alone can't answer."
+        )
+
+    note = "\n\n".join(note_parts)
     return f"{note}\n\n{question}"
 
 

@@ -1,8 +1,11 @@
 """Code Execution MCP server.
 
-Exposes four tools over FastMCP (HTTP transport, mirroring the `indexing`,
+Exposes tools over FastMCP (HTTP transport, mirroring the `indexing`,
 `retrieval`, and `db` servers in this repo): run_python_code,
-check_python_syntax, run_shell_command, generate_file.
+check_python_syntax, run_shell_command (disabled by default), generate_file,
+profile_spreadsheet, run_python_code_on_document (the latter two operate on
+a spreadsheet attached in the chat inbox — see execution/spreadsheet.py —
+and are unrelated to the indexing/retrieval MCP servers' document pipeline).
 
 Security model, in one sentence: submitted code always runs as a fresh
 subprocess in a throwaway temp directory with a stripped environment and a
@@ -33,6 +36,8 @@ from backend.mcp_servers.code.errors import to_error_dict
 from backend.mcp_servers.code.execution.runner import run_python_code as _run_python_code
 from backend.mcp_servers.code.execution.runner import run_shell_command as _run_shell_command
 from backend.mcp_servers.code.execution.syntax import check_python_syntax as _check_python_syntax
+from backend.mcp_servers.code.execution.spreadsheet import profile_spreadsheet as _profile_spreadsheet
+from backend.mcp_servers.code.execution.spreadsheet import run_python_code_on_document as _run_python_code_on_document
 from backend.mcp_servers.code.generation.generator import generate_file as _generate_file
 from backend.mcp_servers.code.generation.ui import generate_ui as _generate_ui
 
@@ -168,6 +173,66 @@ def run_shell_command(
 
 
 @mcp.tool
+def profile_spreadsheet(document_id: str) -> dict:
+    """Inspect a spreadsheet attached in this chat (xlsx/xlsm/xls/ods/csv)
+    without running any code: sheet names, row/column counts, column headers,
+    and 3 sample rows per sheet. Use this first for a spreadsheet the user
+    just attached — it's the equivalent of a table of contents for tabular
+    data, and tells you what's actually in the file (how many sheets, how
+    big each one is, what the columns are called) before you write any
+    analysis code.
+
+    `document_id` must be a spreadsheet stored via the chat file-attach flow
+    (not a Documents-page upload — those are indexed instead, and are read
+    with retrieval_retrieve_document_v2 / retrieval_get_table_of_contents_v2,
+    not this tool).
+
+    Returns `{success, document_id, file_type, sheets: [{sheet, rows,
+    columns, sample_rows}, ...]}`. `sheet` is null for csv (single implicit
+    sheet). Unlike retrieval over an indexed document, `rows` here is the
+    real, exact row count for that sheet — not a sampled estimate.
+    """
+    return _handle("profile_spreadsheet", _profile_spreadsheet, document_id, settings=settings)
+
+
+@mcp.tool
+def run_python_code_on_document(
+    document_id: str,
+    code: str,
+    timeout_seconds: Optional[int] = None,
+    stdin: Optional[str] = None,
+) -> dict:
+    """Run pandas (or any Python) code against the full, real contents of a
+    spreadsheet attached in this chat — for anything profile_spreadsheet's
+    structural summary can't answer: exact sums/averages/counts, filtering
+    every row that matches a condition, joins across sheets, reshaping,
+    plotting. Use this instead of trying to answer a "sum this column" or
+    "every row where X" question from a partial view of the data — that's
+    exactly the completeness problem this tool exists to solve.
+
+    Same isolation model as run_python_code (fresh throwaway subprocess,
+    stripped environment, hard timeout) plus one extra thing: the
+    spreadsheet's raw bytes are copied into the sandbox before your script
+    runs, at the relative path passed to it as `sys.argv[1]` — read it with
+    e.g. `pandas.read_excel(sys.argv[1], sheet_name=None)` (all sheets) or
+    `pandas.read_csv(sys.argv[1])`. Don't hardcode a filename; always read it
+    from argv.
+
+    `document_id` must be a spreadsheet stored via the chat file-attach flow
+    (see profile_spreadsheet). Returns the same
+    `{success, exit_code, stdout, stderr, timed_out, truncated, elapsed_ms,
+    artifacts}` shape as run_python_code — print() what you need to answer
+    the question, since stdout is what comes back to you. Saving a file
+    (e.g. `plt.savefig("plot.png")`) works the same way too: it comes back
+    in `artifacts` with a URL to reference in your reply.
+    """
+    return _handle(
+        "run_python_code_on_document", _run_python_code_on_document, document_id, code,
+        settings=settings, timeout_seconds=timeout_seconds, stdin=stdin,
+    )
+
+
+@mcp.tool
 def generate_file(format: str, filename: str, content: dict) -> dict:
     """Generate a properly-formatted txt, md, csv, xlsx, or docx file from
     structured content and return a URL the user can open it at.
@@ -294,8 +359,16 @@ if settings.allow_ui_generation:
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host=settings.host,
-        port=settings.port,
-    )
+    import os
+
+    # MCP_TRANSPORT=stdio lets this server be launched as a subprocess
+    # (e.g. from servers.docker.json) instead of a standalone HTTP service —
+    # see backend/apps/client/servers.docker.json and the root Dockerfile.
+    if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(
+            transport="http",
+            host=settings.host,
+            port=settings.port,
+        )

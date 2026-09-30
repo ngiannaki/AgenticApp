@@ -698,9 +698,17 @@ def parse_and_index_enhanced(
         }
 
 if __name__ == "__main__":
+    # MCP_TRANSPORT=stdio lets this server be launched as a subprocess
+    # (e.g. from servers.docker.json) instead of a standalone HTTP service —
+    # see backend/apps/client/servers.docker.json and the root Dockerfile.
+    # The large-request-size fallback below only applies to HTTP transport.
+    if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
+        mcp.run(transport="stdio")
+        raise SystemExit(0)
+
     # Configure server with larger request size limit
     import uvicorn
-    
+
     try:
         # Try using FastMCP with HTTP transport and custom config
         mcp.run(

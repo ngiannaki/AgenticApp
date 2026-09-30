@@ -1,0 +1,47 @@
+# Baseline dependencies shared by the Agentic API and all 4 MCP servers
+# (indexing, retrieval, db, code).
+#
+# Why this file exists: backend/pyproject.toml is empty and every
+# backend/**/requirements.txt only lists *extras* on top of "what's already
+# in the shared .venv" — there was previously no single file listing that
+# shared baseline. Versions below were captured with `pip freeze` against
+# the actual working .venv at the repo root on 2026-09-30, so they're a
+# known-good snapshot, not a guess. Install this file FIRST, then each
+# component's own requirements.txt on top of it (see the root Dockerfile).
+#
+# This file intentionally does not include packages only needed by the
+# other apps in this repo (backend/apps/orchestrator, retrieval_agent,
+# synthesis_agent, client) — only what backend/apps/api and
+# backend/mcp_servers/{code,db,indexing,retrieval} import.
+
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.52.4
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+httpx==0.28.1
+sse-starlette==3.4.8
+anyio==4.14.2
+rich==15.0.0
+
+# MCP / agent runtime
+fastmcp==3.4.7
+mcp==1.29.0
+
+# LLM client + RAG (v1 pipeline, used by indexing/retrieval regardless of
+# the v2 LangChain pipeline pinned in their own requirements.txt files)
+openai==2.54.0
+litellm==1.97.0
+llama-index-core==0.14.24
+llama-index-embeddings-ollama==0.9.0
+llama-index-embeddings-openai==0.6.0
+llama-index-llms-ollama==0.10.1
+llama-index-llms-openai==0.7.10
+llama-index-vector-stores-chroma==0.5.5
+chromadb==1.5.9
+
+# Persistence (Agentic API: conversations, auth, documents)
+motor==3.7.1
+pymongo==4.17.0

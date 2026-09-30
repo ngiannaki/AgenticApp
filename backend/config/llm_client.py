@@ -118,6 +118,12 @@ def get_langchain_embedding(model: str, **kwargs: Any):
     if settings.is_prod:
         from langchain_openai import OpenAIEmbeddings
 
+        # OpenAIEmbeddings defaults chunk_size=1000 (texts per request, not a
+        # token cap) — for large documents split into many chunks, 1000 of
+        # them can sum past OpenAI's 300k-tokens-per-request limit in one
+        # batch (observed indexing a ~650k-token document), so use a smaller
+        # batch size instead of the client-side per-request limit.
+        kwargs.setdefault("chunk_size", 100)
         return OpenAIEmbeddings(model=model, api_key=settings.openai.api_key, base_url=settings.openai.base_url, **kwargs)
 
     from langchain_ollama import OllamaEmbeddings

@@ -24,6 +24,15 @@ llama-index-core>=0.14,<0.15
 python-docx>=1.1,<2
 python-pptx>=1.0,<2
 
+# document_parser.py's _extract_pdf_fallback (used when Docling itself fails
+# on a PDF, e.g. corrupted page dimensions or a missing native dependency)
+# and google_document_parser.py's page counting/splitting both import
+# PyPDF2 directly — genuinely missing everywhere (not just Docker: absent
+# from the local .venv too), so this fallback path has silently never
+# worked. Found by an actual failed upload where Docling errored and this
+# fallback then also raised ImportError.
+PyPDF2>=3.0,<4
+
 # Legacy/OpenDocument spreadsheets (.xls / .ods) — openpyxl can't open
 # either, so parsers/xlsx_reader.py routes them through pandas with
 # engine="xlrd"/"odf" instead. Soft dependency: only imported on that path.
