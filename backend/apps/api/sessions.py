@@ -1,10 +1,11 @@
 """In-memory chat session state.
 
-Each session owns its own conversation memory and its own set of pending
-human-in-the-loop interrupts. All sessions share one MCP connection and one
-tool list (see main.py's lifespan) — sessions are cheap and hold no I/O
-resources of their own, so no explicit close/disconnect is needed on top of
-letting them expire.
+Each session owns its own conversation memory, its own set of pending
+human-in-the-loop interrupts, and — since 2026-09-30 — its own MCP client
+(AgentRuntime.new_client()), so concurrent sessions no longer multiplex
+every tool call through one shared client/session object (see that
+method's docstring for why). All sessions still share the same 4 long-lived
+MCP subprocesses underneath; only the per-client state is now per-session.
 """
 from __future__ import annotations
 
@@ -12,11 +13,16 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from fastmcp import Client
 
 from backend.apps.client.memory import ConversationMemory
 from backend.apps.api.schemas import InterruptDecisionRequest, QuestionAnswerRequest
 from backend.config import settings as app_settings
+
+if TYPE_CHECKING:
+    from backend.apps.api.streaming_agent import AgentRuntime
 
 # Tokens reserved out of num_ctx for the model's own generation on a single
 # turn: the visible answer plus, on a thinking model with reasoning_effort
@@ -64,6 +70,11 @@ class ChatSession:
     session_id: str
     memory: ConversationMemory
     approval_required_tools: list[str]
+    mcp: Client
+    """This session's own MCP client (see AgentRuntime.new_client) — entered
+    (connected) by SessionManager.create/restore, exited by
+    SessionManager.delete. Never share this across sessions; that's the
+    exact thing it exists to avoid."""
     user_id: str = ""
     """Owner of this session — set at creation from the authenticated caller
     (backend.apps.api.auth.get_current_user). Never taken from model/tool
@@ -132,11 +143,12 @@ class ChatSession:
 class SessionManager:
     """Owns every live ChatSession. Not process-shared — one worker only."""
 
-    def __init__(self, idle_timeout_seconds: float) -> None:
+    def __init__(self, idle_timeout_seconds: float, runtime: "AgentRuntime") -> None:
         self._sessions: dict[str, ChatSession] = {}
         self._idle_timeout = idle_timeout_seconds
+        self._runtime = runtime
 
-    def create(
+    async def create(
         self,
         system_prompt: str,
         max_history_messages: int,
@@ -144,18 +156,21 @@ class SessionManager:
         user_id: str,
         max_tool_result_chars: int = 8000,
     ) -> ChatSession:
+        mcp = self._runtime.new_client()
+        await mcp.__aenter__()
         session = ChatSession(
             session_id=str(uuid.uuid4()),
             memory=ConversationMemory(
                 system_prompt, max_history_messages, max_tool_result_chars, _max_context_tokens()
             ),
             approval_required_tools=approval_required_tools,
+            mcp=mcp,
             user_id=user_id,
         )
         self._sessions[session.session_id] = session
         return session
 
-    def restore(
+    async def restore(
         self,
         session_id: str,
         system_prompt: str,
@@ -176,10 +191,13 @@ class SessionManager:
                 memory.add_user(turn["content"])
             elif turn["role"] == "assistant":
                 memory.add_assistant(turn["content"])
+        mcp = self._runtime.new_client()
+        await mcp.__aenter__()
         session = ChatSession(
             session_id=session_id,
             memory=memory,
             approval_required_tools=approval_required_tools,
+            mcp=mcp,
             user_id=user_id,
         )
         self._sessions[session_id] = session
@@ -188,7 +206,7 @@ class SessionManager:
     def get(self, session_id: str) -> ChatSession | None:
         return self._sessions.get(session_id)
 
-    def delete(self, session_id: str) -> None:
+    async def delete(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
         if session:
             for pending in session.pending_interrupts.values():
@@ -197,10 +215,14 @@ class SessionManager:
             for pending_q in session.pending_questions.values():
                 if not pending_q.future.done():
                     pending_q.future.cancel()
+            # keep_alive=True on the underlying stdio transport (default)
+            # means this doesn't kill the shared subprocess — just releases
+            # this session's own client-side state. See AgentRuntime.new_client.
+            await session.mcp.__aexit__(None, None, None)
 
-    def evict_idle(self) -> list[str]:
+    async def evict_idle(self) -> list[str]:
         cutoff = time.time() - self._idle_timeout
         stale = [sid for sid, s in self._sessions.items() if s.last_active < cutoff]
         for sid in stale:
-            self.delete(sid)
+            await self.delete(sid)
         return stale

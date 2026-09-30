@@ -31,7 +31,7 @@ from backend.apps.api.config import get_api_settings
 from backend.apps.api.document_registry import DocumentRegistry
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import auth, chat, conversations, files, interrupts, questions, sessions, tools
+from backend.apps.api.routers import auth, chat, conversations, data, files, interrupts, questions, sessions, tools
 from backend.apps.api.sessions import SessionManager
 # ROLLBACK: swapped from `from backend.apps.api.streaming_agent import
 # AgentRuntime` to try the v2 orchestrator/executor/critic runtime live. To
@@ -67,7 +67,7 @@ async def _idle_session_reaper(app: FastAPI, interval_seconds: float) -> None:
     session_manager: SessionManager = app.state.session_manager
     while True:
         await asyncio.sleep(interval_seconds)
-        stale = session_manager.evict_idle()
+        stale = await session_manager.evict_idle()
         if stale:
             logger.info("Evicted %d idle session(s): %s", len(stale), ", ".join(stale))
 
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = await AgentRuntime.connect(servers, settings)
 
     app.state.runtime = runtime
-    app.state.session_manager = SessionManager(settings.session_idle_timeout_seconds)
+    app.state.session_manager = SessionManager(settings.session_idle_timeout_seconds, runtime)
 
     try:
         app.state.conversation_store = await ConversationStore.connect(
@@ -160,6 +160,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations.router)
     app.include_router(files.router)
     app.include_router(files.documents_router)
+    app.include_router(data.router)
 
     @app.get("/api/health")
     def health() -> dict:

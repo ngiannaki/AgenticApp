@@ -112,7 +112,7 @@ async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) 
         # documents (streaming_agent.py's _with_attached_documents_note) is
         # pointed at the matching "_v2" retrieval tools, since v1/v2 write to
         # separate vector collections and can't read each other's documents.
-        result = await runtime.mcp.call_tool(
+        result = await runtime.call_tool_isolated(
             "indexing_upload_and_index_document_v2",
             {
                 "document_id": document_id,
@@ -260,7 +260,7 @@ async def get_document_chunks(
 
     runtime = request.app.state.runtime
     try:
-        result = await runtime.mcp.call_tool(
+        result = await runtime.call_tool_isolated(
             "retrieval_get_document_chunks_v2",
             {"document_id": document_id, "user_id": user.user_id},
         )
@@ -290,7 +290,7 @@ async def delete_document(
     # cleanup must target the same one.
     runtime = request.app.state.runtime
     try:
-        await runtime.mcp.call_tool("indexing_delete_document_v2", {"document_id": document_id})
+        await runtime.call_tool_isolated("indexing_delete_document_v2", {"document_id": document_id})
     except Exception:  # noqa: BLE001 — the registry entry is already gone; log and move on
         logger.exception("indexing_delete_document_v2 call failed for %s", document_id)
 

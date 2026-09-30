@@ -30,7 +30,7 @@ async def create_session(
         else settings.approval_required_tools
     )
 
-    session = session_manager.create(
+    session = await session_manager.create(
         system_prompt=runtime.system_prompt_for(body.system_prompt or DEFAULT_SYSTEM_PROMPT),
         max_history_messages=settings.max_history_messages,
         approval_required_tools=approval_required_tools,
@@ -58,7 +58,7 @@ async def delete_session(session_id: str, request: Request, user: AuthUser = Dep
     session = request.app.state.session_manager.get(session_id)
     if session is not None and session.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Session not found")
-    request.app.state.session_manager.delete(session_id)
+    await request.app.state.session_manager.delete(session_id)
     store = request.app.state.conversation_store
     if store is not None:
         await store.delete_conversation(session_id)

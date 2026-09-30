@@ -411,6 +411,32 @@ class AgentRuntime:
     async def close(self) -> None:
         await self.mcp.__aexit__(None, None, None)
 
+    def new_client(self) -> Client:
+        """A fresh MCP client scoped to one session (or one-off request),
+        instead of every caller sharing `self.mcp` directly.
+
+        `Client.new()` shallow-copies `self.mcp` onto a new instance with
+        its own per-client state (task registry, notification/roots
+        handlers) but the SAME underlying transport — for our stdio servers
+        (keep_alive=True, the default), entering it reuses the already-
+        running subprocess and its already-established session instead of
+        spawning a new one (see StdioTransport.connect/connect_session).
+        This fixes FastMCP's own logged warning for the shared-client
+        pattern ("reusing existing session for all requests... may cause
+        context mixing in concurrent scenarios") without changing the
+        process topology: still exactly 4 long-lived MCP subprocesses,
+        shared by every session, same as before.
+        """
+        return self.mcp.new()
+
+    async def call_tool_isolated(self, name: str, arguments: dict[str, Any]) -> Any:
+        """One-shot tool call on its own fresh client — for request-scoped
+        callers outside any ChatSession (e.g. the upload/delete endpoints in
+        routers/files.py), which have no session object to hang a
+        longer-lived client off of."""
+        async with self.new_client() as client:
+            return await client.call_tool(name, arguments)
+
     async def _load_tools(self) -> None:
         mcp_tools = await self.mcp.list_tools()
         self.tools = [
@@ -689,7 +715,7 @@ class AgentRuntime:
 
         yield events.status(f"calling {name}")
         try:
-            result = await self.mcp.call_tool(name, arguments)
+            result = await session.mcp.call_tool(name, arguments)
             text = _extract_text(result)
             ok = True
         except Exception as exc:  # noqa: BLE001 — surface any tool failure back to the model
