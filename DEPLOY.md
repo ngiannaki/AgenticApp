@@ -22,8 +22,9 @@ Postgres are never reachable from outside.
    - `AUTH_DEV_BYPASS=false`
    - `MCP_INTERNAL_TOKEN`, `AGENTS_INTERNAL_TOKEN`:
      long random strings — `python -c "import secrets; print(secrets.token_urlsafe(32))"`
-   - `AUTH_INVITE_CODE`: what people type to sign up (blank = signup off;
-     create accounts with `docker compose exec app python -m backend.scripts.create_user`)
+   - `AUTH_INVITE_CODE`: what people type to sign up — or `AUTH_SIGNUP_ENABLED=false`
+     and create accounts with `docker compose exec app python -m backend.scripts.create_user you@example.com`
+   - `API_DAILY_CHAT_TURNS`, `API_DAILY_UPLOADS`, `API_DAILY_AGENT_TASKS` (e.g. 200 / 30 / 20)
    - `API_CORS_ORIGINS`: your public URL (same origin, so mostly a safeguard)
 3. `cp .env.example .env` and set `POSTGRES_PASSWORD`, `AGENT_DB_PASSWORD`,
    the same `MCP_INTERNAL_TOKEN`, and the edge settings below.
@@ -65,7 +66,7 @@ Postgres are never reachable from outside.
 
 ## Checklist before sharing the link
 
-- [ ] `AUTH_DEV_BYPASS=false`, an invite code set (or signup off)
+- [ ] `AUTH_DEV_BYPASS=false`, an invite code set (or sign-up off), daily limits set
 - [ ] Both internal tokens and both DB passwords changed from defaults
 - [ ] `docker compose ps` shows only `web` (and `cloudflared`) with public ports
 - [ ] Sign up as a second user and check you can't see the first user's documents

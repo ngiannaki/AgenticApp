@@ -264,6 +264,57 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
     return f"{note}\n\n{question}"
 
 
+class _StreamedMessage:
+    """Rebuilds a chat completion message from streamed chunks: content
+    tokens (forwarded live as `token` events), tool-call deltas (merged by
+    index) and Ollama's non-standard `reasoning` deltas."""
+
+    def __init__(self) -> None:
+        self.content: list[str] = []
+        self.reasoning: list[str] = []
+        self.calls: dict[int, dict[str, Any]] = {}
+
+    def add(self, chunk: Any) -> str:
+        if not getattr(chunk, "choices", None):
+            return ""
+        delta = chunk.choices[0].delta
+        if delta is None:
+            return ""
+        reasoning = getattr(delta, "reasoning", None) or (getattr(delta, "model_extra", None) or {}).get("reasoning")
+        if reasoning:
+            self.reasoning.append(reasoning)
+        for tc in getattr(delta, "tool_calls", None) or []:
+            slot = self.calls.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+            if tc.id:
+                slot["id"] = tc.id
+            if tc.function is not None:
+                slot["name"] += tc.function.name or ""
+                slot["arguments"] += tc.function.arguments or ""
+        token = getattr(delta, "content", None) or ""
+        if token:
+            self.content.append(token)
+        return token
+
+    def message(self) -> Any:
+        from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall
+        from openai.types.chat.chat_completion_message_tool_call import Function
+
+        tool_calls = [
+            ChatCompletionMessageToolCall(
+                id=c["id"] or f"call_{uuid.uuid4().hex[:12]}",
+                type="function",
+                function=Function(name=c["name"], arguments=c["arguments"] or "{}"),
+            )
+            for _, c in sorted(self.calls.items())
+        ]
+        message = ChatCompletionMessage(
+            role="assistant", content="".join(self.content) or None, tool_calls=tool_calls or None
+        )
+        if self.reasoning:
+            message.reasoning = "".join(self.reasoning)  # type: ignore[attr-defined]
+        return message
+
+
 def _extract_reasoning(message: Any) -> str | None:
     """Pull the model's chain-of-thought off a chat completion message, if present.
 
@@ -605,13 +656,22 @@ class AgentRuntime:
         max_recovery_attempts = 2
         for attempt in range(max_recovery_attempts + 1):
             try:
+                stream = bool(self.settings.stream_tokens)
                 response = await self.llm.chat.completions.create(
                     model=app_settings.chat_model,
                     messages=session.memory.messages(),
                     tools=(self.tools or None) if tools_enabled else None,
                     temperature=self.settings.temperature,
                     extra_body=get_chat_extra_body(),
+                    **({"stream": True} if stream else {}),
                 )
+                if stream and not hasattr(response, "choices"):
+                    accumulated = _StreamedMessage()
+                    async for chunk in response:
+                        token = accumulated.add(chunk)
+                        if token:
+                            yield ("event", events.token(token))
+                    response = SimpleNamespace(choices=[SimpleNamespace(message=accumulated.message())])
                 yield ("response", response)
                 return
             except openai.APIStatusError as exc:

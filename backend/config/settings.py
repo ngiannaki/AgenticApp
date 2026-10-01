@@ -198,6 +198,12 @@ class ApiSettings(BaseSettings):
 
     log_level: str = "INFO"
 
+    stream_tokens: bool = Field(default=True, description="Stream the model's reply token by token (`token` SSE events). false = whole reply at once.")
+
+    daily_chat_turns: int = Field(default=0, description="Chat messages per user per day (0 = unlimited).")
+    daily_uploads: int = Field(default=0, description="Document uploads per user per day (0 = unlimited).")
+    daily_agent_tasks: int = Field(default=0, description="Agent tasks (incl. reruns) per user per day (0 = unlimited).")
+
     approval_required_tools: list[str] = Field(
         default_factory=list,
         description=(
@@ -623,6 +629,10 @@ class AuthSettings(BaseSettings):
             "this in a deployment reachable by more than one person."
         ),
     )
+    signup_enabled: bool = Field(default=True, description="false = no self sign-up; create accounts with python -m backend.scripts.create_user.")
+    invite_code: str = Field(default="", description="When set, sign-up requires this code. Set it before sharing a deployment.")
+    token_ttl_days: int = Field(default=30, description="Sign-in lifetime; renewed while the user keeps using the app.")
+    login_max_failures: int = Field(default=10, description="Failed sign-ins per IP or email per 15 minutes before 429.")
     dev_bypass_email: str = "dev@local.test"
     dev_bypass_password: str = "dev-password"
     """Only used to seed the bypass account at startup; never required to authenticate while dev_bypass is on."""

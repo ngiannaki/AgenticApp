@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from backend.apps.api.agent_tasks import TERMINAL, AgentHub
+from backend.apps.api import quotas
 from backend.apps.api.auth import AuthUser, get_current_user
 
 router = APIRouter(prefix="/api", tags=["agents"])
@@ -65,6 +66,7 @@ async def _check_documents(request: Request, inputs: dict, user: AuthUser) -> No
 async def start_task(body: StartTask, request: Request, user: AuthUser = Depends(get_current_user)) -> dict:
     hub = _hub(request)
     await _check_documents(request, body.inputs, user)
+    await quotas.consume(request, user.user_id, "agent_tasks")
     try:
         return await hub.start(user.user_id, body.agent_id, body.inputs)
     except LookupError:
@@ -129,6 +131,7 @@ async def rerun_task(task_id: str, body: Rerun, request: Request, user: AuthUser
     task = await _own_task(request, task_id, user)
     inputs = body.inputs if body.inputs is not None else task["inputs"]
     await _check_documents(request, inputs, user)
+    await quotas.consume(request, user.user_id, "agent_tasks")
     try:
         return await _hub(request).start(user.user_id, task["agent_id"], inputs, parent=task, feedback=body.feedback.strip())
     except LookupError:

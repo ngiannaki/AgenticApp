@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -54,6 +55,43 @@ def hash_token(token: str) -> str:
 
 def normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def _ttl_days() -> int:
+    from backend.config import settings as app_settings
+
+    return app_settings.auth.token_ttl_days
+
+
+class LoginLimiter:
+    """In-memory failed sign-in counter per IP and per email (one API process
+    is enough for a small team). Over the limit within the window -> 429."""
+
+    def __init__(self, max_failures: int, window_seconds: float = 900) -> None:
+        self.max_failures = max_failures
+        self.window = window_seconds
+        self._failures: dict[str, list[float]] = {}
+
+    def _recent(self, key: str) -> list[float]:
+        now = time.monotonic()
+        recent = [t for t in self._failures.get(key, []) if now - t < self.window]
+        if recent:
+            self._failures[key] = recent
+        else:
+            self._failures.pop(key, None)
+        return recent
+
+    def check(self, *keys: str) -> None:
+        if self.max_failures and any(len(self._recent(k)) >= self.max_failures for k in keys):
+            raise HTTPException(status_code=429, detail="Too many failed sign-ins. Try again in 15 minutes.")
+
+    def fail(self, *keys: str) -> None:
+        for k in keys:
+            self._failures.setdefault(k, []).append(time.monotonic())
+
+    def clear(self, *keys: str) -> None:
+        for k in keys:
+            self._failures.pop(k, None)
 
 
 class UserStore:
@@ -118,13 +156,23 @@ class UserStore:
             logger.exception("Failed to delete auth token on logout")
 
     async def resolve_token(self, token: str) -> AuthUser | None:
+        """Valid while used: each use pushes the expiry to now + AUTH_TOKEN_TTL_DAYS
+        (written at most once an hour per token)."""
         def _resolve():
             with self.pool.connection() as conn:
-                return conn.execute(
-                    "SELECT u.id, u.email FROM app.auth_tokens t JOIN app.users u ON u.id = t.user_id"
+                row = conn.execute(
+                    "SELECT u.id, u.email, t.last_used_at > now() - interval '1 hour' AS fresh"
+                    " FROM app.auth_tokens t JOIN app.users u ON u.id = t.user_id"
                     " WHERE t.token_hash = %s AND (t.expires_at IS NULL OR t.expires_at > now())",
                     (hash_token(token),),
                 ).fetchone()
+                if row and not row["fresh"]:
+                    conn.execute(
+                        "UPDATE app.auth_tokens SET last_used_at = now(),"
+                        " expires_at = now() + make_interval(days => %s) WHERE token_hash = %s",
+                        (_ttl_days(), hash_token(token)),
+                    )
+                return row
 
         try:
             row = await run_sync(_resolve)
@@ -157,8 +205,9 @@ class UserStore:
         def _insert() -> None:
             with self.pool.connection() as conn:
                 conn.execute(
-                    "INSERT INTO app.auth_tokens (token_hash, user_id) VALUES (%s, %s)",
-                    (hash_token(token), user_id),
+                    "INSERT INTO app.auth_tokens (token_hash, user_id, last_used_at, expires_at)"
+                    " VALUES (%s, %s, now(), now() + make_interval(days => %s))",
+                    (hash_token(token), user_id, _ttl_days()),
                 )
 
         await run_sync(_insert)

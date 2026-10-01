@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 from backend.apps.api.auth import UserStore
 from backend.apps.api.config import get_api_settings
 from backend.apps.api.document_registry import DocumentRegistry
+from backend.apps.api.indexer import Indexer
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
 from backend.apps.api.routers import agents, auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
@@ -143,6 +144,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.user_store = UserStore(pool)
     app.state.document_registry = DocumentRegistry(pool)
     runtime.document_registry = app.state.document_registry
+    app.state.indexer = Indexer(runtime, app.state.document_registry)
+    requeued = await app.state.indexer.requeue_pending()
+    if requeued:
+        logger.info("Re-queued %d document(s) left mid-indexing by the restart", requeued)
 
     if app_settings.auth.dev_bypass:
         app.state.dev_user = await app.state.user_store.seed_dev_user(
@@ -176,6 +181,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reaper_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reaper_task
+        await app.state.indexer.close()
         if app.state.agent_hub is not None:
             await app.state.agent_hub.close()
         await runtime.close()

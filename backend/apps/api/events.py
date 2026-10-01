@@ -85,6 +85,12 @@ def citations(items: list[dict[str, Any]]) -> dict[str, Any]:
     return sse("citations", {"items": items})
 
 
+def token(content: str) -> dict[str, Any]:
+    """A piece of the model's reply as it is generated (display only; the
+    final `message` event carries the full, citation-rendered answer)."""
+    return sse("token", {"content": content})
+
+
 def message(content: str) -> dict[str, Any]:
     return sse("message", {"content": content})
 

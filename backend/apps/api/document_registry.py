@@ -21,7 +21,7 @@ from backend.core.db import run_sync
 logger = logging.getLogger("agentic_api")
 
 _LIST_COLUMNS = (
-    "id AS document_id, original_name, file_type, status, chunks_indexed,"
+    "id AS document_id, original_name, file_type, status, chunks_indexed, error,"
     " extract(epoch FROM created_at)::float8 AS created_at"
 )
 
@@ -100,6 +100,17 @@ class DocumentRegistry:
         except psycopg.Error:
             logger.exception("Failed to list documents for user %s", user_id)
             return []
+
+    async def with_status(self, status: str) -> list[dict[str, Any]]:
+        """Every user's documents in `status` (startup: re-queue "indexing")."""
+        def _do() -> list[dict[str, Any]]:
+            with self.pool.connection() as conn:
+                return conn.execute(
+                    "SELECT id, user_id, original_name FROM app.documents WHERE status = %s ORDER BY created_at",
+                    (status,),
+                ).fetchall()
+
+        return await run_sync(_do)
 
     async def delete(self, document_id: str, user_id: str) -> bool:
         """Deletes only if `user_id` owns the document. Returns whether it was deleted."""
