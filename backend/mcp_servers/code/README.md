@@ -72,7 +72,7 @@ below. `docker/sandbox/smoke_test.py` checks a running container.
    # edit backend/.env — see the CODE_MCP_* section in backend/.env.example
    ```
 3. **Run the server** (matches how `indexing`/`retrieval`/`db` are started;
-   see the repo's `start_mcp_servers.ps1` / `HOW_TO_RUN_SERVERS.md`):
+   see the repo's `start_mcp_servers.ps1` / `RUNNING.md`):
    ```
    .venv/Scripts/python.exe backend/mcp_servers/code/server.py
    ```

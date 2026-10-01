@@ -1,11 +1,6 @@
 # LLMS
 import logging
-import os
-from pathlib import Path
-from typing import Any, Dict, Optional
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_ollama import ChatOllama
 #from config.settings import get_use_google_api
 
 from backend.config import settings

@@ -136,15 +136,6 @@ class RetrievalModelSettings(BaseSettings):
     temperature: float = 0.3
 
 
-class RetrievalAgentModelSettings(BaseSettings):
-    """Evaluation/answer LLM used by the standalone A2A retrieval agent (backend/apps/retrieval_agent)."""
-
-    model_config = _settings_config("RETRIEVAL_AGENT_MODEL_")
-
-    dev: str = "gpt-oss:20b"
-    prod: str = "gpt-4o-mini"
-
-
 class MetadataModelSettings(BaseSettings):
     """Document summary/section extraction LLM (backend/infrastructure/vector_store/metadata_enhancer.py)."""
 
@@ -491,18 +482,6 @@ class RetrievalServerSettings(BaseSettings):
     )
 
 
-class RetrievalAgentSettings(BaseSettings):
-    """Process/networking config for the standalone A2A retrieval agent."""
-
-    model_config = _settings_config("RETRIEVAL_AGENT_")
-
-    mcp_url: str = "http://localhost:8001/mcp"
-    top_k: int = 10
-    max_iterations: int = 5
-    host: str = "localhost"
-    port: int = 9999
-
-
 class DatabaseSettings(BaseSettings):
     """The one Postgres (with pgvector) behind everything: users, auth
     tokens, conversations, the document registry (schema `app`), document
@@ -667,7 +646,6 @@ class Settings:
         self.chat = ChatModelSettings()
         self.embedding = EmbeddingModelSettings()
         self.retrieval = RetrievalModelSettings()
-        self.retrieval_agent_model_cfg = RetrievalAgentModelSettings()
         self.metadata = MetadataModelSettings()
 
         self.api = ApiSettings()
@@ -675,7 +653,6 @@ class Settings:
         self.code_mcp = CodeMcpSettings()
         self.indexing_server = IndexingServerSettings()
         self.retrieval_server = RetrievalServerSettings()
-        self.retrieval_agent = RetrievalAgentSettings()
         self.database = DatabaseSettings()
         self.document_store = DocumentStoreSettings()
         self.artifact_store = ArtifactStoreSettings()
@@ -711,9 +688,6 @@ class Settings:
     def retrieval_temperature(self) -> float:
         return self.retrieval.temperature
 
-    @property
-    def retrieval_agent_model(self) -> str:
-        return self.retrieval_agent_model_cfg.prod if self.is_prod else self.retrieval_agent_model_cfg.dev
 
     @property
     def metadata_model(self) -> str:

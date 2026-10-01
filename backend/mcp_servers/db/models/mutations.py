@@ -6,7 +6,7 @@ operators are deliberately small: $eq, $ne, $gt, $gte, $lt, $lte, $in, $is_null.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Union
+from typing import Any, Union
 
 from pydantic import BaseModel, Field
 

@@ -370,3 +370,81 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
   7. **Frontend:** one generic `/agents` page that renders any agent's form from its `inputs`, plus a task list, a live timeline, a clarifying-question box with option buttons, deliverables (markdown report with download, chart images, file links) and cancel. "Agents" was added to the sidebar.
   - **Deviation from the plan:** the chat-to-agent handoff tool was left out to keep this phase lean.
   - **Verification:** backend pytest: 76 passed. The new `test_agents.py` runs the real agents service over HTTP (A2A) driven by the real `AgentHub` with Postgres: steps, a question, the reply, artifacts and completion; Deep Research with a scripted LLM/tools producing a report where a real citation becomes [1] and an invented one is dropped; input validation failing a task; the token gate; and `execute_tool` enforcing approval and ownership. Frontend: `tsc` clean (only the existing LayoutProps error), eslint clean, `next build` passes with the new `/agents` route. Not run here: the agents against a real LLM (needs Ollama/OpenAI).
+
+## 2026-10-01
+- **Change:** Agents — new Extractor agent (always answers in JSON), polished agent result views, and delete / rename / rerun-with-feedback for agent tasks
+- **Files:** backend/apps/agents/extractor.py (new), backend/apps/agents/registry.py, backend/apps/api/agent_tasks.py, backend/apps/api/routers/agents.py, backend/migrations/0003_agent_task_reruns.sql (new), backend/tests/test_agents.py; frontend: src/app/agents/page.tsx, src/lib/{api,types}.ts, src/app/globals.css
+- **Details:**
+  1. **ExtractorAgent (`extractor`):**
+     - The user says what to pull out ("invoice number, total, due date"). The agent:
+       - plans the fields (snake_case keys),
+       - searches the user's documents once per field,
+       - has the LLM fill `{key: {value, source}}` from tagged excerpts.
+     - Output is always one `extraction.json` artifact, `{"values": {...}, "sources": {...}}`. Every value carries its document and page, or null when not found.
+     - "Summarize" or a plain question still gives JSON (`{"summary": ...}` / `{"answer": ...}`).
+  2. **Task management:**
+     - `PATCH /api/tasks/{id}` renames a task.
+     - `DELETE /api/tasks/{id}` cancels the task if it is running, then deletes it with its events.
+     - `POST /api/tasks/{id}/rerun` takes `{feedback, inputs?}` and starts a new linked task (`parent_task_id`, title "… (rerun)"). The feedback and an excerpt of the previous result are appended to the agent's main text input.
+  3. **UI:**
+     - Task header: status pill, elapsed time, and Cancel / Rerun with feedback / Rename / Delete.
+     - Results come first; the activity timeline is collapsible with step icons.
+     - Markdown report card with Copy/Download, and a file gallery.
+     - JSON results show as a Table (key / value / source) or as syntax-coloured JSON, with Copy/Download.
+  - **Verification:** pytest (Extractor unit test, and rerun + delete in the lifecycle test). Frontend eslint/tsc/build clean.
+
+## 2026-10-01
+- **Change:** Phase 3 — deployment-ready compose topology (no actual deploy). Both local modes still work.
+- **Files:** backend/core/mcp_http.py (new), backend/mcp_servers/{indexing,retrieval,db,code}/server.py, backend/apps/api/main.py, backend/apps/client/servers.compose.json (new), docker-compose.yml, docker/web/{Dockerfile,Caddyfile} (new), docker/sandbox/Dockerfile, nginx.conf, nginx_http.conf, start_mcp_servers.ps1, .env.example (new, root), backend/.env.example, DEPLOY.md (new), RUNNING.md, .github/workflows/ci.yml, backend/tests/test_mcp_http.py (new); frontend: src/lib/api.ts
+- **Details:**
+  1. **Internal MCP token:**
+     - Every MCP server runs over HTTP through `run_mcp_http`, which rejects requests without `Authorization: Bearer $MCP_INTERNAL_TOKEN`.
+     - The API adds the header to every URL server entry automatically.
+     - The token is read from the environment or from backend/.env, so the ps1 host processes get it too. The ps1 script passes it to the sandbox container.
+  2. **Compose:**
+     - One `agenticapp-backend` image runs `app`, `db-setup` (migrations, once), `indexing`, `retrieval`, `db` and `agents` as separate HTTP services, the same shape as ps1 mode.
+     - Only the API (127.0.0.1:8100) and Postgres (127.0.0.1:5432) are published, both on localhost only.
+     - `app` has a healthcheck on /api/health.
+  3. **Public entrance (profiles):**
+     - `edge`: Caddy builds the frontend static export from `FRONTEND_DIR` and serves it. It proxies only `/api/*` (with SSE flushing) and gets automatic HTTPS for `SITE_ADDRESS`.
+     - `tunnel`: adds `cloudflared` for a named Cloudflare tunnel from your PC.
+  4. **nginx (ps1 mode):** proxies only `/api/`; the public MCP routes are removed.
+  5. **Frontend `API_BASE_URL`:**
+     - `NEXT_PUBLIC_API_BASE_URL` if set.
+     - Otherwise `http://localhost:8100` under `npm run dev`, or same origin in a build.
+     - The hardcoded devtunnels URL is gone.
+  6. **Docs and CI:** DEPLOY.md covers the VM + Caddy, PC + tunnel, backups and a pre-share checklist. CI validates every compose profile and the Caddyfile.
+  - **Verification:** pytest; `docker compose config` OK for the default, edge and tunnel profiles. Not run here (no Docker daemon): the image builds and the Caddyfile validation, which CI covers.
+
+## 2026-10-01
+- **Change:** Phase 4 — accounts, limits and UX: invite-only sign-up, expiring tokens, login rate limit, per-user daily quotas, background indexing, token streaming
+- **Files:** backend/apps/api/{auth,quotas (new),indexer (new),document_registry,main,events,streaming_agent,schemas}.py, backend/apps/api/routers/{auth,chat,files,agents}.py, backend/migrations/0004_usage_daily.sql (new), backend/scripts/create_user.py (new), backend/config/settings.py, backend/.env.example, DEPLOY.md, backend/tests/test_limits_and_streaming.py (new); frontend: src/components/{LoginForm,ChatApp}.tsx, src/app/documents/page.tsx, src/lib/{api,types}.ts, src/app/globals.css
+- **Details:**
+  1. **Sign-up:**
+     - `AUTH_INVITE_CODE`: sign-up requires the code. Wrong codes count toward the per-IP limit.
+     - `AUTH_SIGNUP_ENABLED=false` turns sign-up off; then create accounts with `python -m backend.scripts.create_user <email>`, which also resets passwords.
+     - `GET /api/auth/config` tells the login form whether to show the invite field and the sign-up link.
+  2. **Sessions:** tokens expire after `AUTH_TOKEN_TTL_DAYS` (30) and renew while used (written at most hourly).
+  3. **Login rate limit:** in memory, per IP and per email. After `AUTH_LOGIN_MAX_FAILURES` (10) failures in 15 minutes the API returns 429.
+  4. **Quotas:** `app.usage_daily` counts chat turns, uploads and agent tasks (reruns included) per user per day against `API_DAILY_*`. 0 means unlimited; over the limit returns 429 with a readable message.
+  5. **Background indexing:**
+     - A Documents-page upload stores the file and returns 202 with status `indexing`.
+     - `Indexer` indexes one document at a time and sets `indexed`, or `failed` with the error.
+     - Documents left in `indexing` by a restart are re-queued at startup.
+     - The page shows an Indexing…/failed badge and polls every 3s while needed.
+     - Chat attachments still index before returning, because the model needs them right away.
+  6. **Token streaming:**
+     - `_chat` uses `stream=True` and rebuilds the message from deltas (content, tool-call pieces merged by index, Ollama `reasoning`).
+     - Content is forwarded as new `token` SSE events, which the chat renders live. They are cleared if the model calls tools instead, then replaced by the final citation-rendered `message`.
+     - `API_STREAM_TOKENS=false` turns it off.
+  - **Verification:** pytest 85 passed (invite/disabled sign-up, login 429, token expiry + renewal, quota 429, background indexing success/failure + requeue, stream reassembly). Frontend eslint (0 errors), tsc and `next build` pass.
+
+## 2026-10-01
+- **Change:** Phase 7 — cleanup, lint and CI
+- **Files:** removed backend/apps/api/streaming_agent_v2.py, streaming_agent_v3.py, backend/mcp_servers/client/{test_*.py,retrieval_mcp_client.py}, and the RETRIEVAL_AGENT_* settings; events.py drops the orchestrator-only events; old root docs moved to docs/archive/; README.md (new); ruff F-rule fixes across backend; CI gets a ruff job; frontend gets .github/workflows/ci.yml (eslint + build) and a lint fix in src/app/data/page.tsx
+- **Details:**
+  - Dead code from the old orchestrator/retrieval-agent experiments is gone.
+  - Docs that described the Mongo/Chroma era are archived.
+  - `ruff check backend --select F` is clean (unused imports removed) and enforced in CI.
+  - The frontend repo now has CI: lint + static build.
+  - **Verification:** pytest 85 passed, compileall OK, ruff clean, frontend lint/build clean.

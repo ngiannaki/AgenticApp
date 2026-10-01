@@ -78,7 +78,7 @@ def retrieve_document_v2(
     the end user) and is checked against the document's owner — a mismatch
     returns the same "not found" error as a nonexistent document_id.
     """
-    logger.info(f"[RETRIEVAL_V2] retrieve_document_v2 called")
+    logger.info("[RETRIEVAL_V2] retrieve_document_v2 called")
     logger.info(f"[RETRIEVAL_V2] user_id: {user_id}, document_id: {document_id}, query: {query}, top_k: {top_k}, filters: {filters}")
 
     if not query or not query.strip():

@@ -6,9 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from types import SimpleNamespace
 
-import pytest
 import uvicorn
 
 from backend.apps.agents import base as agents_base
