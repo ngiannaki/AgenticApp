@@ -51,6 +51,18 @@ _SPREADSHEET_EXTENSIONS = {".csv", ".xlsx", ".xlsm"}
 # would silently fail to display without this.
 _INLINE_CONTENT_TYPES = {"text/html", "image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"}
 
+# Artifacts are model-generated (a generate_ui page, a plot, an SVG...) and
+# served from the API's own origin, so they must never run with that
+# origin's privileges. `sandbox` puts the response in an opaque origin even
+# when opened directly in a tab (not only inside the frontend's sandboxed
+# iframe) — scripts still run, so interactive generate_ui pages keep
+# working, but can't read anything belonging to the API origin. nosniff
+# stops a browser from re-interpreting e.g. a .txt artifact as HTML.
+_ARTIFACT_HEADERS = {
+    "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+    "X-Content-Type-Options": "nosniff",
+}
+
 
 @router.get("/{artifact_id}/{filename}")
 def get_file(artifact_id: str, filename: str) -> FileResponse:
@@ -59,7 +71,9 @@ def get_file(artifact_id: str, filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="File not found")
     media_type, _ = mimetypes.guess_type(path.name)
     disposition = "inline" if media_type in _INLINE_CONTENT_TYPES else "attachment"
-    return FileResponse(path, filename=path.name, content_disposition_type=disposition)
+    return FileResponse(
+        path, filename=path.name, content_disposition_type=disposition, headers=_ARTIFACT_HEADERS
+    )
 
 
 # --- Chat file uploads + per-user document registry -------------------------
@@ -241,7 +255,11 @@ async def get_document_content(
     doc = await registry.get(document_id)
     display_name = (doc or {}).get("original_name") or path.name
     return FileResponse(
-        path, filename=display_name, media_type=media_type, content_disposition_type=disposition
+        path,
+        filename=display_name,
+        media_type=media_type,
+        content_disposition_type=disposition,
+        headers=_ARTIFACT_HEADERS,
     )
 
 

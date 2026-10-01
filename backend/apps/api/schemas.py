@@ -34,15 +34,17 @@ class ToolInfo(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
-    system_prompt: str | None = None
-    """Override the default agent system prompt for this session."""
+    # No system_prompt override: the system prompt carries the agent's tool
+    # and safety rules, so it's server-controlled only. (An old client still
+    # sending the field is fine — unknown fields are ignored.)
 
     approval_required_tools: list[str] | None = None
     """
-    Tool names that must pause for human approval in this session.
+    Extra tool names that must pause for human approval in this session.
     Pass ["*"] to require approval for every tool call.
     Omit to fall back to the server-wide default (API_APPROVAL_REQUIRED_TOOLS).
-    Pass [] explicitly to disable human-in-the-loop for this session.
+    Pass [] to add nothing beyond API_MANDATORY_APPROVAL_TOOLS, which always
+    apply and can't be turned off from here (see ChatSession.requires_approval).
     """
 
 

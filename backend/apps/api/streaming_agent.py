@@ -39,12 +39,21 @@ logger = logging.getLogger("agentic_api")
 ASK_USER_TOOL_NAME = "ask_user"
 GET_SKILL_TOOL_NAME = "get_skill"
 
-# Registered as MCP tools (so FastAPI routes can call them via
-# runtime.mcp.call_tool) but deliberately withheld from the model's own
-# tool list in _load_tools — each is a raw/unscored data dump meant for a
-# specific UI (the Documents page's chunk browser + citation preview), not
-# something the chat agent should ever reach for to answer a question.
-_INTERNAL_ONLY_TOOLS = {"retrieval_get_document_chunks_v2"}
+# Which MCP tools the model may see is an allowlist (settings.api.model_tools),
+# not a denylist: every MCP server also registers tools meant only for the
+# API itself — indexing_upload_document* (reads a server-local file_path),
+# indexing_upload_and_index_document_v2 / indexing_delete_document_v2 (the
+# Documents page's upload/delete), retrieval_get_document_chunks_v2 (the
+# chunk browser's raw dump) — and a denylist silently exposes the next one
+# somebody adds. FastAPI routes still call those through runtime.mcp /
+# call_tool_isolated directly; only the model's view is filtered.
+
+# Tool-call argument names that carry document ids. Any model-initiated call
+# passing one is checked against the document registry before dispatch (see
+# AgentRuntime._check_document_access) — a single guard covering retrieval,
+# the code server's spreadsheet tools, and any future document-taking tool,
+# instead of trusting every MCP server to implement its own ownership check.
+_DOCUMENT_ID_ARGS = ("document_id", "document_ids")
 
 # Tool calls whose user_id argument must come from the authenticated session,
 # never from the model. The model is told which document_ids are attached
@@ -513,6 +522,11 @@ class AgentRuntime:
         self.settings = settings
         self.tools: list[dict[str, Any]] = []
         self._skill_index: list[skills_lib.SkillMeta] = []
+        self.document_registry: Any = None
+        """backend.apps.api.document_registry.DocumentRegistry, set by main.py's
+        lifespan once Mongo is connected (None if it isn't). Used by
+        _check_document_access to verify document ownership before any
+        model-initiated tool call that names a document_id."""
         self._isolated_sessions = isolated_sessions
         """True when every chat session can safely get its own independent
         MCP protocol session (streamable-HTTP servers.json, run via
@@ -584,6 +598,11 @@ class AgentRuntime:
 
     async def _load_tools(self) -> None:
         mcp_tools = await self.mcp.list_tools()
+        allowed = set(self.settings.model_tools)
+        expose_all = "*" in allowed
+        hidden = sorted(t.name for t in mcp_tools if not expose_all and t.name not in allowed)
+        if hidden:
+            logger.info("Withheld from the model (not in API_MODEL_TOOLS): %s", ", ".join(hidden))
         self.tools = [
             {
                 "type": "function",
@@ -594,7 +613,7 @@ class AgentRuntime:
                 },
             }
             for t in mcp_tools
-            if t.name not in _INTERNAL_ONLY_TOOLS
+            if expose_all or t.name in allowed
         ]
         self.tools.append(_ASK_USER_TOOL_SCHEMA)
 
@@ -802,8 +821,19 @@ class AgentRuntime:
         chunk_numbers: dict[str, int],
     ) -> AsyncIterator[dict[str, Any]]:
         name = call.function.name
-        arguments = json.loads(call.function.arguments) if call.function.arguments else {}
         call_id = str(uuid.uuid4())
+        try:
+            arguments = json.loads(call.function.arguments) if call.function.arguments else {}
+            if not isinstance(arguments, dict):
+                raise ValueError("arguments must be a JSON object")
+        except ValueError as exc:
+            # A malformed tool call is the model's mistake to correct, not a
+            # reason to end the whole turn — hand it back as a failed result.
+            text = f"Error calling tool '{name}': arguments were not a valid JSON object ({exc}). Retry with valid JSON."
+            yield events.tool_call(call_id, name, {"_raw": call.function.arguments})
+            yield events.tool_result(call_id, name, False, text)
+            session.memory.add_tool_result(name, text, tool_call_id=call.id)
+            return
 
         yield events.tool_call(call_id, name, arguments)
 
@@ -855,14 +885,29 @@ class AgentRuntime:
             if decision.action == "edit" and decision.arguments is not None:
                 arguments = decision.arguments
 
+        # After the approval block on purpose: an "edit" decision can replace
+        # the arguments, document_id included, so check what will actually run.
+        denied = await self._check_document_access(session, arguments)
+        if denied is not None:
+            text = f"Error calling tool '{name}': {denied}"
+            logger.warning("[ACCESS] user=%s tool=%s denied: %s", session.user_id, name, denied)
+            yield events.tool_result(call_id, name, False, text)
+            session.memory.add_tool_result(name, text, tool_call_id=call.id)
+            return
+
         if name in self.user_scoped_tool_names:
             arguments["user_id"] = session.user_id
 
         yield events.status(f"calling {name}")
+        timeout = self.settings.tool_call_timeout_seconds
         try:
-            result = await session.mcp.call_tool(name, arguments)
+            result = await asyncio.wait_for(session.mcp.call_tool(name, arguments), timeout=timeout)
             text = _extract_text(result)
             ok = True
+        except asyncio.TimeoutError:
+            text = f"Error calling tool '{name}': timed out after {timeout:.0f}s."
+            ok = False
+            logger.error(text)
         except Exception as exc:  # noqa: BLE001 — surface any tool failure back to the model
             text = f"Error calling tool '{name}': {exc}"
             ok = False
@@ -871,6 +916,40 @@ class AgentRuntime:
         text = _collect_and_stamp_citations(citations, chunk_numbers, name, ok, text)
         yield events.tool_result(call_id, name, ok, text)
         session.memory.add_tool_result(name, text, tool_call_id=call.id)
+
+    async def _check_document_access(self, session: ChatSession, arguments: dict[str, Any]) -> str | None:
+        """Return a denial reason if `arguments` name any document the
+        session's user doesn't own, else None.
+
+        Checked here, centrally, rather than trusting each MCP server: the
+        code server's spreadsheet tools take a bare document_id and have no
+        notion of users at all, and retrieval's own collection-metadata check
+        is a second line of defence, not the only one. Unknown ids get the
+        same message as someone else's so the model (or a prompt-injected
+        instruction) can't probe which ids exist.
+        """
+        doc_ids: list[str] = []
+        for key in _DOCUMENT_ID_ARGS:
+            value = arguments.get(key)
+            if isinstance(value, list):
+                doc_ids.extend(str(v) for v in value if v)
+            elif value:
+                # Anything else non-empty (normally a str, but don't let an
+                # int/dict slip past unchecked just because of its type).
+                doc_ids.append(str(value))
+        if not doc_ids:
+            return None
+
+        registry = self.document_registry
+        if registry is None:
+            if app_settings.auth.dev_bypass:
+                return None  # single-user local dev without Mongo: nothing to check against
+            return "the document registry is unavailable, so document access can't be verified."
+
+        for doc_id in doc_ids:
+            if not await registry.is_owner(doc_id, session.user_id):
+                return f"document_id={doc_id!r} was not found among this user's documents."
+        return None
 
     async def _handle_ask_user(
         self, session: ChatSession, call: Any, call_id: str, arguments: dict[str, Any]

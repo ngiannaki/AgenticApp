@@ -72,11 +72,14 @@ class LangchainRetrievalPipelineV2:
         return f"{self.cfg.collection_prefix}{document_id}"
 
     def _check_ownership(self, collection, user_id: str | None) -> bool:
-        """Same rule as v1's DocumentRetriever._check_ownership: a
-        collection with no owner is unowned/shared; once it has one, only
-        that user_id may read it."""
+        """Only the collection's owner may read it. A collection with no
+        recorded owner is denied too (it used to be treated as shared): every
+        document uploaded through the API is stamped with its user_id, so an
+        ownerless collection can only come from a legacy/out-of-band upload,
+        and "readable by everyone" is the wrong default for that in a
+        multi-user deployment."""
         owner = (collection.metadata or {}).get("user_id")
-        if owner and owner != user_id:
+        if not owner or owner != user_id:
             logger.warning(f"[RETRIEVAL_V2] Denied access to {collection.name} for user_id={user_id!r} (owned by {owner!r})")
             return False
         return True

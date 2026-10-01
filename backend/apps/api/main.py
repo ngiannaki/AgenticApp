@@ -95,6 +95,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mongo_db = mongo_client[settings.mongo_db_name]
         app.state.user_store = await UserStore.connect(mongo_client, mongo_db)
         app.state.document_registry = await DocumentRegistry.connect(mongo_client, mongo_db)
+        runtime.document_registry = app.state.document_registry
     except Exception:  # noqa: BLE001 — persistence is a durability nice-to-have, not a hard dependency
         logger.exception(
             "Could not connect to MongoDB at %s — conversations, auth, and documents will "

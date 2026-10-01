@@ -235,3 +235,16 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ✅ Added backend/tests/test_identifier_validator.py (18 cases) covering the SQL identifier allowlist/quoting module, plus [tool.pytest.ini_options] in backend/pyproject.toml and a new `pytest` job in .github/workflows/ci.yml — all run locally first (18 passed, 0.04s) before wiring into CI
 - ⬜ Only one module has real test coverage so far — identifier_validator.py was picked as a deliberately easy, dependency-free, security-relevant starting point, not because it's the only thing worth testing. Good next candidates once this pattern is proven out: sql_validator.py (query-shape validation, also stdlib-ish), permissions.py (table/column access control), and streaming_agent.py's new _looks_like_broken_connection (2026-10-01 entry above) — that last one would need fastmcp/anyio installed in CI though, unlike today's zero-dependency module
 - ⬜ Not yet confirmed green on an actual GitHub Actions run with the new pytest job included — push and check the Actions tab
+
+## 2026-10-01
+- ✅ Phase 0 (multi-user hardening): model tool allowlist, central document-ownership guard on tool calls, retrieval denies ownerless collections, auth and owner checks on interrupts/questions/tools/session-delete, server-enforced mandatory approvals for DB writes, no client system_prompt override, sandbox CSP + nosniff on artifacts, malformed tool-args handling, tool-call timeout
+- ✅ Frontend: Approve/Reject card for paused tool calls (needed now that DB writes always require approval)
+- ✅ 12 access-control pytest cases + CI installs backend/requirements-test.txt
+- ⬜ Not yet verified live end to end (running stack + real LLM): ask the chat to call `indexing_upload_document` and confirm it's refused; confirm a `db_insert_data` call shows the Approve/Reject card and both buttons work
+- ⬜ Phase 1: one Postgres (pgvector) replacing Mongo + Chroma; per-user DB workspaces; migrate_mongo_to_pg.py + reindex_all.py
+- ⬜ Phase 2: code sandbox container (separate uid for user code, no network, no secrets, file pull via signed token)
+- ⬜ Phase 3: compose all-HTTP topology + internal MCP token + Caddy (VM) / cloudflared (PC) profiles + ps1/nginx parity + same-origin frontend
+- ⬜ Phase 4: invite-only signup, hashed expiring tokens, login rate limit, per-user quotas, background indexing, token streaming
+- ⬜ Phase 5: A2A agents service (Deep Research + Data Analyst) + /api/tasks
+- ⬜ Phase 6: frontend /research and /analyst pages
+- ⬜ Phase 7: full pytest/sandbox tests in CI, ruff, dead-code cleanup, docs consolidation

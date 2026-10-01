@@ -1,0 +1,21 @@
+# What backend/tests needs to import the API (backend/apps/api) without the
+# heavy indexing/retrieval stack (docling, torch, langchain...). Versions
+# match requirements-base.txt / apps/api/requirements.txt.
+pytest
+fastapi==0.141.1
+starlette==1.6.0
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+python-multipart==0.0.32
+httpx==0.28.1
+sse-starlette==3.4.8
+anyio==4.14.2
+rich==15.0.0
+fastmcp==3.4.7
+mcp==1.29.0
+openai==2.54.0
+ollama
+bcrypt
+motor==3.7.1
+pymongo==4.17.0

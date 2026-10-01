@@ -7,6 +7,8 @@ name: Backend CI
 # Dockerfile, and the one real pytest module that exists so far (see
 # backend/tests/ -- backend/mcp_servers/client/test_*.py are separate
 # ad-hoc/print-based scripts, not pytest-discoverable, and not run here).
+# backend/tests also covers the API's multi-user access-control rules
+# (test_api_access_control.py), with MCP/LLM/Mongo faked in-process.
 
 on:
   push:
@@ -31,13 +33,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install pytest
-        # Deliberately not `pip install -r <requirements>` here: the one
-        # test module we have (backend/tests/test_identifier_validator.py)
-        # exercises a stdlib-only module on purpose, precisely so this job
-        # stays fast and doesn't need the rest of the app's (heavy) runtime
-        # dependencies installed just to run it.
-        run: pip install pytest
+      - name: Install test dependencies
+        # backend/requirements-test.txt is the API's import surface only
+        # (fastapi, fastmcp, openai, motor, ...) -- not the heavy indexing/
+        # retrieval stack (docling, torch, langchain), which no test needs.
+        run: pip install -r backend/requirements-test.txt
       - name: Run backend/tests
         run: python -m pytest backend/tests
 

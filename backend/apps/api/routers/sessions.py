@@ -31,7 +31,7 @@ async def create_session(
     )
 
     session = await session_manager.create(
-        system_prompt=runtime.system_prompt_for(body.system_prompt or DEFAULT_SYSTEM_PROMPT),
+        system_prompt=runtime.system_prompt_for(DEFAULT_SYSTEM_PROMPT),
         max_history_messages=settings.max_history_messages,
         approval_required_tools=approval_required_tools,
         user_id=user.user_id,
@@ -58,7 +58,15 @@ async def delete_session(session_id: str, request: Request, user: AuthUser = Dep
     session = request.app.state.session_manager.get(session_id)
     if session is not None and session.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Session not found")
-    await request.app.state.session_manager.delete(session_id)
     store = request.app.state.conversation_store
+    if session is None and store is not None:
+        # Not live in memory (evicted, or the API restarted): the in-memory
+        # check above couldn't run, so ownership has to come from the
+        # persisted conversation instead — otherwise any signed-in user could
+        # delete anyone's conversation just by knowing its id.
+        conversation = await store.get_conversation(session_id)
+        if conversation is None or conversation.get("user_id") != user.user_id:
+            raise HTTPException(status_code=404, detail="Session not found")
+    await request.app.state.session_manager.delete(session_id)
     if store is not None:
         await store.delete_conversation(session_id)

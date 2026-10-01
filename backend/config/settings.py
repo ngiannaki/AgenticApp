@@ -203,8 +203,63 @@ class ApiSettings(BaseSettings):
         description=(
             "Tool names that always pause for human approval before executing. "
             "Use ['*'] to require approval for every tool call by default. "
-            "Sessions may override this at creation time."
+            "Sessions may override this at creation time — but only on top of "
+            "mandatory_approval_tools below, which no session can opt out of."
         ),
+    )
+
+    mandatory_approval_tools: list[str] = Field(
+        default_factory=lambda: [
+            "db_create_table",
+            "db_update_table_definition",
+            "db_insert_data",
+            "db_update_data",
+            "db_delete_data",
+        ],
+        description=(
+            "Tools that always pause for human approval, regardless of what a "
+            "session asked for at creation time. Server-side policy: a client can "
+            "add tools to its session's approval list but never remove these."
+        ),
+    )
+
+    model_tools: list[str] = Field(
+        default_factory=lambda: [
+            "retrieval_retrieve_document_v2",
+            "retrieval_get_table_of_contents_v2",
+            "retrieval_get_document_info_v2",
+            "retrieval_web_search",
+            "retrieval_fetch_page",
+            "db_list_tables",
+            "db_describe_table",
+            "db_create_table",
+            "db_update_table_definition",
+            "db_insert_data",
+            "db_update_data",
+            "db_delete_data",
+            "db_query_data",
+            "code_run_python_code",
+            "code_check_python_syntax",
+            "code_profile_spreadsheet",
+            "code_run_python_code_on_document",
+            "code_generate_file",
+            "code_generate_ui",
+        ],
+        description=(
+            "Allowlist of MCP tools (aggregated '<server>_<tool>' names) the chat "
+            "model is shown and may call. Anything else an MCP server registers "
+            "stays callable by the API itself (routers/files.py's upload/delete/"
+            "chunk-listing calls) but is invisible to the model — so a new tool, "
+            "or one taking a server-local file_path (indexing_upload_document), "
+            "never becomes model-reachable by accident. Use ['*'] to expose every "
+            "tool (local single-user debugging only)."
+        ),
+    )
+
+    tool_call_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="Hard ceiling on a single model-initiated MCP tool call before it's reported back to the model as a timeout.",
     )
 
     interrupt_heartbeat_seconds: float = 15.0

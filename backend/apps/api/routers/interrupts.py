@@ -7,7 +7,9 @@ events.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from backend.apps.api.auth import AuthUser, get_current_user
 
 from backend.apps.api.schemas import InterruptDecisionRequest, InterruptDecisionResponse
 
@@ -23,9 +25,12 @@ def resume_interrupt(
     interrupt_id: str,
     decision: InterruptDecisionRequest,
     request: Request,
+    user: AuthUser = Depends(get_current_user),
 ) -> InterruptDecisionResponse:
     session = request.app.state.session_manager.get(session_id)
-    if session is None:
+    # Same 404 for "not yours" as for "doesn't exist" — approving someone
+    # else's paused tool call is exactly what this check is here to stop.
+    if session is None or session.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Session not found")
 
     if decision.action == "edit" and decision.arguments is None:
