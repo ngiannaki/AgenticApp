@@ -1,7 +1,7 @@
 # This repo has no root dependency manifest (backend/pyproject.toml is
 # empty; packages are just installed into the shared .venv). Listed here so
 # this file documents the API's real dependency surface beyond what's
-# already pinned elsewhere (fastapi, motor, pymongo, openai, fastmcp,
+# already pinned elsewhere (fastapi, psycopg, openai, fastmcp,
 # sse-starlette are already required by other servers in this repo).
 #
 # bcrypt is used by backend/apps/api/auth.py for password hashing.

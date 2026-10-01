@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from backend.apps.api.auth import AuthUser, UserStore, get_current_user
+from backend.apps.api.auth import AuthUser, UserStore, get_current_user, normalize_email
 from backend.apps.api.schemas import AuthResponse, CurrentUserResponse, LoginRequest, SignupRequest
 from backend.config import settings as app_settings
 
@@ -27,14 +27,14 @@ def _require_store(request: Request) -> UserStore:
 async def signup(body: SignupRequest, request: Request) -> AuthResponse:
     store = _require_store(request)
     user_id, token = await store.signup(body.email, body.password)
-    return AuthResponse(user_id=user_id, email=body.email, token=token)
+    return AuthResponse(user_id=user_id, email=normalize_email(body.email), token=token)
 
 
 @router.post("/login", response_model=AuthResponse)
 async def login(body: LoginRequest, request: Request) -> AuthResponse:
     store = _require_store(request)
     user_id, token = await store.login(body.email, body.password)
-    return AuthResponse(user_id=user_id, email=body.email, token=token)
+    return AuthResponse(user_id=user_id, email=normalize_email(body.email), token=token)
 
 
 @router.post("/logout", status_code=204)

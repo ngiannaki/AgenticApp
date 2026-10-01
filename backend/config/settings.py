@@ -228,6 +228,7 @@ class ApiSettings(BaseSettings):
             "retrieval_retrieve_document_v2",
             "retrieval_get_table_of_contents_v2",
             "retrieval_get_document_info_v2",
+            "retrieval_search_my_documents_v2",
             "retrieval_web_search",
             "retrieval_fetch_page",
             "db_list_tables",
@@ -271,12 +272,6 @@ class ApiSettings(BaseSettings):
     session_idle_timeout_seconds: float = 3600.0
     """Sessions untouched for this long are evicted by the periodic cleanup task."""
 
-    mongo_url: str = "mongodb://localhost:27017"
-    """MongoDB connection string used to durably store conversations/messages."""
-
-    mongo_db_name: str = "agentic_chat"
-    """MongoDB database name for conversation persistence."""
-
     skills_enabled: bool = Field(
         default=True,
         description=(
@@ -298,8 +293,13 @@ class DbMcpSettings(BaseSettings):
 
     # --- Connectivity -----------------------------------------------------
     database_url: str = Field(
-        default="postgresql://postgres:postgres@localhost:5432/postgres",
-        description="PostgreSQL connection string (libpq/psycopg URI).",
+        default="postgresql://agent_ws:changeme-agent@localhost:5432/ragdb",
+        description=(
+            "PostgreSQL connection string for the DB MCP server. Connect as the "
+            "restricted agent role (DATABASE_AGENT_ROLE), never the app's own role: "
+            "the agent role can't see the app/rag schemas, only the per-user "
+            "ws_<hash> workspace schemas this server creates."
+        ),
     )
     pool_min_size: int = Field(default=1, ge=0)
     pool_max_size: int = Field(default=10, ge=1)
@@ -464,21 +464,35 @@ class RetrievalAgentSettings(BaseSettings):
     port: int = 9999
 
 
-class VectorStoreSettings(BaseSettings):
-    """Chroma is run as its own server process (see start_mcp_servers.ps1)
-    rather than opened in-process via PersistentClient, because the indexing
-    and retrieval MCP servers are two separate long-lived processes — two
-    independent PersistentClient instances against the same on-disk store
-    don't reliably see each other's writes (Chroma's embedded client caches
-    collection state per-process), so a document indexed after the retrieval
-    server started could look like it doesn't exist. Routing both through one
-    HttpClient/server gives them a single consistent view."""
+class DatabaseSettings(BaseSettings):
+    """The one Postgres (with pgvector) behind everything: users, auth
+    tokens, conversations, the document registry (schema `app`), document
+    chunks + embeddings (schema `rag`), and each user's private DB-tool
+    workspace (`ws_<hash>` schemas, reached only through the DB MCP server's
+    own restricted role — see DbMcpSettings.database_url).
 
-    model_config = _settings_config("VECTOR_STORE_")
+    Used by the API and the indexing/retrieval MCP servers. The API applies
+    backend/migrations/*.sql at startup (see backend/core/db/migrate.py).
+    """
 
-    dir: str = "data/vector_store"
-    host: str = "localhost"
-    port: int = 8010
+    model_config = _settings_config("DATABASE_")
+
+    url: str = "postgresql://raguser:changeme@localhost:5432/ragdb"
+    """Connection string for the app's own role. Must be able to CREATE
+    schemas/extensions on first start (the compose/ps1 Postgres container's
+    POSTGRES_USER is)."""
+
+    pool_min_size: int = Field(default=1, ge=0)
+    pool_max_size: int = Field(default=10, gt=0)
+
+    agent_role: str = "agent_ws"
+    """Login role the DB MCP server connects as. Has no access to the `app`
+    or `rag` schemas — only to the per-user workspace schemas it creates."""
+
+    agent_role_password: str | None = None
+    """When set, API startup creates/updates `agent_role` with this password
+    (idempotent). Must match the password in DB_MCP_DATABASE_URL. Leave unset
+    to manage that role yourself."""
 
 
 class DocumentStoreSettings(BaseSettings):
@@ -504,17 +518,12 @@ class RerankingSettings(BaseSettings):
 
 class LangchainRagSettings(BaseSettings):
     """Config for the LangChain-based v2 indexing/retrieval tools
-    (backend/mcp_servers/indexing, retrieval `..._v2` tools).
-
-    This is a parallel pipeline to the llama_index-based v1 tools, not a
-    replacement — it writes/reads its own Chroma collections (named
-    `collection_prefix + document_id`) on the same Chroma server, so v1 and
-    v2 never see each other's data.
+    (backend/mcp_servers/indexing, retrieval `..._v2` tools), which store
+    chunks + embeddings in Postgres (schema `rag`, see
+    backend/core/vector_store/pg_store.py).
     """
 
     model_config = _settings_config("RAG_V2_")
-
-    collection_prefix: str = "docv2_"
 
     # --- Parsing (indexing) ---------------------------------------------------
     pdf_engine: str = Field(
@@ -536,8 +545,8 @@ class LangchainRagSettings(BaseSettings):
     max_top_k: int = Field(default=25, gt=0, description="Hard ceiling on top_k accepted from a caller.")
     fetch_k_multiplier: int = Field(default=6, gt=0, description="Each of the dense/sparse retrievers fetches top_k * this many candidates before ensembling/reranking.")
     max_fetch_k: int = Field(default=60, gt=0, description="Hard ceiling on the fetch_k computed above.")
-    dense_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the vector (Chroma) retriever.")
-    sparse_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the keyword (BM25) retriever.")
+    dense_weight: float = Field(default=0.5, ge=0, description="Reciprocal-rank-fusion weight for the dense (pgvector cosine) leg.")
+    sparse_weight: float = Field(default=0.5, ge=0, description="Reciprocal-rank-fusion weight for the keyword (Postgres full-text) leg.")
     use_reranker: bool = Field(default=True, description="Rerank the ensembled candidates with a cross-encoder before truncating to top_k.")
     rerank_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-12-v2", description="HuggingFace cross-encoder model id used by the reranker.")
 
@@ -603,7 +612,7 @@ class Settings:
         self.indexing_server = IndexingServerSettings()
         self.retrieval_server = RetrievalServerSettings()
         self.retrieval_agent = RetrievalAgentSettings()
-        self.vector_store = VectorStoreSettings()
+        self.database = DatabaseSettings()
         self.document_store = DocumentStoreSettings()
         self.artifact_store = ArtifactStoreSettings()
         self.reranking = RerankingSettings()

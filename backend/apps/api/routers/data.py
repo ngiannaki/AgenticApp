@@ -15,11 +15,10 @@ sessions.py's ChatSession), and get hit on every list/select/paginate click
 same single client opened once at app startup — directly, under both
 transports. Sharing this client across concurrent requests is safe.
 
-There is currently no per-user table ownership in the db MCP server (single
-shared Postgres DB, permissions.yaml scopes by table only) — every
-signed-in user can see every table they have `select` permission on. If
-per-user/per-document scoping is added later, filter here once that
-metadata exists.
+Tables are per user: every call passes the signed-in user's id, and the db
+MCP server confines it to that user's own workspace schema (see
+backend/mcp_servers/db/database/workspace.py) — nobody sees anyone else's
+tables here.
 """
 from __future__ import annotations
 
@@ -65,8 +64,8 @@ async def _call_db_tool(request: Request, tool_name: str, arguments: dict) -> di
 
 @router.get("/tables")
 async def list_tables(request: Request, user: AuthUser = Depends(get_current_user)) -> list[dict]:
-    """Every table the signed-in user is allowed to read, per permissions.yaml."""
-    data = await _call_db_tool(request, "db_list_tables", {})
+    """Every table in the signed-in user's own workspace that they can read."""
+    data = await _call_db_tool(request, "db_list_tables", {"user_id": user.user_id})
     return [t for t in data.get("tables", []) if t.get("select")]
 
 
@@ -74,7 +73,7 @@ async def list_tables(request: Request, user: AuthUser = Depends(get_current_use
 async def get_table_schema(
     table: str, request: Request, user: AuthUser = Depends(get_current_user)
 ) -> dict:
-    return await _call_db_tool(request, "db_describe_table", {"table": table})
+    return await _call_db_tool(request, "db_describe_table", {"table": table, "user_id": user.user_id})
 
 
 @router.get("/tables/{table}/rows")
@@ -91,14 +90,14 @@ async def get_table_rows(
     # otherwise need a separate db_list_tables round trip for. Never
     # interpolate `table` into SQL on the strength of the request alone —
     # quote_identifier below re-validates independently regardless.
-    described = await _call_db_tool(request, "db_describe_table", {"table": table})
+    described = await _call_db_tool(request, "db_describe_table", {"table": table, "user_id": user.user_id})
     table = described["table"]  # validated/lowercased identifier
 
     quoted = quote_identifier(table, kind="table")
     data = await _call_db_tool(
         request,
         "db_query_data",
-        {"sql": f"SELECT * FROM {quoted} LIMIT %s OFFSET %s", "parameters": [limit, offset]},
+        {"sql": f"SELECT * FROM {quoted} LIMIT %s OFFSET %s", "parameters": [limit, offset], "user_id": user.user_id},
     )
     return {
         "columns": data.get("columns", []),

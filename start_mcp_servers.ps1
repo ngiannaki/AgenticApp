@@ -1,9 +1,9 @@
 <#
     start_mcp_servers.ps1
 
-    Starts the Indexing MCP server (hardcoded port 8000) and Retrieval MCP server
-    (assumed hardcoded port 8001) in separate windows, and optionally starts nginx
-    as the reverse proxy in front of them.
+    Starts Postgres (Docker, pgvector image), prepares the database, then the
+    four MCP servers (indexing 8000, retrieval 8001, db 8002, code 8003) and the
+    Agentic API (8100) in separate windows, and optionally nginx in front.
 
     IMPORTANT: server.py uses absolute imports like "from backend.core.storage...",
     so it must be launched as a MODULE (-m) with the repo root as the working
@@ -92,32 +92,22 @@ $dbModule = "backend.mcp_servers.db.server"
 $codeModule = "backend.mcp_servers.code.server"
 $apiModule = "backend.apps.api.main"
 
-# Chroma exe lives alongside python.exe in the venv's Scripts folder.
-$chromaExe = Join-Path (Split-Path $pythonExe -Parent) "chroma.exe"
-$chromaPort = 8010
-$chromaDataDir = Join-Path $repoRoot "data\vector_store"
-
 # Set this to the folder containing nginx.exe if you want this script to also launch nginx.
 # Leave as $null to skip starting nginx automatically.
 $nginxDir       = "C:\Users\Nigia\nginx-1.31.3"   # e.g. "C:\nginx-1.25.3"
 
-# --- Postgres (backs the DB MCP server) ---
-# Matches backend/mcp_servers/db/.env (DB_MCP_DATABASE_URL). Change together.
+# --- Postgres: the one database (users, chats, documents, vectors, DB-tool tables) ---
+# Matches backend/.env (DATABASE_URL). Change together. The pgvector image is
+# plain Postgres 16 plus the `vector` extension, so it reuses the same data
+# volume as the old postgres:16 container.
 $pgContainerName = "agenticapp-postgres"
-$pgImage         = "postgres:16"
+$pgImage         = "pgvector/pgvector:pg16"
 $pgUser          = "raguser"
 $pgPassword      = "changeme"
 $pgDb            = "ragdb"
 $pgPort          = 5432
 $pgVolume        = "agenticapp_pgdata"
-$pgMigration     = Join-Path $repoRoot "backend\mcp_servers\db\migrations\0001_init.sql"
-
-# --- MongoDB (backs conversation/message persistence for the Agentic API) ---
-# Matches backend/.env (API_MONGO_URL / API_MONGO_DB_NAME defaults). Change together.
-$mongoContainerName = "agenticapp-mongo"
-$mongoImage         = "mongo:7"
-$mongoPort          = 27017
-$mongoVolume        = "agenticapp_mongodata"
+$dbSetupModule   = "backend.scripts.db_setup"
 
 # --- Start/ensure local Postgres in Docker ---
 # Native commands (docker/psql) write harmless status lines (progress,
@@ -145,13 +135,24 @@ if ($LASTEXITCODE -ne 0) {
         if ($LASTEXITCODE -eq 0) { $dockerReady = $true; break }
     }
     if (-not $dockerReady) {
-        Write-Warning "Docker did not become ready in time - skipping Postgres startup. The DB MCP server will fail to connect until Docker/Postgres is up."
+        Write-Warning "Docker did not become ready in time - skipping Postgres startup. Nothing will work until Docker/Postgres is up."
     }
 }
 
 docker info *> $null
 if ($LASTEXITCODE -eq 0) {
     $existing = docker ps -a --filter "name=^/$pgContainerName$" --format "{{.Names}}"
+    if ($existing -eq $pgContainerName) {
+        # A container from before the move to pgvector runs plain postgres:16,
+        # which lacks the `vector` extension. Replace the container (the data
+        # lives in the $pgVolume volume, so nothing is lost).
+        $existingImage = docker inspect -f "{{.Config.Image}}" $pgContainerName
+        if ($existingImage -ne $pgImage) {
+            Write-Host "Recreating '$pgContainerName' on $pgImage (was $existingImage; data volume kept)..." -ForegroundColor Cyan
+            docker rm -f $pgContainerName *> $null
+            $existing = $null
+        }
+    }
     if ($existing -eq $pgContainerName) {
         $running = docker ps --filter "name=^/$pgContainerName$" --format "{{.Names}}"
         if ($running -ne $pgContainerName) {
@@ -181,73 +182,21 @@ if ($LASTEXITCODE -eq 0) {
 
     if ($pgReady) {
         Write-Host "Postgres is ready." -ForegroundColor Green
-        if (Test-Path $pgMigration) {
-            # 0001_init.sql uses CREATE TABLE/EXTENSION IF NOT EXISTS, so it is
-            # safe to re-apply on every start (no-op once the schema exists).
-            Write-Host "Applying $pgMigration ..." -ForegroundColor Cyan
-            Get-Content $pgMigration -Raw | docker exec -i $pgContainerName psql -U $pgUser -d $pgDb *> $null
+        # Migrations + the DB MCP server's restricted role, before any server
+        # starts (they all expect the schema to exist).
+        Write-Host "Preparing the database ($dbSetupModule)..." -ForegroundColor Cyan
+        Push-Location $repoRoot
+        & $pythonExe -m $dbSetupModule
+        Pop-Location
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Database setup failed - see the output above."
         }
     } else {
-        Write-Warning "Postgres did not become ready in time - the DB MCP server may fail to connect."
-    }
-
-    # --- Start/ensure local MongoDB in Docker ---
-    $existingMongo = docker ps -a --filter "name=^/$mongoContainerName$" --format "{{.Names}}"
-    if ($existingMongo -eq $mongoContainerName) {
-        $runningMongo = docker ps --filter "name=^/$mongoContainerName$" --format "{{.Names}}"
-        if ($runningMongo -ne $mongoContainerName) {
-            Write-Host "Starting existing MongoDB container '$mongoContainerName'..." -ForegroundColor Cyan
-            docker start $mongoContainerName *> $null
-        } else {
-            Write-Host "MongoDB container '$mongoContainerName' already running." -ForegroundColor Green
-        }
-    } else {
-        Write-Host "Creating MongoDB container '$mongoContainerName' (image $mongoImage, port $mongoPort)..." -ForegroundColor Cyan
-        docker run -d --name $mongoContainerName `
-            -p "${mongoPort}:27017" `
-            -v "${mongoVolume}:/data/db" `
-            $mongoImage *> $null
-    }
-
-    Write-Host "Waiting for MongoDB to accept connections..." -ForegroundColor Cyan
-    $mongoReady = $false
-    for ($i = 0; $i -lt 20; $i++) {
-        docker exec $mongoContainerName mongosh --quiet --eval "db.adminCommand('ping')" *> $null
-        if ($LASTEXITCODE -eq 0) { $mongoReady = $true; break }
-        Start-Sleep -Seconds 2
-    }
-
-    if ($mongoReady) {
-        Write-Host "MongoDB is ready." -ForegroundColor Green
-    } else {
-        Write-Warning "MongoDB did not become ready in time - conversation persistence will be unavailable until it is reachable."
+        Write-Warning "Postgres did not become ready in time - the servers will fail to connect."
     }
 }
 
 $ErrorActionPreference = $prevErrorActionPreference
-
-# --- Start Chroma vector store server ---
-# Indexing (VectorStore) and Retrieval (DocumentRetriever) are separate
-# processes, so they can't each open the on-disk Chroma store directly
-# (PersistentClient) and reliably see each other's writes — one process's
-# in-memory view of the store can go stale relative to the other's writes.
-# Routing both through a single `chroma run` server via HttpClient fixes
-# that; both must connect to it, so start it before them and wait for it.
-Write-Host "Starting Chroma vector store server (port $chromaPort)..." -ForegroundColor Cyan
-if (-not (Test-Path $chromaExe)) {
-    Write-Warning "chroma.exe not found at $chromaExe - the indexing/retrieval servers will fail to connect to the vector store."
-} else {
-    New-Item -ItemType Directory -Force -Path $chromaDataDir | Out-Null
-    $chromaProc = Start-Process -FilePath $chromaExe `
-        -ArgumentList "run", "--path", $chromaDataDir, "--port", $chromaPort `
-        -WorkingDirectory $repoRoot `
-        -PassThru -WindowStyle Normal
-    Write-Host "Chroma server PID: $($chromaProc.Id)"
-    $chromaReady = Wait-ForPort -ServerName "Chroma vector store server" -Port $chromaPort
-    if (-not $chromaReady) {
-        Write-Warning "Chroma server never came up - the indexing/retrieval MCP servers will fail to connect to the vector store."
-    }
-}
 
 # --- Start Indexing server (port 8000, hardcoded in server.py) ---
 Write-Host "Starting Indexing MCP server (port 8000)..." -ForegroundColor Cyan
@@ -313,6 +262,5 @@ Write-Host ""
 Write-Host "All set. Servers are running in their own windows." -ForegroundColor Green
 Write-Host "Closing this window will NOT stop them (they were launched as separate processes)."
 $allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id, $codeProc.Id)
-if ($chromaProc) { $allPids += $chromaProc.Id }
 if ($apiProc) { $allPids += $apiProc.Id }
 Write-Host "To stop them manually: Stop-Process -Id $($allPids -join ',')"

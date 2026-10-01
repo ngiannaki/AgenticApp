@@ -1,27 +1,24 @@
 """LangChain-native indexing pipeline (v2).
 
-Parallel to backend/infrastructure/vector_store/vector_store.py's
-llama_index-based pipeline — not a replacement. Parses with LangChain
-document loaders (see langchain_loaders.py), splits with LangChain text
-splitters, embeds with the same DEV/PROD-selected embedding model as v1
-(backend.config.get_langchain_embedding), and writes into the same Chroma
-server but its own collections (`docv2_{document_id}`), so v1 and v2 data
-never mix.
+Parses with LangChain document loaders (see langchain_loaders.py), splits
+with LangChain text splitters (structure-preserving for markdown-flavored
+types, see langchain_structure.py), embeds with the DEV/PROD-selected
+embedding model (backend.config.get_langchain_embedding), and stores the
+chunks + embeddings in Postgres (backend/core/vector_store/pg_store.py,
+schema `rag`).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from uuid import uuid4
 
-import chromadb
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.config import get_langchain_embedding, settings
+from backend.core.vector_store.pg_store import ChunkRecord, PgVectorStore
 from backend.mcp_servers.indexing.langchain_loaders import load_documents_v2
 from backend.mcp_servers.indexing.langchain_structure import split_markdown_preserving_structure
 
@@ -37,17 +34,12 @@ _MARKDOWN_STRUCTURED_TYPES = {"pdf", "docx", "txt"}
 class LangchainIndexPipelineV2:
     """Parse -> split -> embed -> store, entirely on LangChain primitives."""
 
-    def __init__(self, host: str | None = None, port: int | None = None):
+    def __init__(self, store: PgVectorStore | None = None):
         self.cfg = settings.rag_v2
-        self.chroma_client = chromadb.HttpClient(
-            host=host or settings.vector_store.host,
-            port=port or settings.vector_store.port,
-        )
-        self.embeddings = get_langchain_embedding(settings.embedding_model)
-        logger.info("LangchainIndexPipelineV2 initialized")
-
-    def _collection_name(self, document_id: str) -> str:
-        return f"{self.cfg.collection_prefix}{document_id}"
+        self.store = store or PgVectorStore()
+        self.embedding_model = settings.embedding_model
+        self.embeddings = get_langchain_embedding(self.embedding_model)
+        logger.info("LangchainIndexPipelineV2 initialized (embedding model %s)", self.embedding_model)
 
     def _splitter(self) -> RecursiveCharacterTextSplitter:
         return RecursiveCharacterTextSplitter(
@@ -92,9 +84,12 @@ class LangchainIndexPipelineV2:
         extra_metadata: dict | None = None,
     ) -> dict:
         """Parse `file_path` (of `content_type`), split it, embed it, and
-        write it into `docv2_{document_id}`. Returns the same
-        {success, document_id, chunks_indexed, ...} shape as v1's
-        index_document_enhanced so callers can treat both uniformly."""
+        store it as `document_id` (replacing any earlier index of it).
+        Returns {success, document_id, chunks_indexed, ...}."""
+        if not user_id:
+            # Retrieval only ever serves a document to its owner, so an
+            # ownerless index would be unreadable — refuse it up front.
+            return {"success": False, "document_id": document_id, "error": "user_id is required to index a document"}
         try:
             logger.info(f"[INDEX_V2] Starting for document_id={document_id} type={content_type}")
 
@@ -111,12 +106,10 @@ class LangchainIndexPipelineV2:
                 "document_name": document_name,
                 "content_type": content_type,
                 "pipeline": "langchain_v2",
+                "user_id": user_id,
                 **(extra_metadata or {}),
             }
-            if user_id:
-                base_metadata["user_id"] = user_id
 
-            ids = []
             for i, doc in enumerate(split_docs):
                 # Loader/splitter metadata (page, sheet, row, start_index, ...) is
                 # grounding info worth keeping, but its own "source" is the
@@ -129,35 +122,34 @@ class LangchainIndexPipelineV2:
                 if loader_path:
                     loader_metadata["source_path"] = loader_path
                 doc.metadata = {**loader_metadata, **base_metadata, "source": document_name, "chunk_index": i}
-                chunk_id = f"{document_id}-v2-{i}-{uuid4().hex[:8]}"
-                doc.metadata["chunk_id"] = chunk_id
-                ids.append(chunk_id)
+                doc.metadata["chunk_id"] = f"{document_id}-v2-{i}-{uuid4().hex[:8]}"
 
-            collection_metadata = {"hnsw:space": "cosine", "document_id": document_id, "pipeline": "langchain_v2"}
-            if user_id:
-                collection_metadata["user_id"] = user_id
-            if toc_entries:
-                # Chroma collection metadata only accepts scalar values, so
-                # the outline is stored as a JSON string and parsed back out
-                # by LangchainRetrievalPipelineV2.get_table_of_contents.
-                collection_metadata["toc"] = json.dumps(toc_entries)
-
-            collection_name = self._collection_name(document_id)
-            vectorstore = Chroma(
-                client=self.chroma_client,
-                collection_name=collection_name,
-                embedding_function=self.embeddings,
-                collection_metadata=collection_metadata,
+            vectors = self.embeddings.embed_documents([d.page_content for d in split_docs])
+            self.store.replace_document(
+                document_id=document_id,
+                user_id=user_id,
+                document_name=document_name,
+                content_type=content_type,
+                embedding_model=self.embedding_model,
+                toc=toc_entries or None,
+                chunks=[
+                    ChunkRecord(
+                        chunk_id=d.metadata["chunk_id"],
+                        chunk_index=d.metadata["chunk_index"],
+                        content=d.page_content,
+                        metadata=d.metadata,
+                        embedding=vec,
+                    )
+                    for d, vec in zip(split_docs, vectors)
+                ],
             )
-            vectorstore.add_documents(split_docs, ids=ids)
 
-            logger.info(f"[INDEX_V2] Indexed {len(split_docs)} chunks for document_id={document_id} into {collection_name}")
+            logger.info(f"[INDEX_V2] Indexed {len(split_docs)} chunks for document_id={document_id}")
 
             return {
                 "success": True,
                 "document_id": document_id,
                 "chunks_indexed": len(split_docs),
-                "collection_name": collection_name,
                 "pipeline": "langchain_v2",
                 "message": f"Document {document_id} indexed successfully (v2)",
             }
@@ -166,14 +158,12 @@ class LangchainIndexPipelineV2:
             return {"success": False, "document_id": document_id, "error": str(e)}
 
     def delete_document(self, document_id: str) -> dict:
-        """Delete the v2 collection for `document_id`. Safe to call even if
-        it was never indexed with v2, or already deleted. Does not touch the
-        v1 (`doc_{document_id}`) collection."""
-        collection_name = self._collection_name(document_id)
+        """Delete `document_id`'s chunks and embeddings. Safe to call for a
+        document that was never indexed or is already gone."""
         try:
-            self.chroma_client.delete_collection(name=collection_name)
-            logger.info(f"[INDEX_V2] Deleted collection {collection_name}")
+            deleted = self.store.delete_document(document_id)
+            logger.info(f"[INDEX_V2] Deleted index for {document_id} (existed={deleted})")
             return {"success": True, "document_id": document_id}
         except Exception as e:
-            logger.warning(f"[INDEX_V2] Failed to delete collection {collection_name}: {e}")
+            logger.warning(f"[INDEX_V2] Failed to delete index for {document_id}: {e}")
             return {"success": False, "document_id": document_id, "error": str(e)}

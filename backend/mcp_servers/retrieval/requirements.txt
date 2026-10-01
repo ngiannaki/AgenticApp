@@ -1,29 +1,23 @@
-# This repo has no root dependency manifest (backend/pyproject.toml is
-# empty; packages are just installed into the shared .venv). Listed here so
-# this file documents the retrieval server's real dependency surface beyond
-# what's already pinned elsewhere (fastmcp, chromadb, llama-index-core and
-# its ollama/openai llm+embedding integrations back the v1 tools and are
-# already required by the indexing server / backend/infrastructure).
+# Packages the retrieval server needs beyond requirements-base.txt (which
+# already pins fastmcp, openai and psycopg — the Postgres/pgvector store is
+# backend/core/vector_store/pg_store.py).
 #
-# --- v2 (LangChain) pipeline: retrieve_document_v2 / get_document_info_v2 ---
+# --- v2 pipeline: retrieve_document_v2 / search_my_documents_v2 / ... ---
 # (backend/mcp_servers/retrieval/langchain_pipeline.py)
 #
-# langchain / langchain-chroma / langchain-community give the hybrid
-# retriever (EnsembleRetriever + ContextualCompressionRetriever), the Chroma
-# vector retriever, and BM25Retriever (via rank_bm25). langchain-openai /
-# langchain-ollama back get_langchain_embedding (backend/config/llm_client.py),
-# mirroring v1's embedding switch (OpenAI in PROD, Ollama in DEV) so v1/v2
-# vectors stay comparable even though their Chroma collections are separate.
-# sentence-transformers backs the HuggingFace cross-encoder used for
-# reranking (downloaded from HF on first use).
+# Both search legs (pgvector cosine + Postgres full-text) run as SQL, so no
+# LangChain retriever classes are needed any more. langchain-core provides
+# the Document type; langchain-community the HuggingFace cross-encoder
+# wrapper used for reranking (sentence-transformers backs it, model
+# downloaded from HF on first use); langchain-openai / langchain-ollama back
+# get_langchain_embedding (backend/config/llm_client.py) — OpenAI in PROD,
+# Ollama in DEV, and must match the model documents were indexed with.
 
 langchain>=0.3,<0.4
 langchain-core>=0.3,<0.4
 langchain-community>=0.3,<0.4
-langchain-chroma>=0.2,<0.3
 langchain-openai>=0.3,<0.4
 langchain-ollama>=0.3,<0.4
-rank_bm25>=0.2,<1
 sentence-transformers>=3.0,<4
 
 # --- web_search / fetch_page tools (backend/mcp_servers/retrieval/web_search.py) ---

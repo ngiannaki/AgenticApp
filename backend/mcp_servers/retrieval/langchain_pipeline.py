@@ -1,42 +1,41 @@
-"""LangChain-native hybrid retrieval pipeline (v2).
+"""Hybrid retrieval pipeline (v2) over Postgres.
 
-Parallel to retriever.py's llama_index-based DocumentRetriever — not a
-replacement. Reads the `docv2_{document_id}` collections written by
-backend/mcp_servers/indexing/langchain_pipeline.py and combines two
-LangChain retrievers via reciprocal-rank fusion:
+Reads the chunks written by backend/mcp_servers/indexing/langchain_pipeline.py
+(schema `rag`, see backend/core/vector_store/pg_store.py) and combines two
+search legs, both run inside Postgres:
 
-- dense: a Chroma similarity retriever (backend.config.get_langchain_embedding,
-  Ollama in DEV / OpenAI in PROD — same model as v1, so vectors stay
-  comparable across pipelines even though collections are separate)
-- sparse: a BM25 keyword retriever, built on the fly from that same
-  collection's chunks
+- dense: pgvector cosine similarity against the query embedding
+  (backend.config.get_langchain_embedding — Ollama in DEV, OpenAI in PROD;
+  must match the model the document was indexed with)
+- keyword: Postgres full-text search over a generated `tsvector` column
+  (any query word may match, ranked with ts_rank_cd) — catches exact
+  keywords, IDs and numbers that embeddings blur
 
-`langchain.retrievers.EnsembleRetriever` fuses the two, and (when enabled)
-`ContextualCompressionRetriever` + a HuggingFace cross-encoder reranks the
-fused candidates down to `top_k` — the current state-of-the-art recipe for
-small-corpus RAG: dense retrieval alone misses exact keyword/ID matches that
-BM25 catches, and reranking corrects ordering mistakes either retriever
-makes alone.
+The two ranked lists are merged with weighted reciprocal-rank fusion (the
+same fusion LangChain's EnsembleRetriever used here before), then (when
+enabled) a HuggingFace cross-encoder reranks the fused candidates down to
+`top_k`, and adjacent chunks are spliced in for citation context.
 
 Every returned chunk carries a `grounding` block (document_name, source,
-page/sheet/row when the original loader captured one, chunk_id, retrieval
-signals) so a caller can cite exactly where an answer came from.
+page/sheet/row when the original loader captured one, chunk_id, ...) so a
+caller can cite exactly where an answer came from.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from functools import lru_cache
+from typing import Any
 
-import chromadb
-from langchain_chroma import Chroma
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
 from backend.config import get_langchain_embedding, settings
+from backend.core.vector_store.pg_store import PgVectorStore
 
 logger = logging.getLogger(__name__)
+
+# Reciprocal-rank-fusion constant (the standard 60, as in EnsembleRetriever).
+_RRF_K = 60
 
 
 @lru_cache(maxsize=2)
@@ -49,104 +48,90 @@ def _get_cross_encoder(model_name: str):
     return HuggingFaceCrossEncoder(model_name=model_name)
 
 
-def _build_reranker(model_name: str, top_n: int):
-    from langchain.retrievers.document_compressors import CrossEncoderReranker
+def _rerank(model_name: str, query: str, docs: list[Document], top_n: int) -> list[Document]:
+    """Order `docs` by cross-encoder relevance to `query`, keep `top_n`, and
+    record each kept doc's score as metadata["relevance_score"]. (LangChain's
+    CrossEncoderReranker does the same ordering but throws the scores away.)"""
+    scores = _get_cross_encoder(model_name).score([(query, d.page_content) for d in docs])
+    ranked = sorted(zip(docs, scores), key=lambda pair: pair[1], reverse=True)[:top_n]
+    for doc, score in ranked:
+        doc.metadata["relevance_score"] = float(score)
+    return [doc for doc, _ in ranked]
 
-    return CrossEncoderReranker(model=_get_cross_encoder(model_name), top_n=top_n)
+
+def _not_found(document_id: str | None, query: str | None = None) -> dict:
+    # Same message for "doesn't exist" and "belongs to someone else", so ids
+    # can't be probed.
+    result: dict[str, Any] = {
+        "success": False,
+        "document_id": document_id,
+        "error": f"Document not found in vector store: {document_id}",
+    }
+    if query is not None:
+        result["query"] = query
+    return result
+
+
+def _row_to_document(row: dict[str, Any]) -> Document:
+    meta = dict(row["metadata"] or {})
+    meta.setdefault("chunk_id", row["chunk_id"])
+    meta.setdefault("chunk_index", row["chunk_index"])
+    meta.setdefault("document_id", row["document_id"])
+    return Document(page_content=row["content"], metadata=meta)
+
+
+def fuse_rankings(
+    ranked_lists: list[list[dict[str, Any]]], weights: list[float]
+) -> list[dict[str, Any]]:
+    """Weighted reciprocal-rank fusion of several best-first result lists,
+    deduplicated by chunk_id. Each returned row gets `rrf_score`, plus
+    `dense_score` when it came from the first (dense) list."""
+    fused: dict[str, dict[str, Any]] = {}
+    for list_index, (rows, weight) in enumerate(zip(ranked_lists, weights)):
+        for rank, row in enumerate(rows, start=1):
+            entry = fused.get(row["chunk_id"])
+            if entry is None:
+                entry = {**row, "rrf_score": 0.0}
+                fused[row["chunk_id"]] = entry
+            entry["rrf_score"] += weight / (_RRF_K + rank)
+            if list_index == 0:
+                entry["dense_score"] = row.get("score")
+    return sorted(fused.values(), key=lambda r: r["rrf_score"], reverse=True)
 
 
 class LangchainRetrievalPipelineV2:
-    """Hybrid (dense + BM25) retrieval with cross-encoder reranking, over
-    the `docv2_*` collections."""
+    """Hybrid (pgvector + full-text) retrieval with cross-encoder reranking."""
 
-    def __init__(self, host: str | None = None, port: int | None = None):
+    def __init__(self, store: PgVectorStore | None = None):
         self.cfg = settings.rag_v2
-        self.chroma_client = chromadb.HttpClient(
-            host=host or settings.vector_store.host,
-            port=port or settings.vector_store.port,
-        )
-        self.embeddings = get_langchain_embedding(settings.embedding_model)
-        logger.info("LangchainRetrievalPipelineV2 initialized")
+        self.store = store or PgVectorStore()
+        self.embedding_model = settings.embedding_model
+        self.embeddings = get_langchain_embedding(self.embedding_model)
+        logger.info("LangchainRetrievalPipelineV2 initialized (embedding model %s)", self.embedding_model)
 
-    def _collection_name(self, document_id: str) -> str:
-        return f"{self.cfg.collection_prefix}{document_id}"
+    # --- access ---------------------------------------------------------------
 
-    def _check_ownership(self, collection, user_id: str | None) -> bool:
-        """Only the collection's owner may read it. A collection with no
-        recorded owner is denied too (it used to be treated as shared): every
-        document uploaded through the API is stamped with its user_id, so an
-        ownerless collection can only come from a legacy/out-of-band upload,
-        and "readable by everyone" is the wrong default for that in a
-        multi-user deployment."""
-        owner = (collection.metadata or {}).get("user_id")
-        if not owner or owner != user_id:
-            logger.warning(f"[RETRIEVAL_V2] Denied access to {collection.name} for user_id={user_id!r} (owned by {owner!r})")
-            return False
-        return True
-
-    def _load_all_documents(self, collection) -> list[Document]:
-        result = collection.get(include=["documents", "metadatas"])
-        texts = result.get("documents") or []
-        metadatas = result.get("metadatas") or []
-        ids = result.get("ids") or []
-        docs = []
-        for text, metadata, chunk_id in zip(texts, metadatas, ids):
-            meta = dict(metadata or {})
-            meta.setdefault("chunk_id", chunk_id)
-            docs.append(Document(page_content=text, metadata=meta))
-        return docs
-
-    @staticmethod
-    def _build_where(filters: dict | None) -> dict | None:
-        """Turn a flat {field: value} filter dict into a Chroma `where`
-        clause. Exact-match only — callers filter on metadata fields written
-        at index time (chunk_content_type, page, sheet, h1/h2/h3, ...)."""
-        if not filters:
+    def _owned_document(self, document_id: str, user_id: str | None) -> dict | None:
+        """The rag.documents row, only if `user_id` owns it."""
+        if not user_id:
             return None
-        clauses = [{k: {"$eq": v}} for k, v in filters.items() if v is not None]
-        if not clauses:
+        doc = self.store.get_documents([document_id]).get(document_id)
+        if doc is None or doc["user_id"] != user_id:
+            if doc is not None:
+                logger.warning(f"[RETRIEVAL_V2] Denied access to {document_id} for user_id={user_id!r}")
             return None
-        return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+        return doc
 
-    @staticmethod
-    def _matches_filters(metadata: dict, filters: dict | None) -> bool:
-        if not filters:
-            return True
-        return all(metadata.get(k) == v for k, v in filters.items() if v is not None)
+    def _model_mismatch(self, doc: dict) -> str | None:
+        if doc["embedding_model"] != self.embedding_model:
+            return (
+                f"Document {doc['document_id']} was indexed with embedding model "
+                f"'{doc['embedding_model']}', but this server queries with '{self.embedding_model}'. "
+                "Re-index it (scripts/reindex_all.py) to search it with the current model."
+            )
+        return None
 
-    def _build_retriever(
-        self,
-        document_id: str,
-        collection,
-        all_docs: list[Document],
-        fetch_k: int,
-        where: dict | None,
-        filters: dict | None,
-    ):
-        vectorstore = Chroma(
-            client=self.chroma_client,
-            collection_name=self._collection_name(document_id),
-            embedding_function=self.embeddings,
-        )
-        search_kwargs: dict = {"k": fetch_k}
-        if where:
-            search_kwargs["filter"] = where
-        dense = vectorstore.as_retriever(search_kwargs=search_kwargs)
-
-        filtered_docs = [d for d in all_docs if self._matches_filters(d.metadata, filters)]
-        if not filtered_docs:
-            return dense, False
-
-        bm25 = BM25Retriever.from_documents(filtered_docs)
-        bm25.k = fetch_k
-
-        from langchain.retrievers import EnsembleRetriever
-
-        ensemble = EnsembleRetriever(
-            retrievers=[dense, bm25],
-            weights=[self.cfg.dense_weight, self.cfg.sparse_weight],
-        )
-        return ensemble, True
+    # --- grounding ------------------------------------------------------------
 
     @staticmethod
     def _section(metadata: dict) -> str | None:
@@ -179,46 +164,91 @@ class LangchainRetrievalPipelineV2:
             "expanded": expanded,
         }
 
-    def _expand_neighbors(self, docs: list[Document], all_docs: list[Document]) -> list[tuple[Document, bool]]:
+    def _expand_neighbors(self, docs: list[Document]) -> list[tuple[Document, bool]]:
         """For each hit, splice in ±neighbor_window adjacent chunks (by
-        chunk_index within the same source) so a citation carries more
+        chunk_index within the same document) so a citation carries more
         surrounding context than one isolated chunk. Returns (doc, expanded)
         pairs — `doc.page_content` is replaced with the merged text when
         expansion happened; the original chunk's own metadata is kept."""
         window = self.cfg.neighbor_window
-        if not window:
+        if not window or not docs:
             return [(d, False) for d in docs]
 
-        by_key: dict[tuple, Document] = {}
-        for d in all_docs:
-            idx = d.metadata.get("chunk_index")
+        wanted: dict[str, set[int]] = {}
+        for doc in docs:
+            idx = doc.metadata.get("chunk_index")
             if idx is not None:
-                by_key[(d.metadata.get("source"), idx)] = d
+                wanted.setdefault(doc.metadata["document_id"], set()).update(
+                    range(idx - window, idx + window + 1)
+                )
+        by_key: dict[tuple[str, int], str] = {}
+        for document_id, indexes in wanted.items():
+            for row in self.store.get_chunks(document_id, chunk_indexes=sorted(indexes)):
+                by_key[(document_id, row["chunk_index"])] = row["content"]
 
         out = []
         for doc in docs:
             idx = doc.metadata.get("chunk_index")
-            source = doc.metadata.get("source")
             if idx is None:
                 out.append((doc, False))
                 continue
-
-            pieces = []
-            expanded = False
+            document_id = doc.metadata["document_id"]
+            pieces, expanded = [], False
             for offset in range(-window, window + 1):
-                neighbor = by_key.get((source, idx + offset))
-                if neighbor is None:
+                text = doc.page_content if offset == 0 else by_key.get((document_id, idx + offset))
+                if text is None:
                     continue
                 if offset != 0:
                     expanded = True
-                pieces.append(neighbor.page_content)
-
+                pieces.append(text)
             if expanded:
-                merged = Document(page_content="\n\n".join(pieces), metadata=doc.metadata)
-                out.append((merged, True))
+                out.append((Document(page_content="\n\n".join(pieces), metadata=doc.metadata), True))
             else:
                 out.append((doc, False))
         return out
+
+    # --- search ---------------------------------------------------------------
+
+    def _search(
+        self, document_ids: list[str], query: str, top_k: int | None, filters: dict | None
+    ) -> tuple[list[dict], bool, bool]:
+        """Hybrid search over `document_ids` (already ownership-checked).
+        Returns (source_chunks, used_keyword_leg, reranked)."""
+        top_k = min(top_k or self.cfg.default_top_k, self.cfg.max_top_k)
+        fetch_k = min(max(top_k * self.cfg.fetch_k_multiplier, 10), self.cfg.max_fetch_k)
+
+        query_vector = self.embeddings.embed_query(query)
+        dense = self.store.dense_search(document_ids, query_vector, fetch_k, filters)
+        keyword = self.store.keyword_search(document_ids, query, fetch_k, filters)
+        fused = fuse_rankings([dense, keyword], [self.cfg.dense_weight, self.cfg.sparse_weight])
+
+        candidates = [_row_to_document(r) for r in fused]
+        for doc, row in zip(candidates, fused):
+            doc.metadata["relevance_score"] = row.get("dense_score")
+
+        reranked = False
+        if self.cfg.use_reranker and candidates:
+            try:
+                candidates = _rerank(self.cfg.rerank_model, query, candidates, top_k)
+                reranked = True
+            except Exception as e:  # noqa: BLE001 — degrade to fused order, don't fail the search
+                logger.warning(f"[RETRIEVAL_V2] Reranker unavailable, skipping: {e}")
+        docs = candidates[:top_k]
+
+        expanded_docs = self._expand_neighbors(docs) if self.cfg.neighbor_expansion else [(d, False) for d in docs]
+        source_chunks = []
+        for doc, expanded in expanded_docs:
+            metadata = dict(doc.metadata)
+            score = metadata.pop("relevance_score", None)
+            source_chunks.append(
+                {
+                    "text": doc.page_content,
+                    "score": float(score) if score is not None else None,
+                    "metadata": metadata,
+                    "grounding": self._grounding(metadata, expanded=expanded),
+                }
+            )
+        return source_chunks, bool(keyword), reranked
 
     def retrieve(
         self,
@@ -228,81 +258,33 @@ class LangchainRetrievalPipelineV2:
         user_id: str | None = None,
         filters: dict | None = None,
     ) -> dict:
-        """Hybrid-retrieve + rerank chunks for `query` from `docv2_{document_id}`.
+        """Hybrid-retrieve + rerank chunks for `query` from one document.
 
-        Does not synthesize an answer — same contract as v1's retrieve():
-        returns source chunks only, each with `text`, `score`
-        (reranker relevance score when reranking ran, else the vector
-        similarity score), `metadata`, and a `grounding` block.
+        Does not synthesize an answer: returns source chunks only, each with
+        `text`, `score` (reranker relevance score when reranking ran, else
+        the vector similarity score, None for keyword-only hits),
+        `metadata`, and a `grounding` block.
 
         `filters` restricts candidates to exact metadata matches before
         ranking — e.g. {"chunk_content_type": "table"} to only search table
         chunks, {"page": 3} for one page, {"h1": "..."} for one section.
-        Applied identically to the dense (Chroma `where`) and BM25 legs.
+        Applied identically to both search legs.
         """
-        top_k = min(top_k or self.cfg.default_top_k, self.cfg.max_top_k)
-        fetch_k = min(max(top_k * self.cfg.fetch_k_multiplier, 10), self.cfg.max_fetch_k)
-        where = self._build_where(filters)
-
         if not query or not query.strip():
             return {"success": False, "document_id": document_id, "error": "Query parameter is required and cannot be empty"}
 
-        collection_name = self._collection_name(document_id)
-        try:
-            collection = self.chroma_client.get_collection(name=collection_name)
-        except Exception:
-            return {
-                "success": False,
-                "document_id": document_id,
-                "query": query,
-                "error": f"Document not found in v2 vector store: {document_id}",
-            }
-
-        if not self._check_ownership(collection, user_id):
-            return {
-                "success": False,
-                "document_id": document_id,
-                "query": query,
-                "error": f"Document not found in v2 vector store: {document_id}",
-            }
+        doc = self._owned_document(document_id, user_id)
+        if doc is None:
+            return _not_found(document_id, query)
+        mismatch = self._model_mismatch(doc)
+        if mismatch:
+            return {"success": False, "document_id": document_id, "query": query, "error": mismatch}
 
         try:
-            all_docs = self._load_all_documents(collection)
-            retriever, used_bm25 = self._build_retriever(document_id, collection, all_docs, fetch_k, where, filters)
-
-            reranked = False
-            if self.cfg.use_reranker and all_docs:
-                try:
-                    from langchain.retrievers import ContextualCompressionRetriever
-
-                    compressor = _build_reranker(self.cfg.rerank_model, top_n=top_k)
-                    retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever)
-                    reranked = True
-                except Exception as e:
-                    logger.warning(f"[RETRIEVAL_V2] Reranker unavailable, skipping: {e}")
-
-            docs = retriever.invoke(query)
-            docs = docs[:top_k]
-
-            expanded_docs = self._expand_neighbors(docs, all_docs) if self.cfg.neighbor_expansion else [(d, False) for d in docs]
-
-            source_chunks = []
-            for doc, expanded in expanded_docs:
-                metadata = dict(doc.metadata)
-                score = metadata.pop("relevance_score", None)
-                source_chunks.append(
-                    {
-                        "text": doc.page_content,
-                        "score": score,
-                        "metadata": metadata,
-                        "grounding": self._grounding(metadata, expanded=expanded),
-                    }
-                )
-
+            source_chunks, used_keyword, reranked = self._search([document_id], query, top_k, filters)
             logger.info(
-                f"[RETRIEVAL_V2] document_id={document_id} hybrid={used_bm25} reranked={reranked} -> {len(source_chunks)} chunks"
+                f"[RETRIEVAL_V2] document_id={document_id} hybrid={used_keyword} reranked={reranked} -> {len(source_chunks)} chunks"
             )
-
             return {
                 "success": True,
                 "document_id": document_id,
@@ -310,7 +292,7 @@ class LangchainRetrievalPipelineV2:
                 "source_chunks": source_chunks,
                 "chunks_count": len(source_chunks),
                 "pipeline": "langchain_v2",
-                "retrieval_mode": "hybrid" if used_bm25 else "dense",
+                "retrieval_mode": "hybrid" if used_keyword else "dense",
                 "reranked": reranked,
                 "filters": filters,
             }
@@ -318,41 +300,93 @@ class LangchainRetrievalPipelineV2:
             logger.exception(f"[RETRIEVAL_V2] Retrieval failed for document_id={document_id}")
             return {"success": False, "document_id": document_id, "query": query, "error": str(e)}
 
+    def search_documents(
+        self,
+        query: str,
+        user_id: str | None,
+        document_ids: list[str] | None = None,
+        top_k: int | None = None,
+        filters: dict | None = None,
+    ) -> dict:
+        """Same hybrid search as retrieve(), across several of the user's
+        documents at once — or all of them when `document_ids` is empty.
+        Each chunk's grounding says which document it came from."""
+        if not query or not query.strip():
+            return {"success": False, "error": "Query parameter is required and cannot be empty"}
+        if not user_id:
+            return {"success": False, "error": "user_id is required"}
+
+        skipped: list[dict] = []
+        if document_ids:
+            docs = self.store.get_documents(document_ids)
+            for doc_id in document_ids:
+                doc = docs.get(doc_id)
+                if doc is None or doc["user_id"] != user_id:
+                    return _not_found(doc_id, query)
+            searchable = []
+            for doc_id in document_ids:
+                mismatch = self._model_mismatch(docs[doc_id])
+                if mismatch:
+                    skipped.append({"document_id": doc_id, "reason": mismatch})
+                else:
+                    searchable.append(doc_id)
+        else:
+            searchable = self.store.list_user_documents(user_id, self.embedding_model)
+
+        if not searchable:
+            return {
+                "success": True,
+                "query": query,
+                "source_chunks": [],
+                "chunks_count": 0,
+                "documents_searched": 0,
+                "skipped": skipped,
+                "pipeline": "langchain_v2",
+            }
+
+        try:
+            source_chunks, used_keyword, reranked = self._search(searchable, query, top_k, filters)
+            logger.info(
+                f"[RETRIEVAL_V2] search across {len(searchable)} doc(s) hybrid={used_keyword} reranked={reranked} -> {len(source_chunks)} chunks"
+            )
+            return {
+                "success": True,
+                "query": query,
+                "source_chunks": source_chunks,
+                "chunks_count": len(source_chunks),
+                "documents_searched": len(searchable),
+                "skipped": skipped,
+                "pipeline": "langchain_v2",
+                "retrieval_mode": "hybrid" if used_keyword else "dense",
+                "reranked": reranked,
+                "filters": filters,
+            }
+        except Exception as e:
+            logger.exception("[RETRIEVAL_V2] Cross-document search failed")
+            return {"success": False, "query": query, "error": str(e)}
+
+    # --- document info ----------------------------------------------------------
+
     def get_document_info(self, document_id: str, user_id: str | None = None) -> dict:
-        """Metadata/statistics for a document's v2 collection — same shape
-        family as v1's get_document_metadata."""
-        collection_name = self._collection_name(document_id)
+        """Metadata/statistics for an indexed document."""
+        doc = self._owned_document(document_id, user_id)
+        if doc is None:
+            return _not_found(document_id)
         try:
-            collection = self.chroma_client.get_collection(name=collection_name)
-        except Exception:
-            return {"success": False, "document_id": document_id, "error": f"Document not found in v2 vector store: {document_id}"}
-
-        if not self._check_ownership(collection, user_id):
-            return {"success": False, "document_id": document_id, "error": f"Document not found in v2 vector store: {document_id}"}
-
-        try:
-            result = collection.get(limit=1000, include=["metadatas"])
-            all_metadata = result.get("metadatas") or []
-
+            coverage = self.store.coverage(document_id)
             info: dict = {
                 "success": True,
                 "document_id": document_id,
-                "collection_metadata": collection.metadata or {},
-                "total_chunks": len(all_metadata),
+                "document_name": doc["document_name"] or "Untitled",
+                "content_type": doc["content_type"],
+                "embedding_model": doc["embedding_model"],
+                "total_chunks": coverage["total_chunks"],
                 "pipeline": "langchain_v2",
             }
-            if all_metadata:
-                info["document_name"] = all_metadata[0].get("document_name", "Untitled")
-                info["content_type"] = all_metadata[0].get("content_type")
-
-                pages = {m.get("page") for m in all_metadata if m.get("page") is not None}
-                if pages:
-                    info["total_pages"] = len(pages)
-
-                sheets = {m.get("sheet") for m in all_metadata if m.get("sheet") is not None}
-                if sheets:
-                    info["sheets"] = sorted(str(s) for s in sheets)
-
+            if coverage.get("total_pages"):
+                info["total_pages"] = coverage["total_pages"]
+            if coverage.get("sheets"):
+                info["sheets"] = sorted(str(s) for s in coverage["sheets"])
             return info
         except Exception as e:
             logger.error(f"[RETRIEVAL_V2] Failed to get metadata for {document_id}: {e}")
@@ -366,24 +400,12 @@ class LangchainRetrievalPipelineV2:
         section/table with `filters` instead of a blind top-k query.
 
         Falls back to the page/sheet coverage from get_document_info when no
-        TOC was captured (csv/xlsx, pptx, or a document indexed before this
-        was added)."""
-        collection_name = self._collection_name(document_id)
-        try:
-            collection = self.chroma_client.get_collection(name=collection_name)
-        except Exception:
-            return {"success": False, "document_id": document_id, "error": f"Document not found in v2 vector store: {document_id}"}
-
-        if not self._check_ownership(collection, user_id):
-            return {"success": False, "document_id": document_id, "error": f"Document not found in v2 vector store: {document_id}"}
-
-        raw_toc = (collection.metadata or {}).get("toc")
-        if raw_toc:
-            try:
-                toc = json.loads(raw_toc)
-                return {"success": True, "document_id": document_id, "toc": toc, "pipeline": "langchain_v2"}
-            except (TypeError, ValueError) as e:
-                logger.warning(f"[RETRIEVAL_V2] Malformed TOC metadata for {document_id}: {e}")
+        TOC was captured (csv/xlsx, pptx)."""
+        doc = self._owned_document(document_id, user_id)
+        if doc is None:
+            return _not_found(document_id)
+        if doc.get("toc"):
+            return {"success": True, "document_id": document_id, "toc": doc["toc"], "pipeline": "langchain_v2"}
 
         info = self.get_document_info(document_id, user_id=user_id)
         if not info.get("success"):
@@ -404,42 +426,22 @@ class LangchainRetrievalPipelineV2:
         chunk_id: str | None = None,
         page: int | None = None,
     ) -> dict:
-        """All chunks of a document's v2 collection, in original
-        chunk_index order, each with its full text + metadata + grounding —
-        no query, scoring, or reranking. For inspection UIs (a document's
-        chunk browser, citation click-through), not for answering
-        questions; use retrieve() for that.
+        """All chunks of a document, in original chunk_index order, each with
+        its full text + metadata + grounding — no query, scoring, or
+        reranking. For inspection UIs (a document's chunk browser, citation
+        click-through), not for answering questions; use retrieve() for that.
 
         `chunk_id`/`page` narrow to a single chunk or one page's chunks
         when given; omit both to list the whole document.
         """
-        collection_name = self._collection_name(document_id)
+        if self._owned_document(document_id, user_id) is None:
+            return _not_found(document_id)
         try:
-            collection = self.chroma_client.get_collection(name=collection_name)
-        except Exception:
-            return {"success": False, "document_id": document_id, "error": f"Document not found in v2 vector store: {document_id}"}
-
-        if not self._check_ownership(collection, user_id):
-            return {"success": False, "document_id": document_id, "error": f"Document not found in v2 vector store: {document_id}"}
-
-        try:
-            docs = self._load_all_documents(collection)
-            docs.sort(key=lambda d: d.metadata.get("chunk_index") or 0)
-
-            if chunk_id is not None:
-                docs = [d for d in docs if d.metadata.get("chunk_id") == chunk_id]
-            if page is not None:
-                docs = [d for d in docs if d.metadata.get("page") == page]
-
-            chunks = [
-                {
-                    "text": d.page_content,
-                    "metadata": dict(d.metadata),
-                    "grounding": self._grounding(d.metadata),
-                }
-                for d in docs
-            ]
-
+            rows = self.store.get_chunks(document_id, chunk_id=chunk_id, page=page)
+            chunks = []
+            for row in rows:
+                metadata = _row_to_document(row).metadata
+                chunks.append({"text": row["content"], "metadata": metadata, "grounding": self._grounding(metadata)})
             return {
                 "success": True,
                 "document_id": document_id,

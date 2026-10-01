@@ -36,7 +36,7 @@ _PG_TO_LOGICAL_TYPE: dict[str, str] = {
 
 def list_tables(*, permissions: PermissionsConfig, db: Database) -> dict[str, Any]:
     tables = []
-    for name in db.list_public_tables():
+    for name in db.list_tables():
         perms = permissions.get_table_permissions(name)
         if not any((perms.select, perms.insert, perms.update, perms.delete, perms.schema_change)):
             continue

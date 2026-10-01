@@ -8,7 +8,9 @@ name: Backend CI
 # backend/tests/ -- backend/mcp_servers/client/test_*.py are separate
 # ad-hoc/print-based scripts, not pytest-discoverable, and not run here).
 # backend/tests also covers the API's multi-user access-control rules
-# (test_api_access_control.py), with MCP/LLM/Mongo faked in-process.
+# (test_api_access_control.py, MCP/LLM faked in-process) and, against a real
+# pgvector Postgres service, the stores, vector search and per-user DB
+# workspaces.
 
 on:
   push:
@@ -28,6 +30,22 @@ jobs:
 
   pytest:
     runs-on: ubuntu-latest
+    services:
+      # Real Postgres + pgvector for the integration tests (stores, vector
+      # search, per-user DB workspaces) — see backend/tests/conftest.py.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -12,10 +12,11 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import psycopg
-from psycopg import Connection
+from psycopg import Connection, sql
 
 from backend.mcp_servers.db.errors import ConstraintError, QueryError, TimeoutError_
 from backend.mcp_servers.db.database.connection import Database
+from backend.mcp_servers.db.database.workspace import current_schema
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,8 @@ def translate_db_error(exc: Exception) -> Exception:
 
 @contextmanager
 def transaction(db: Database, *, statement_timeout_seconds: int, read_only: bool = False) -> Iterator[Connection]:
-    """Yield a connection inside a transaction with a statement timeout set.
+    """Yield a connection inside a transaction with a statement timeout set
+    and search_path pinned to the caller's workspace schema.
 
     Commits on clean exit, rolls back and re-raises (translated) on any error.
     """
@@ -59,6 +61,9 @@ def transaction(db: Database, *, statement_timeout_seconds: int, read_only: bool
                 # (from Settings), never client-supplied text.
                 timeout_ms = int(statement_timeout_seconds) * 1000
                 cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+                # Unqualified names resolve only in the caller's own workspace
+                # (pg_catalog is always implicitly searched first by Postgres).
+                cur.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(current_schema())))
             yield conn
             conn.commit()
         except Exception as exc:  # noqa: BLE001 - translate everything, then re-raise

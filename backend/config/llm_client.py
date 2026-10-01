@@ -109,11 +109,10 @@ def get_langchain_llm(model: str, temperature: float = 0.0, **kwargs: Any):
 def get_langchain_embedding(model: str, **kwargs: Any):
     """A LangChain embedding model for the given model, using Ollama in DEV and OpenAI in PROD.
 
-    Parallel to get_llamaindex_embedding above, for the LangChain-based v2
-    RAG pipeline. Must embed into the same vector space as the llama_index
-    pipeline's model (same `settings.embedding_model`) so DEV/PROD stay
-    consistent, but v2 writes to its own Chroma collections
-    (`settings.rag_v2.collection_prefix`) rather than sharing v1's.
+    Used by the v2 RAG pipeline for both indexing and querying; the model
+    a document was indexed with is recorded alongside it in Postgres
+    (rag.documents.embedding_model), since query and document vectors must
+    come from the same model.
     """
     if settings.is_prod:
         from langchain_openai import OpenAIEmbeddings

@@ -5,13 +5,10 @@
 # alternative to start_mcp_servers.ps1, which still works unchanged for
 # local dev. See RUNNING.md for both ways to run this app.
 #
-# External services this container does NOT include and still needs:
-#   - MongoDB   (API_MONGO_URL)      — conversations, auth, documents
-#   - Postgres  (DB_MCP_DATABASE_URL) — the DB MCP server's own tables
-#   - Chroma    (VECTOR_STORE_*)     — indexing/retrieval's vector store
-# docker-compose.yml wires all three up for local/single-host use; for a
-# free-tier deploy, point these at managed free instances instead
-# (MongoDB Atlas, Neon/Supabase Postgres, a small persistent-disk Chroma).
+# External service this container does NOT include and still needs:
+#   - Postgres with pgvector (DATABASE_URL / DB_MCP_DATABASE_URL) — users,
+#     chats, documents, the vector index and per-user DB-tool tables.
+# docker-compose.yml runs it (pgvector/pgvector:pg16) next to this container.
 FROM python:3.13-slim
 
 WORKDIR /app

@@ -248,3 +248,14 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Phase 5: A2A agents service (Deep Research + Data Analyst) + /api/tasks
 - ⬜ Phase 6: frontend /research and /analyst pages
 - ⬜ Phase 7: full pytest/sandbox tests in CI, ruff, dead-code cleanup, docs consolidation
+
+## 2026-10-01
+- ✅ Phase 1: one Postgres (pgvector) replaces MongoDB + Chroma (app / rag / per-user ws_* schemas, migration runner, db_setup script)
+- ✅ Hybrid retrieval in SQL (pgvector + full-text, RRF fusion, real cross-encoder scores) + new retrieval_search_my_documents_v2 across a user's documents
+- ✅ Per-user private DB-tool workspaces + restricted agent_ws role; Data page shows only the user's own tables
+- ✅ migrate_mongo_to_pg.py + reindex_all.py so existing data and documents carry over without re-uploading
+- ✅ ps1 and compose switched to pgvector/pgvector:pg16; CI runs the Postgres integration tests
+- ⬜ Run once locally on real data: `docker compose up --build` (or ps1), then migrate_mongo_to_pg + reindex_all, then upload a PDF and ask a cited question — confirms the real Docling/embedding/cross-encoder path that tests faked
+- ⬜ Agent-created tables from before this change remain in the old `public` schema (invisible now) — copy any still needed into the owner's workspace by hand, or drop them
+- ⬜ Older root docs (HOW_TO_RUN_SERVERS.md, QUICK_START.md, ENHANCED_METADATA.md, RAG_IMPROVEMENTS_SUMMARY.md) still describe Chroma/Mongo — consolidate in Phase 7
+- ⬜ Phase 2: code sandbox container

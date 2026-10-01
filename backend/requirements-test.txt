@@ -1,6 +1,7 @@
-# What backend/tests needs to import the API (backend/apps/api) without the
-# heavy indexing/retrieval stack (docling, torch, langchain...). Versions
-# match requirements-base.txt / apps/api/requirements.txt.
+# What backend/tests needs to import the API, the DB MCP server and the
+# retrieval pipeline without the heavy indexing/retrieval stack (docling,
+# torch, sentence-transformers...). Versions match requirements-base.txt /
+# the per-component requirements.txt files.
 pytest
 fastapi==0.141.1
 starlette==1.6.0
@@ -17,5 +18,10 @@ mcp==1.29.0
 openai==2.54.0
 ollama
 bcrypt
-motor==3.7.1
-pymongo==4.17.0
+psycopg[binary,pool]>=3.3,<4
+sqlglot>=30.0,<31
+pyyaml>=6.0,<7
+langchain-core>=0.3,<0.4
+# Only for test_migrate_mongo.py (the one-time Mongo -> Postgres copy script).
+pymongo
+mongomock

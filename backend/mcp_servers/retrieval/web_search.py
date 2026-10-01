@@ -1,7 +1,7 @@
 """External web search + page fetch, backing the retrieval server's
 web_search and fetch_page tools.
 
-Separate from retriever.py/langchain_pipeline.py on purpose: those query
+Separate from langchain_pipeline.py on purpose: those query
 this backend's own indexed documents (Chroma), while this module reaches
 out to the open web. Same server because both are "get the agent
 information it doesn't already have" — web_search is just an external

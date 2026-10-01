@@ -30,8 +30,8 @@ rich==15.0.0
 fastmcp==3.4.7
 mcp==1.29.0
 
-# LLM client + RAG (v1 pipeline, used by indexing/retrieval regardless of
-# the v2 LangChain pipeline pinned in their own requirements.txt files)
+# LLM client (+ llama_index, still used by parts of the indexing parsers;
+# the v2 LangChain pipeline is pinned in indexing/retrieval requirements.txt)
 openai==2.54.0
 litellm==1.97.0
 llama-index-core==0.14.24
@@ -39,9 +39,7 @@ llama-index-embeddings-ollama==0.9.0
 llama-index-embeddings-openai==0.6.0
 llama-index-llms-ollama==0.10.1
 llama-index-llms-openai==0.7.10
-llama-index-vector-stores-chroma==0.5.5
-chromadb==1.5.9
 
-# Persistence (Agentic API: conversations, auth, documents)
-motor==3.7.1
-pymongo==4.17.0
+# Persistence: the one Postgres (users, conversations, documents, vectors,
+# per-user DB-tool workspaces) — see backend/core/db
+psycopg[binary,pool]>=3.3,<4
