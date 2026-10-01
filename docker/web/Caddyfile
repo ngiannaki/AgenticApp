@@ -1,0 +1,29 @@
+# SITE_ADDRESS: a domain (e.g. app.example.com -> automatic HTTPS) or ":80"
+# (plain HTTP, e.g. behind a Cloudflare tunnel that terminates TLS).
+{$SITE_ADDRESS::80} {
+	encode gzip
+
+	# Only /api is proxied — /internal (file tokens, agents' tool calls) is
+	# never reachable from outside.
+	handle /api/* {
+		reverse_proxy app:8100 {
+			flush_interval -1 # SSE: stream events as they come
+		}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} {path}.html {path}/index.html /index.html
+		file_server
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options SAMEORIGIN
+		-Server
+	}
+	request_body {
+		max_size 150MB
+	}
+}

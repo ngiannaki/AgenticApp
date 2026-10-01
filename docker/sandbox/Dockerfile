@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.
 COPY backend/__init__.py backend/__init__.py
 COPY backend/config backend/config
 COPY backend/core/storage backend/core/storage
+COPY backend/core/mcp_http.py backend/core/mcp_http.py
 COPY backend/mcp_servers/__init__.py backend/mcp_servers/__init__.py
 COPY backend/mcp_servers/code backend/mcp_servers/code
 

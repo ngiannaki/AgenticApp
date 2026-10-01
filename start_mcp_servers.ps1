@@ -236,12 +236,21 @@ if ($pgPassword -eq "changeme") {
 docker network inspect agenticapp-sandbox *> $null
 if ($LASTEXITCODE -ne 0) { docker network create agenticapp-sandbox *> $null }
 docker rm -f $sandboxName *> $null
+# The API sends MCP_INTERNAL_TOKEN (backend/.env) to every MCP server; the
+# host servers read it from backend/.env themselves, the container gets it here.
+$mcpInternalToken = ""
+$envFile = Join-Path $repoRoot "backend\.env"
+if (Test-Path $envFile) {
+    $line = Select-String -Path $envFile -Pattern '^\s*MCP_INTERNAL_TOKEN\s*=(.*)$' | Select-Object -First 1
+    if ($line) { $mcpInternalToken = $line.Matches[0].Groups[1].Value.Trim() }
+}
 docker run -d --name $sandboxName --network agenticapp-sandbox --init --read-only `
     --tmpfs "/work:size=1g,mode=0711" --tmpfs "/tmp:size=256m" `
     --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add KILL `
     --security-opt "no-new-privileges:true" --memory 2g --pids-limit 256 --cpus 2 `
     -p "127.0.0.1:8003:8003" `
     -e "CODE_MCP_FILE_SOURCE_URL=http://host.docker.internal:8100/internal/files" `
+    -e "MCP_INTERNAL_TOKEN=$mcpInternalToken" `
     $sandboxImage *> $null
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "Could not start the code sandbox container - code execution will be unavailable."

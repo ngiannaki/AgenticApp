@@ -45,6 +45,7 @@ from backend.apps.api.sessions import SessionManager
 # router, references the runtime class name directly.
 from backend.apps.api.streaming_agent import AgentRuntime
 from backend.config import settings as app_settings
+from backend.core.mcp_http import internal_token
 from backend.core.db import apply_migrations, close_pool, ensure_agent_role, get_pool, run_sync
 
 logger = logging.getLogger("agentic_api")
@@ -66,6 +67,9 @@ def _load_servers(servers_path: Path) -> dict:
         # just reads backend/.env directly).
         if "command" in entry:
             entry["env"] = {**os.environ, **entry.get("env", {})}
+        elif "url" in entry and internal_token():
+            # HTTP MCP servers require the internal token (backend/core/mcp_http.py).
+            entry["headers"] = {**entry.get("headers", {}), "Authorization": f"Bearer {internal_token()}"}
     return {"mcpServers": mapping}
 
 

@@ -1,0 +1,9 @@
+{
+  "_comment": "docker compose: every MCP server is its own HTTP service (same image), reached by service name. The API adds the MCP_INTERNAL_TOKEN header to each entry automatically. Selected by API_SERVERS_PATH in docker-compose.yml.",
+  "mcpServers": {
+    "indexing": {"url": "http://indexing:8000/mcp"},
+    "retrieval": {"url": "http://retrieval:8001/mcp"},
+    "db": {"url": "http://db:8002/mcp"},
+    "code": {"url": "http://code-sandbox:8003/mcp"}
+  }
+}

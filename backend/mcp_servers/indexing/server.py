@@ -19,6 +19,8 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from fastmcp import FastMCP
+
+from backend.core.mcp_http import run_mcp_http
 from backend.config import settings
 from backend.core.db import apply_migrations
 from backend.core.storage.document_store import DocumentStore
@@ -195,8 +197,4 @@ if __name__ == "__main__":
     if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
         mcp.run(transport="stdio")
     else:
-        mcp.run(
-            transport="http",
-            host=settings.indexing_server.host,
-            port=settings.indexing_server.port,
-        )
+        run_mcp_http(mcp, settings.indexing_server.host, settings.indexing_server.port)
