@@ -27,7 +27,7 @@ jobs:
           python-version: "3.13"
       - name: Byte-compile every backend module (catches syntax errors)
         run: python -m compileall -q backend
-      - name: Lint (pyflakes rules: unused imports, undefined names, ...)
+      - name: "Lint (pyflakes rules: unused imports, undefined names, ...)"
         run: pip install -q ruff && ruff check backend --select F
 
   pytest:
