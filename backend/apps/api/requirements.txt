@@ -20,3 +20,7 @@
 bcrypt>=4.1,<6
 openai-agents>=0.19.4,<0.20
 pyyaml>=6.0,<7
+
+# A2A protocol: the agents service (backend/apps/agents) and the API's client
+# for it (backend/apps/api/agent_tasks.py).
+a2a-sdk[http-server]==1.2.1

@@ -22,6 +22,7 @@ services:
       DATABASE_URL: postgresql://raguser:${POSTGRES_PASSWORD:-changeme}@postgres:5432/ragdb
       DATABASE_AGENT_ROLE_PASSWORD: ${AGENT_DB_PASSWORD:-changeme-agent}
       DB_MCP_DATABASE_URL: postgresql://agent_ws:${AGENT_DB_PASSWORD:-changeme-agent}@postgres:5432/ragdb
+      AGENTS_URL: http://agents:9100
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,6 +41,21 @@ services:
       # process to pick up the new code. The Dockerfile's CMD (used for
       # real deploys, not this compose file) is untouched and still bakes
       # the code in instead.
+      - ./backend:/app/backend
+
+  # The A2A agents (Deep Research, Data Analyst, ...). Same image as `app`;
+  # reaches tools only through the API (/internal/tools), with
+  # AGENTS_INTERNAL_TOKEN from backend/.env.
+  agents:
+    build: .
+    command: ["python", "-m", "backend.apps.agents.main"]
+    env_file:
+      - backend/.env
+    environment:
+      AGENTS_HOST: 0.0.0.0
+      AGENTS_URL: http://agents:9100
+      AGENTS_API_URL: http://app:8100
+    volumes:
       - ./backend:/app/backend
 
   # Runs the code the assistant writes (run_python_code, spreadsheet

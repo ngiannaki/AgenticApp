@@ -271,3 +271,9 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 
 ## 2026-10-01
 - ✅ Fixed code-sandbox image startup (lazy `openai` import in backend/config/llm_client.py); confirm the `sandbox-image` CI job is green on the next run
+
+## 2026-10-01
+- ✅ Phases 5+6: reusable A2A agent framework + Deep Research + Data Analyst agents, API task endpoints with Postgres event log, generic /agents page
+- ⬜ Try with a real model: set AGENTS_INTERNAL_TOKEN in backend/.env, start everything, run a Deep Research task and a Data Analyst task from /agents
+- ⬜ Optional later: chat-to-agent handoff tool (start an agent task from the chat)
+- ⬜ Phase 3 (deployment), Phase 4 (accounts/limits/streaming), Phase 7 (cleanup) still to do

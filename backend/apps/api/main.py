@@ -35,7 +35,8 @@ from backend.apps.api.config import get_api_settings
 from backend.apps.api.document_registry import DocumentRegistry
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
+from backend.apps.api.routers import agents, auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
+from backend.apps.api.agent_tasks import AgentHub, TaskStore
 from backend.apps.api.sessions import SessionManager
 # ROLLBACK: swapped from `from backend.apps.api.streaming_agent import
 # AgentRuntime` to try the v2 orchestrator/executor/critic runtime live. To
@@ -149,6 +150,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.dev_user.email,
         )
 
+    app.state.agent_hub = None
+    agents_cfg = app_settings.agents
+    if agents_cfg.enabled and agents_cfg.internal_token:
+        task_store = TaskStore(pool)
+        interrupted = await task_store.fail_interrupted()
+        if interrupted:
+            logger.info("Marked %d agent task(s) interrupted by the restart as failed", interrupted)
+        app.state.agent_hub = AgentHub(task_store, agents_cfg.url, agents_cfg.internal_token, agents_cfg.max_active_tasks_per_user)
+    else:
+        logger.warning("Agents disabled: set AGENTS_INTERNAL_TOKEN (same value for the API and the agents service).")
+
     reaper_task = asyncio.create_task(
         _idle_session_reaper(app, interval_seconds=min(300.0, settings.session_idle_timeout_seconds))
     )
@@ -160,6 +172,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reaper_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reaper_task
+        if app.state.agent_hub is not None:
+            await app.state.agent_hub.close()
         await runtime.close()
         logger.info("MCP connection closed")
         close_pool()
@@ -189,6 +203,7 @@ def create_app() -> FastAPI:
     app.include_router(files.documents_router)
     app.include_router(data.router)
     app.include_router(internal.router)
+    app.include_router(agents.router)
 
     @app.get("/api/health")
     async def health() -> JSONResponse:

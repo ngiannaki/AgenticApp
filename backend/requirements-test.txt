@@ -25,3 +25,4 @@ langchain-core>=0.3,<0.4
 # Only for test_migrate_mongo.py (the one-time Mongo -> Postgres copy script).
 pymongo
 mongomock
+a2a-sdk[http-server]==1.2.1

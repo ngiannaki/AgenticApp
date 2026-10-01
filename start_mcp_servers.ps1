@@ -254,6 +254,13 @@ Write-Host "Code sandbox:         container '$sandboxName' (docker logs $sandbox
 Write-Host "Indexing server PID:  $($indexingProc.Id)"
 Write-Host "Retrieval server PID: $($retrievalProc.Id)"
 
+# --- Start the A2A agents service (port 9100) ---
+# Deep Research, Data Analyst, ... (backend/apps/agents). Needs
+# AGENTS_INTERNAL_TOKEN in backend/.env (same value the API reads).
+Write-Host "Starting the agents service (port 9100)..." -ForegroundColor Cyan
+$agentsProc = Start-PythonServer -Name "agents" -Module "backend.apps.agents.main" `
+    -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
+
 # --- Start Agentic API server (port 8100) ---
 # AgentRuntime connects to all MCP servers at startup and fails fast
 # if they're not reachable yet, so wait for their ports before launching it.
@@ -292,5 +299,6 @@ Write-Host ""
 Write-Host "All set. Servers are running in their own windows." -ForegroundColor Green
 Write-Host "Closing this window will NOT stop them (they were launched as separate processes)."
 $allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id)
+if ($agentsProc) { $allPids += $agentsProc.Id }
 if ($apiProc) { $allPids += $apiProc.Id }
 Write-Host "To stop them manually: Stop-Process -Id $($allPids -join ',') ; docker stop $sandboxName"

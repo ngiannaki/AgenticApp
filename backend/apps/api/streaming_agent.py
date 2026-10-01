@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import uuid
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import anyio
@@ -35,6 +36,7 @@ from backend.apps.api import skills as skills_lib
 from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
 from backend.config import get_async_openai_client, get_chat_extra_body, settings as app_settings
+from backend.core.citations import _collect_and_stamp_citations, _render_citations
 from backend.core.storage.artifact_store import ArtifactStore
 
 logger = logging.getLogger("agentic_api")
@@ -260,128 +262,6 @@ def _with_attached_documents_note(session: ChatSession, question: str) -> str:
 
     note = "\n\n".join(note_parts)
     return f"{note}\n\n{question}"
-
-
-def _collect_and_stamp_citations(
-    citations: list[dict[str, Any]], chunk_numbers: dict[str, int], name: str, ok: bool, text: str
-) -> str:
-    """Pull grounding out of a retrieve_document_v2 tool result, fold any
-    not-yet-seen chunk into `citations` (first-appearance order across the
-    whole turn — a later call re-returning an already-cited chunk reuses its
-    number rather than renumbering), and stamp a `<citation id="..."/>` tag
-    directly into the JSON handed back to the model, carrying that chunk's
-    own opaque `chunk_id`.
-
-    The stamping — and the choice of an id tag over a bracket number — is
-    what actually makes citations reliable. Asking the model to write "[n]"
-    itself requires it to reconstruct which ordinal a chunk was first
-    assigned, purely from memory, across however many retrieval calls it's
-    made this turn — the rag-retrieval-strategy skill's retry loop can mean
-    3-4 calls and dozens of candidate chunks, and that cross-call
-    bookkeeping is exactly the kind of thing a smaller model gets wrong.
-    Observed in practice: the model correctly identified and quoted the
-    right chunk (a financial statement table, correctly stating "page 51"
-    pulled from the TOC) but emitted a "[n]" marker that actually resolved
-    to an unrelated chunk from an earlier, broader retrieval call that had
-    been numbered "[n]" first (a decoy percentage table on a different
-    page) — a plausible-looking number pointing at the wrong source.
-
-    A `chunk_id` tag fixes this by turning citing into a copy task instead
-    of arithmetic: the model reproduces a string it just read seconds
-    earlier. It also fails *safe* on a mistake — a typo'd id matches no real
-    chunk and is simply dropped (see _render_citations), whereas a typo'd
-    number can silently land on a different real, wrong chunk, exactly as
-    happened here.
-
-    Returns the (possibly modified) text to actually store in conversation
-    memory and show in the tool-result event, so the model reads the same
-    stamped version this function computed from.
-    """
-    if not ok or not name.endswith("retrieve_document_v2"):
-        return text
-    try:
-        data = json.loads(text)
-    except (TypeError, ValueError):
-        return text
-
-    stamped = False
-    for chunk in data.get("source_chunks") or []:
-        grounding = chunk.get("grounding") or {}
-        chunk_id = grounding.get("chunk_id")
-        if not chunk_id:
-            continue
-        number = chunk_numbers.get(chunk_id)
-        if number is None:
-            number = len(citations) + 1
-            chunk_numbers[chunk_id] = number
-            citations.append({"number": number, "text": chunk.get("text", ""), "grounding": grounding})
-        chunk["cite_as"] = f'<citation id="{chunk_id}"/>'
-        stamped = True
-
-    return json.dumps(data) if stamped else text
-
-
-_CITATION_TAG_RE = re.compile(r'<citation\s+id="([^"]*)"\s*/?>')
-
-
-def _render_citations(
-    answer: str, citations: list[dict[str, Any]]
-) -> tuple[str, list[dict[str, Any]]]:
-    """Turn the model's inline `<citation id="..."/>` tags into the
-    user-facing answer text plus the filtered, display-numbered Sources
-    list, in one pass.
-
-    Per tag found in `answer`, in reading order:
-    - Known id (matches a chunk actually stamped this turn, per `citations`)
-      -> replaced with a clean "[n]" marker, where n is assigned fresh here
-      — 1 for the first distinct chunk id encountered while scanning
-      `answer` left to right, 2 for the next new one, and so on. This is
-      deliberately *not* the chunk's original stamp-time number (its
-      first-appearance order across all of this turn's tool calls, which
-      can run into double digits after a few retries) — a turn that
-      retrieved a dozen candidates but only ended up citing two of them
-      should show "[1]" and "[2]" in the Sources strip, not e.g. "[4]" and
-      "[7]" inherited from how many chunks came before them in tool
-      results the user never sees.
-    - Unknown id (typo, invented, or left over from stale context) -> the
-      tag is silently removed. No raw markup or misleading marker is ever
-      shown to the user.
-
-    A citation never tagged anywhere in the answer is dropped from the
-    Sources list entirely — `citations` deliberately holds every chunk every
-    retrieve_document_v2 call returned this turn (so the list can't be
-    hallucinated), but a turn that retried retrieval can mean dozens of
-    candidates the answer never actually used; keeping only the tagged ones
-    is what makes the strip read as "these support the answer" rather than
-    "these were looked at".
-
-    Falls back to returning every collected citation, un-renumbered, when
-    the answer contains no tags at all, so a model that skipped the
-    instruction still shows sources rather than none.
-    """
-    by_chunk_id = {c["grounding"].get("chunk_id"): c for c in citations}
-    display_numbers: dict[str, int] = {}
-
-    def _replace(match: "re.Match[str]") -> str:
-        chunk_id = match.group(1)
-        if chunk_id not in by_chunk_id:
-            return ""
-        number = display_numbers.get(chunk_id)
-        if number is None:
-            number = len(display_numbers) + 1
-            display_numbers[chunk_id] = number
-        return f"[{number}]"
-
-    clean_answer = _CITATION_TAG_RE.sub(_replace, answer)
-
-    if not display_numbers:
-        return clean_answer, citations
-
-    cited = [
-        {**by_chunk_id[chunk_id], "number": number}
-        for chunk_id, number in sorted(display_numbers.items(), key=lambda kv: kv[1])
-    ]
-    return clean_answer, cited
 
 
 def _extract_reasoning(message: Any) -> str | None:
@@ -953,6 +833,35 @@ class AgentRuntime:
         if self._artifact_store is None:
             self._artifact_store = ArtifactStore()
         return materialize_artifacts(text, self._artifact_store, app_settings.code_mcp.artifact_public_base_url)
+
+    async def execute_tool(self, user_id: str, name: str, arguments: dict[str, Any], approved: bool = False) -> tuple[bool, str]:
+        """Run one MCP tool for `user_id` outside a chat session — the agents
+        service's path (POST /internal/tools/call). Same rules as a chat tool
+        call: allowlisted tools only, mandatory approvals (the agent must have
+        asked the user and passes approved=True), document ownership,
+        injected user_id/file_token, timeout, artifact materialization."""
+        if name not in self._injected_params:
+            return False, f"Error calling tool '{name}': unknown or unavailable tool."
+        if name in self.settings.mandatory_approval_tools and not approved:
+            return False, f"Error calling tool '{name}': this action needs the user's approval first."
+        arguments = dict(arguments)
+        denied = await self._check_document_access(SimpleNamespace(user_id=user_id), arguments)
+        if denied is not None:
+            return False, f"Error calling tool '{name}': {denied}"
+        injected = self._injected_params[name]
+        if "user_id" in injected:
+            arguments["user_id"] = user_id
+        if "file_token" in injected:
+            document_id = arguments.get("document_id")
+            arguments["file_token"] = self.file_tokens.issue(str(document_id)) if document_id else ""
+        timeout = self.settings.tool_call_timeout_seconds
+        try:
+            result = await asyncio.wait_for(self.mcp.call_tool(name, arguments), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False, f"Error calling tool '{name}': timed out after {timeout:.0f}s."
+        except Exception as exc:  # noqa: BLE001 - reported back to the agent
+            return False, f"Error calling tool '{name}': {exc}"
+        return True, self.materialize_artifacts(_extract_text(result))
 
     async def _check_document_access(self, session: ChatSession, arguments: dict[str, Any]) -> str | None:
         """Return a denial reason if `arguments` name any document the

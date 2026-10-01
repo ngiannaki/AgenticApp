@@ -108,3 +108,23 @@ document vectors in Chroma. To bring existing data across (once):
 Agent-created DB tables from before this change stay in the old `public`
 schema and aren't visible to anyone any more (every user now has a private
 workspace). Copy any you still need into a user's workspace by hand.
+
+## Agents (Deep Research, Data Analyst, ...)
+
+A separate **agents service** (`python -m backend.apps.agents.main`, port
+9100) runs every registered A2A agent; the API drives it and the frontend's
+**Agents** page (`/agents`) shows any agent it lists. `docker compose up`
+starts it as the `agents` container; `start_mcp_servers.ps1` starts it as
+its own window. Both the API and the agents service must have the same
+`AGENTS_INTERNAL_TOKEN` in `backend/.env` — agents stay disabled until it's
+set. Agents never talk to the MCP servers directly: they call tools through
+the API (`/internal/tools`), so the chat's ownership checks, approvals and
+sandbox apply to them too.
+
+**Adding an agent:** write one `BaseAgent` subclass (id, name, description,
+`inputs` form fields, `allowed_tools`, and an `async run(ctx, inputs)` that
+uses `ctx.step`, `ctx.ask`, `ctx.call_tool`/`ctx.tool_loop` and
+`ctx.artifact`) and add it to `backend/apps/agents/registry.py`. The A2A
+card, the API endpoints and the UI form pick it up automatically — see the
+docstring at the top of `backend/apps/agents/base.py` and the two examples
+(`research.py`, `analyst.py`).
