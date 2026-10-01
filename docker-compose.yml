@@ -30,6 +30,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      # Bind-mounts the actual source over the image's baked-in COPY, so
+      # edits on the host are visible inside the container immediately —
+      # no rebuild needed. No auto-reload though: run
+      # `docker compose restart app` yourself when you want the running
+      # process to pick up the new code. The Dockerfile's CMD (used for
+      # real deploys, not this compose file) is untouched and still bakes
+      # the code in instead.
+      - ./backend:/app/backend
 
   mongo:
     image: mongo:7

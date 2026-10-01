@@ -2,11 +2,11 @@ name: Backend CI
 
 # Scope note: this repo (AgenticApp) holds the backend only -- the frontend
 # lives in a separate repo/remote (AgenticApp-frontend) and needs its own
-# workflow there. There is no pytest suite wired in here yet (backend's
-# existing backend/mcp_servers/client/test_*.py scripts are ad-hoc/print-based,
-# not pytest-discoverable) -- see history/todo.md 2026-10-01 for that gap.
-# This workflow catches what's cheap and real today: Python syntax errors
-# across the whole backend, and a broken docker-compose.yml/Dockerfile.
+# workflow there. This workflow catches what's cheap and real today: Python
+# syntax errors across the whole backend, a broken docker-compose.yml/
+# Dockerfile, and the one real pytest module that exists so far (see
+# backend/tests/ -- backend/mcp_servers/client/test_*.py are separate
+# ad-hoc/print-based scripts, not pytest-discoverable, and not run here).
 
 on:
   push:
@@ -23,6 +23,23 @@ jobs:
           python-version: "3.13"
       - name: Byte-compile every backend module (catches syntax errors)
         run: python -m compileall -q backend
+
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pytest
+        # Deliberately not `pip install -r <requirements>` here: the one
+        # test module we have (backend/tests/test_identifier_validator.py)
+        # exercises a stdlib-only module on purpose, precisely so this job
+        # stays fast and doesn't need the rest of the app's (heavy) runtime
+        # dependencies installed just to run it.
+        run: pip install pytest
+      - name: Run backend/tests
+        run: python -m pytest backend/tests
 
   docker-compose-validate:
     runs-on: ubuntu-latest

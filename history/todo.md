@@ -39,6 +39,16 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Flip `API_SKILLS_ENABLED=true` in `backend/.env` and verify in the live chat UI that the model reaches for `list_skills`/`get_skill` unprompted on a table-filter question, a db-write request, a "generate a report" request, and a "why didn't my upload work" question — one real test per skill (now 5)
 - ⬜ `db_query_data`'s `parameters` fix is code-only, not test-covered — no existing test suite exercises the db MCP server found during this session; verify manually against a real Postgres instance before relying on it in production
 
+## 2026-10-01
+- ✅ Remove NebulaGraph Docker Desktop extension, `valuationiq_db`/`ai_rag` leftovers, unused `redis:7-alpine`, dangling `agenticapp-app` build layers, and stale build cache from the local Docker install
+- ✅ Write `DockerRunbook.md` documenting start/clean-restart commands, stray-container diagnosis, and housekeeping
+- ⬜ Decide whether to remove the stray `agenticapp-mongo`/`agenticapp-postgres` containers (left in place at user's request) and their orphaned `agenticapp_mongodata`/`agenticapp_pgdata` volumes (single-prefix naming, not the ones the current `docker-compose.yml` actually points at — that's `agenticapp_agenticapp_mongodata`/`agenticapp_agenticapp_pgdata`)
+- ⬜ User still needs to confirm `docker volume prune -f` for 7 small orphan anonymous volumes left over from the removed nebula/ai_rag/valuationiq containers — blocked by the permission system as an irreversible action, needs explicit go-ahead
+- ⬜ `app` container's last observed shutdown exited with code 137 (SIGKILL after grace timeout, not a clean stop) — worth investigating whether MCP stdio subprocesses or DB connections are hanging on shutdown rather than just increasing the stop timeout
+- ✅ Add live auto-reload to `docker compose`'s `app` service (bind-mount `backend/` + `uvicorn --reload`) so code edits apply without `--build` or a manual restart; verified end-to-end (edit → WatchFiles reload → healthy again, MCP subprocesses respawned)
+- ⬜ Reload currently restarts the whole `app` process (API + all 4 MCP subprocesses) on any `backend/` change — fine for now, but if MCP-server-heavy iteration ever feels slow (one of them loads docling/torch, which showed up as a noticeably slow MCP reconnect during testing), consider whether a narrower `--reload-dir` or reload-exclude pattern is worth it
+- ✅ Revert the above auto-reload-on-save — user wants to trigger the reload themselves, not have every save restart the app. Removed `--reload`/`--reload-dir` from `docker-compose.yml`'s `app` command (back to the Dockerfile's default `CMD`); kept the `./backend:/app/backend` bind mount so `docker compose restart app` alone (no `--build`) picks up current on-disk code. Verified: edited a file, confirmed no reaction while running, then confirmed `docker compose restart app` picks it up and health comes back clean
+
 ## 2026-09-30
 - ✅ Add `GET /api/data/tables`, `GET /api/data/tables/{table}/schema`, `GET /api/data/tables/{table}/rows` (call_tool_isolated against the existing db MCP server, no new MCP tools needed)
 - ✅ Add a new `/data` page: table list + paginated read-only row grid, linked from Chat/Documents/Data nav everywhere
@@ -220,3 +230,8 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ No test job in CI yet, consistent with pytest being explicitly out of scope today — once `backend/mcp_servers/client/test_*.py` is migrated to real pytest (flagged repeatedly in earlier audit entries), add a `pytest` job here too
 - ✅ Fixed `docker-compose-validate` actually failing on GitHub's runner (`env file backend/.env not found` — gitignored, never exists on a fresh checkout) by copying `backend/.env.example` to `backend/.env` before running `docker compose config`; reproduced the failure and the fix locally before pushing
 - ⬜ Not yet confirmed green on an actual GitHub Actions run after this fix — only reproduced locally via move-aside-then-copy-example. Push and check the Actions tab to confirm both jobs pass for real
+
+## 2026-10-01
+- ✅ Added backend/tests/test_identifier_validator.py (18 cases) covering the SQL identifier allowlist/quoting module, plus [tool.pytest.ini_options] in backend/pyproject.toml and a new `pytest` job in .github/workflows/ci.yml — all run locally first (18 passed, 0.04s) before wiring into CI
+- ⬜ Only one module has real test coverage so far — identifier_validator.py was picked as a deliberately easy, dependency-free, security-relevant starting point, not because it's the only thing worth testing. Good next candidates once this pattern is proven out: sql_validator.py (query-shape validation, also stdlib-ish), permissions.py (table/column access control), and streaming_agent.py's new _looks_like_broken_connection (2026-10-01 entry above) — that last one would need fastmcp/anyio installed in CI though, unlike today's zero-dependency module
+- ⬜ Not yet confirmed green on an actual GitHub Actions run with the new pytest job included — push and check the Actions tab
