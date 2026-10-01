@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from backend.mcp_servers.code.artifacts import artifact_url, get_artifact_store
+from backend.mcp_servers.code.artifacts import inline_artifact
 from backend.mcp_servers.code.errors import ValidationError
 
 _FILENAME = "index.html"
@@ -38,16 +38,8 @@ def generate_ui(html: str, title: str = "Generated UI", *, settings: Any) -> dic
     if len(data) > settings.max_artifact_bytes:
         raise ValidationError(f"Generated UI is {len(data)} bytes, exceeding the {settings.max_artifact_bytes}-byte limit.")
 
-    store = get_artifact_store()
-    artifact_id = store.save(data, _FILENAME)
-
-    return {
-        "success": True,
-        "filename": _FILENAME,
-        "url": artifact_url(settings, artifact_id, _FILENAME),
-        "content_type": _CONTENT_TYPE,
-        "size_bytes": len(data),
-    }
+    # Returned inline; the API stores it and swaps in a URL (see artifacts.py).
+    return {"success": True, **inline_artifact(data, _FILENAME, _CONTENT_TYPE)}
 
 
 def _ensure_document(html: str, title: str) -> str:

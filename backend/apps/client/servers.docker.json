@@ -1,26 +1,38 @@
 {
-  "_comment": "Docker/single-container variant of servers.json: the same 4 MCP servers, launched as stdio subprocesses of the API process instead of standalone HTTP services. Selected by setting API_SERVERS_PATH to this file's path (done in the root Dockerfile's ENV). Each server still reads its own settings (DB_MCP_DATABASE_URL, CODE_MCP_*, etc.) from the environment exactly as it does in HTTP mode — only the transport changes, via MCP_TRANSPORT=stdio below.",
-
+  "_comment": "Docker variant of servers.json: indexing, retrieval and db run as stdio subprocesses of the API (MCP_TRANSPORT=stdio); code runs in its own locked-down `code-sandbox` container and is reached over HTTP. Selected by API_SERVERS_PATH (set in the root Dockerfile). Each server still reads its own settings from the environment.",
   "mcpServers": {
     "indexing": {
       "command": "python",
-      "args": ["-m", "backend.mcp_servers.indexing.server"],
-      "env": { "MCP_TRANSPORT": "stdio" }
+      "args": [
+        "-m",
+        "backend.mcp_servers.indexing.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
     },
     "retrieval": {
       "command": "python",
-      "args": ["-m", "backend.mcp_servers.retrieval.server"],
-      "env": { "MCP_TRANSPORT": "stdio" }
+      "args": [
+        "-m",
+        "backend.mcp_servers.retrieval.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
     },
     "db": {
       "command": "python",
-      "args": ["-m", "backend.mcp_servers.db.server"],
-      "env": { "MCP_TRANSPORT": "stdio" }
+      "args": [
+        "-m",
+        "backend.mcp_servers.db.server"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      }
     },
     "code": {
-      "command": "python",
-      "args": ["-m", "backend.mcp_servers.code.server"],
-      "env": { "MCP_TRANSPORT": "stdio" }
+      "url": "http://code-sandbox:8003/mcp"
     }
   }
 }

@@ -3,6 +3,8 @@
 Wires together:
   - a single shared MCP connection (fastmcp.Client over every server in
     servers.json), opened once at startup and reused by every session,
+  - Postgres (backend/core/db): migrations applied at startup; users,
+    conversations and the document registry live there,
   - a per-session conversation (backend/apps/api/sessions.py),
   - a streaming, interruptible tool-calling loop
     (backend/apps/api/streaming_agent.py) exposed to the frontend as SSE.
@@ -23,6 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
+import psycopg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -32,7 +35,7 @@ from backend.apps.api.config import get_api_settings
 from backend.apps.api.document_registry import DocumentRegistry
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import auth, chat, conversations, data, files, interrupts, questions, sessions, tools
+from backend.apps.api.routers import auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
 from backend.apps.api.sessions import SessionManager
 # ROLLBACK: swapped from `from backend.apps.api.streaming_agent import
 # AgentRuntime` to try the v2 orchestrator/executor/critic runtime live. To
@@ -41,6 +44,7 @@ from backend.apps.api.sessions import SessionManager
 # router, references the runtime class name directly.
 from backend.apps.api.streaming_agent import AgentRuntime
 from backend.config import settings as app_settings
+from backend.core.db import apply_migrations, close_pool, ensure_agent_role, get_pool, run_sync
 
 logger = logging.getLogger("agentic_api")
 
@@ -73,10 +77,55 @@ async def _idle_session_reaper(app: FastAPI, interval_seconds: float) -> None:
             logger.info("Evicted %d idle session(s): %s", len(stale), ", ".join(stale))
 
 
+def _ping_database(pool) -> None:
+    with pool.connection() as conn:
+        conn.execute("SELECT 1")
+
+
+async def _connect_database():
+    """Apply migrations, make sure the DB-tool role exists, open the pool.
+
+    Postgres is the one hard dependency (users, conversations, documents and
+    the vector index all live there), so startup waits up to ~30s for it (a
+    container may still be booting) and then fails loudly instead of running
+    half-working.
+    """
+    db = app_settings.database
+    last_error: Exception | None = None
+    for attempt in range(1, 16):
+        try:
+            applied = await run_sync(apply_migrations, db.url)
+            if applied:
+                logger.info("Applied database migrations: %s", ", ".join(applied))
+            break
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            logger.warning("Postgres not reachable yet (attempt %d/15): %s", attempt, exc)
+            await asyncio.sleep(2)
+    else:
+        raise RuntimeError(
+            f"Could not connect to Postgres at DATABASE_URL after 30s — is it running? ({last_error})"
+        )
+
+    if db.agent_role_password:
+        await run_sync(ensure_agent_role, db.url, db.agent_role, db.agent_role_password)
+    else:
+        logger.warning(
+            "DATABASE_AGENT_ROLE_PASSWORD is not set — not managing the %r role the DB MCP server "
+            "connects as; make sure it exists with access only to its own ws_* schemas.",
+            db.agent_role,
+        )
+    return await run_sync(get_pool)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_api_settings()
     setup_logging(settings.log_level)
+
+    # Database first: the MCP servers expect the schema to exist.
+    pool = await _connect_database()
+    app.state.db_pool = pool
 
     servers = _load_servers(settings.servers_path)
     logger.info("Connecting to MCP servers: %s", ", ".join(servers["mcpServers"]))
@@ -85,37 +134,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.runtime = runtime
     app.state.session_manager = SessionManager(settings.session_idle_timeout_seconds, runtime)
 
-    try:
-        app.state.conversation_store = await ConversationStore.connect(
-            settings.mongo_url, settings.mongo_db_name
-        )
-        # Auth (users/tokens) and the document registry share the same
-        # Mongo connection/database as conversation persistence.
-        mongo_client = app.state.conversation_store.client
-        mongo_db = mongo_client[settings.mongo_db_name]
-        app.state.user_store = await UserStore.connect(mongo_client, mongo_db)
-        app.state.document_registry = await DocumentRegistry.connect(mongo_client, mongo_db)
-    except Exception:  # noqa: BLE001 — persistence is a durability nice-to-have, not a hard dependency
-        logger.exception(
-            "Could not connect to MongoDB at %s — conversations, auth, and documents will "
-            "not be persisted until it is reachable. Start it via start_mcp_servers.ps1 or docker.",
-            settings.mongo_url,
-        )
-        app.state.conversation_store = None
-        app.state.user_store = None
-        app.state.document_registry = None
+    app.state.conversation_store = ConversationStore(pool)
+    app.state.user_store = UserStore(pool)
+    app.state.document_registry = DocumentRegistry(pool)
+    runtime.document_registry = app.state.document_registry
 
     if app_settings.auth.dev_bypass:
-        if app.state.user_store is not None:
-            app.state.dev_user = await app.state.user_store.seed_dev_user(
-                app_settings.auth.dev_bypass_email, app_settings.auth.dev_bypass_password
-            )
-        else:
-            # Mongo unreachable but bypass is on: fall back to an in-memory
-            # identity so local dev without Mongo still works end to end.
-            from backend.apps.api.auth import AuthUser
-
-            app.state.dev_user = AuthUser(user_id="dev-user", email=app_settings.auth.dev_bypass_email)
+        app.state.dev_user = await app.state.user_store.seed_dev_user(
+            app_settings.auth.dev_bypass_email, app_settings.auth.dev_bypass_password
+        )
         logger.warning(
             "AUTH_DEV_BYPASS is on — every request is treated as %s. Do not use this in a "
             "deployment reachable by more than one person.",
@@ -135,9 +162,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await reaper_task
         await runtime.close()
         logger.info("MCP connection closed")
-        if app.state.conversation_store is not None:
-            await app.state.conversation_store.close()
-            logger.info("MongoDB connection closed")
+        close_pool()
+        logger.info("Postgres pool closed")
 
 
 def create_app() -> FastAPI:
@@ -162,10 +188,11 @@ def create_app() -> FastAPI:
     app.include_router(files.router)
     app.include_router(files.documents_router)
     app.include_router(data.router)
+    app.include_router(internal.router)
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
-        """Actually probes the MCP connection and Mongo, instead of just
+        """Actually probes the MCP connection and Postgres, instead of just
         reporting the tool count captured once at startup -- that alone
         can't tell you the shared MCP client died (see the 2026-10-01
         ClosedResourceError incident, where /api/health kept reporting "ok"
@@ -181,17 +208,13 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001 — surfaced in the response body, not a 500
             checks["mcp"] = f"error: {exc}"
 
-        store = app.state.conversation_store
-        if store is None:
-            checks["mongo"] = "not configured"
-        else:
-            try:
-                await asyncio.wait_for(store.client.admin.command("ping"), timeout=5)
-                checks["mongo"] = "ok"
-            except Exception as exc:  # noqa: BLE001
-                checks["mongo"] = f"error: {exc}"
+        try:
+            await asyncio.wait_for(run_sync(_ping_database, app.state.db_pool), timeout=5)
+            checks["postgres"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            checks["postgres"] = f"error: {exc}"
 
-        healthy = all(v in ("ok", "not configured") for v in checks.values())
+        healthy = all(v == "ok" for v in checks.values())
         body = {"status": "ok" if healthy else "degraded", "tools": len(runtime.tools), "checks": checks}
         return JSONResponse(body, status_code=200 if healthy else 503)
 

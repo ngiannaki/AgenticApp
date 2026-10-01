@@ -3,9 +3,14 @@
 #
 # This is the Docker alternative to start_mcp_servers.ps1 — see RUNNING.md
 # for how the two compare. It reuses backend/.env for every setting (API
-# keys, model names, feature flags, ...) except the two that must point at
-# this compose network's service names instead of localhost (Mongo,
-# Postgres), which are overridden below.
+# keys, model names, feature flags, ...) except the database URLs, which must
+# point at this compose network's `postgres` service instead of localhost and
+# are overridden below.
+#
+# One database: Postgres with pgvector holds users, chats, the document
+# registry, the vector index and each user's private DB-tool tables.
+# Passwords come from the root .env (POSTGRES_PASSWORD, AGENT_DB_PASSWORD) —
+# the defaults below are for local use only.
 services:
   app:
     build: .
@@ -14,19 +19,17 @@ services:
     env_file:
       - backend/.env
     environment:
-      API_MONGO_URL: mongodb://mongo:27017
-      DB_MCP_DATABASE_URL: postgresql://raguser:changeme@postgres:5432/ragdb
-      VECTOR_STORE_HOST: chroma
-      # 8000, not the host-mapped 8010 below: container-to-container traffic
-      # uses chroma's actual listening port, not its host port mapping.
-      VECTOR_STORE_PORT: "8000"
+      DATABASE_URL: postgresql://raguser:${POSTGRES_PASSWORD:-changeme}@postgres:5432/ragdb
+      DATABASE_AGENT_ROLE_PASSWORD: ${AGENT_DB_PASSWORD:-changeme-agent}
+      DB_MCP_DATABASE_URL: postgresql://agent_ws:${AGENT_DB_PASSWORD:-changeme-agent}@postgres:5432/ragdb
     depends_on:
-      mongo:
-        condition: service_started
       postgres:
         condition: service_healthy
-      chroma:
+      code-sandbox:
         condition: service_started
+    networks:
+      - default
+      - sandbox
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -39,37 +42,61 @@ services:
       # the code in instead.
       - ./backend:/app/backend
 
-  mongo:
-    image: mongo:7
-    ports:
-      - "27017:27017"
-    volumes:
-      - agenticapp_mongodata:/data/db
+  # Runs the code the assistant writes (run_python_code, spreadsheet
+  # analysis). Locked down: no secrets, read-only filesystem, minimal
+  # capabilities, resource limits, and on the `sandbox` network only — it
+  # can reach the API (to fetch an attached spreadsheet with a one-time
+  # token) but not Postgres or the internet. Each submission runs as its own
+  # unprivileged uid inside (backend/mcp_servers/code/execution/sandbox.py).
+  code-sandbox:
+    build:
+      context: .
+      dockerfile: docker/sandbox/Dockerfile
+    init: true
+    read_only: true
+    tmpfs:
+      - /work:size=1g,mode=0711
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    pids_limit: 256
+    cpus: 2
+    environment:
+      CODE_MCP_FILE_SOURCE_URL: http://app:8100/internal/files
+    networks:
+      - sandbox
 
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: raguser
-      POSTGRES_PASSWORD: changeme
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       POSTGRES_DB: ragdb
+    # Host access for local tools (psql, a DB GUI) only — bound to localhost.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - agenticapp_pgdata:/var/lib/postgresql/data
-      - ./backend/mcp_servers/db/migrations/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
       interval: 2s
       timeout: 5s
       retries: 20
 
-  chroma:
-    image: chromadb/chroma:latest
-    ports:
-      - "8010:8000"
-    volumes:
-      - ./data/vector_store:/data
+networks:
+  # internal: no route to the outside world. Only `app` and `code-sandbox`
+  # are on it.
+  sandbox:
+    internal: true
 
 volumes:
-  agenticapp_mongodata:
   agenticapp_pgdata:

@@ -10,7 +10,7 @@ if str(project_root) not in sys.path:
 from fastmcp import FastMCP
 import logging
 from backend.config import settings
-from backend.mcp_servers.retrieval.retriever import DocumentRetriever
+from backend.core.db import apply_migrations
 from backend.mcp_servers.retrieval.langchain_pipeline import LangchainRetrievalPipelineV2
 from backend.mcp_servers.retrieval.web_search import fetch_page as _fetch_page
 from backend.mcp_servers.retrieval.web_search import web_search as _web_search
@@ -32,140 +32,7 @@ logger.setLevel(logging.INFO)
 
 mcp = FastMCP("retrieval")
 
-# Initialize retriever
-retriever = DocumentRetriever()
 retriever_v2 = LangchainRetrievalPipelineV2()
-
-
-#@mcp.tool
-def query_document(document_id: str, query: str) -> dict:
-    """
-    Query a document using RAG with Ollama.
-    
-    Takes a document_id and question, retrieves relevant chunks from the vector store,
-    and uses Ollama to generate a contextual answer.
-    
-    Args:
-        document_id: UUID of the document to query
-        query: Question to ask about the document
-    
-    Returns:
-        Dictionary with answer and source chunks used
-    """
-    logger.info(f"[RETRIEVAL] query_document called")
-    logger.info(f"[RETRIEVAL] document_id: {document_id}")
-    logger.info(f"[RETRIEVAL] query: {query}")
-    
-    result = retriever.query(document_id, query)
-    
-    if result.get("success"):
-        logger.info(f"[RETRIEVAL] Query successful, {result.get('chunks_count', 0)} chunks used")
-    else:
-        logger.error(f"[RETRIEVAL] Query failed: {result.get('error')}")
-    
-    return result
-
-
-#@mcp.tool
-def query_document_with_context(document_id: str, query: str, top_k: int = 5) -> dict:
-    """
-    Query a document with configurable retrieval context.
-    
-    Args:
-        document_id: UUID of the document to query
-        query: Question to ask about the document
-        top_k: Number of top chunks to retrieve (default: 5)
-    
-    Returns:
-        Dictionary with answer and source chunks used
-    """
-    logger.info(f"[RETRIEVAL] query_document_with_context called")
-    logger.info(f"[RETRIEVAL] document_id: {document_id}, top_k: {top_k}")
-    
-    result = retriever.query(document_id, query, top_k=top_k)
-    
-    if result.get("success"):
-        logger.info(f"[RETRIEVAL] ✓ Query successful with top_k={top_k}")
-    else:
-        logger.error(f"[RETRIEVAL] ✗ Query failed: {result.get('error')}")
-    
-    return result
-
-#@mcp.tool
-def retrieve_document(
-    document_id: str,
-    query: str,
-    top_k: int = 5,
-    user_id: str = "",
-) -> dict:
-    """
-    Retrieve relevant chunks from a document.
-
-    This tool performs vector retrieval only.
-    It does not generate an answer.
-
-    `user_id` is always injected by the calling application (never asked of
-    the end user) and is checked against the document's owner — a mismatch
-    returns the same "not found" error as a nonexistent document_id, so a
-    caller can't distinguish "wrong owner" from "doesn't exist".
-    """
-    logger.info(f"[RETRIEVAL] retrieve_document called")
-    logger.info(f"[RETRIEVAL] user_id: {user_id}, document_id: {document_id}, query: {query}, top_k: {top_k}")
-
-    if not query or not query.strip():
-        logger.error("[RETRIEVAL] Query is empty or None")
-        return {
-            "success": False,
-            "document_id": document_id,
-            "error": "Query parameter is required and cannot be empty"
-        }
-
-    result = retriever.retrieve(
-        document_id=document_id,
-        query=query,
-        top_k=top_k,
-        user_id=user_id or None,
-    )
-
-    if result.get("success"):
-        logger.info(f"[RETRIEVAL] Retrieved {result.get('chunks_count', 0)} chunks")
-    else:
-        logger.error(f"[RETRIEVAL] Retrieval failed: {result.get('error')}")
-
-    return result
-
-#@mcp.tool
-def get_document_info(document_id: str, user_id: str = "") -> dict:
-    """
-    Get enhanced metadata and information about a document.
-
-    Retrieves:
-    - Document name
-    - Total chunks
-    - Sections (if extracted)
-    - Hierarchy distribution (chunk levels)
-    - Total pages (if multi-page)
-    - Collection metadata
-
-    `user_id` is always injected by the calling application and checked
-    against the document's owner (see retrieve_document's docstring).
-
-    Args:
-        document_id: UUID of the document
-
-    Returns:
-        Dictionary with document metadata and statistics
-    """
-    logger.info(f"[RETRIEVAL] get_document_info called for document_id: {document_id}, user_id: {user_id}")
-
-    result = retriever.get_document_metadata(document_id, user_id=user_id or None)
-    
-    if result.get("success"):
-        logger.info(f"[RETRIEVAL] Retrieved metadata: {result.get('total_chunks', 0)} chunks")
-    else:
-        logger.error(f"[RETRIEVAL] Failed to get metadata: {result.get('error')}")
-    
-    return result
 
 
 @mcp.tool
@@ -177,15 +44,11 @@ def retrieve_document_v2(
     filters: dict | None = None,
 ) -> dict:
     """
-    LangChain-native equivalent of retrieve_document: hybrid retrieval
-    (dense Chroma similarity + BM25 keyword search, fused with
-    EnsembleRetriever) followed by cross-encoder reranking down to `top_k`.
-
-    Reads the v2 collection created by upload_and_index_document_v2 (the
-    indexing server's LangChain pipeline) — a document indexed only with
-    v1's upload_and_index_document will not be found here; use
-    retrieve_document for that. This performs retrieval only, no answer
-    synthesis.
+    Hybrid retrieval over one uploaded document (dense embedding similarity +
+    full-text keyword search, fused) followed by cross-encoder reranking down
+    to `top_k`. Retrieval only, no answer synthesis. To search several
+    documents (or all of the user's documents) at once, use
+    search_my_documents_v2 instead.
 
     Each returned chunk includes a `grounding` block
     (document_id/document_name/source/location/chunk_id/chunk_index/
@@ -197,7 +60,7 @@ def retrieve_document_v2(
     controlled by settings.rag_v2.neighbor_expansion/neighbor_window).
 
     `filters`: optional exact-match metadata filter applied to both the
-    dense and BM25 legs before ranking. Every chunk is tagged
+    dense and keyword legs before ranking. Every chunk is tagged
     chunk_content_type="table" or "prose" at index time, so if the user
     asks for tables specifically (e.g. "show me the tables in this doc",
     "what numbers are in the pricing table", "list only tabular data"),
@@ -210,9 +73,8 @@ def retrieve_document_v2(
     `top_k` is clamped to settings.rag_v2.max_top_k.
 
     `user_id` is always injected by the calling application (never asked of
-    the end user) and is checked against the v2 collection's owner — a
-    mismatch returns the same "not found" error as a nonexistent
-    document_id, exactly like retrieve_document.
+    the end user) and is checked against the document's owner — a mismatch
+    returns the same "not found" error as a nonexistent document_id.
     """
     logger.info(f"[RETRIEVAL_V2] retrieve_document_v2 called")
     logger.info(f"[RETRIEVAL_V2] user_id: {user_id}, document_id: {document_id}, query: {query}, top_k: {top_k}, filters: {filters}")
@@ -259,7 +121,7 @@ def get_table_of_contents_v2(document_id: str, user_id: str = "") -> dict:
     `pages`/`sheets` are populated instead.
 
     `user_id` is always injected by the calling application and checked
-    against the v2 collection's owner (see retrieve_document_v2's
+    against the document's owner (see retrieve_document_v2's
     docstring).
 
     Args:
@@ -284,13 +146,12 @@ def get_table_of_contents_v2(document_id: str, user_id: str = "") -> dict:
 @mcp.tool
 def get_document_info_v2(document_id: str, user_id: str = "") -> dict:
     """
-    LangChain-native equivalent of get_document_info: metadata and
-    statistics for a document indexed via upload_and_index_document_v2
+    Metadata and statistics for an uploaded, indexed document
     (total chunks, document name, content type, and page/sheet coverage
     when available).
 
     `user_id` is always injected by the calling application and checked
-    against the v2 collection's owner (see retrieve_document_v2's
+    against the document's owner (see retrieve_document_v2's
     docstring).
 
     Args:
@@ -319,7 +180,7 @@ def get_document_chunks_v2(
     page: int | None = None,
 ) -> dict:
     """
-    All chunks of a document's v2 collection, in original chunk_index
+    All chunks of an indexed document, in original chunk_index
     order, each with full text + metadata + grounding (chunk_id,
     chunk_content_type, page/sheet/row, h1/h2/h3, ...) — no query,
     scoring, or reranking.
@@ -328,14 +189,13 @@ def get_document_chunks_v2(
     click-through), not for answering questions — retrieve_document_v2's
     hybrid search is how to actually answer something from a document.
     (Registered as an MCP tool so the API server can call it, but not
-    offered to the chat agent's own tool list — see streaming_agent.py's
-    _INTERNAL_ONLY_TOOLS.)
+    offered to the chat model — see API_MODEL_TOOLS.)
 
     `chunk_id` or `page` narrows to one chunk / one page's chunks; leave
     both empty/unset to list the whole document.
 
     `user_id` is always injected by the calling application and checked
-    against the v2 collection's owner (see retrieve_document_v2's
+    against the document's owner (see retrieve_document_v2's
     docstring).
 
     Args:
@@ -364,28 +224,43 @@ def get_document_chunks_v2(
     return result
 
 
-#@mcp.tool
-def summarize_document(document_id: str, query: str) -> dict:
+@mcp.tool
+def search_my_documents_v2(
+    query: str,
+    document_ids: list[str] | None = None,
+    top_k: int = 8,
+    user_id: str = "",
+    filters: dict | None = None,
+) -> dict:
     """
-    Summarize a document using the provided query as context.
-    
-    Args:
-        document_id: UUID of the document to summarize
-        query: Context or question to guide the summary
-    Returns:
-        Dictionary with summary results
-    """
-    logger.info(f"[RETRIEVAL] summarize_document called for document_id: {document_id}")
-    
-    result = retriever.summarize_document(document_id, query)
-    
-    if result.get("success"):
-        logger.info(f"[RETRIEVAL] Summarization successful")
-    else:
-        logger.error(f"[RETRIEVAL] Summarization failed: {result.get('error')}")
-    
+    Search across several of the user's uploaded documents at once — or all
+    of them when `document_ids` is omitted — with the same hybrid search +
+    reranking as retrieve_document_v2. Use this when the question isn't
+    about one specific document ("which of my files mention X?", "compare
+    what my reports say about Y"), or when you don't know which document
+    holds the answer. Each returned chunk's `grounding.document_id` /
+    `grounding.document_name` says which document it came from.
 
+    `filters` works exactly as in retrieve_document_v2. `top_k` is clamped
+    to a server maximum. `user_id` is always injected by the calling
+    application; only that user's documents are ever searched, and naming a
+    document_id that isn't theirs returns a "not found" error.
+    """
+    logger.info(f"[RETRIEVAL_V2] search_my_documents_v2 user_id={user_id} document_ids={document_ids} query={query!r}")
+    result = retriever_v2.search_documents(
+        query=query,
+        user_id=user_id or None,
+        document_ids=document_ids or None,
+        top_k=top_k,
+        filters=filters or None,
+    )
+    if result.get("success"):
+        logger.info(f"[RETRIEVAL_V2] Searched {result.get('documents_searched', 0)} doc(s) -> {result.get('chunks_count', 0)} chunks")
+    else:
+        logger.error(f"[RETRIEVAL_V2] Cross-document search failed: {result.get('error')}")
     return result
+
+
 @mcp.tool
 def web_search(query: str, max_results: int | None = None) -> dict:
     """
@@ -464,9 +339,11 @@ def fetch_page(url: str) -> dict:
 
 
 if __name__ == "__main__":
+    # Make sure the `rag` schema exists (idempotent; see backend/core/db/migrate.py).
+    apply_migrations(settings.database.url)
+
     # MCP_TRANSPORT=stdio lets this server be launched as a subprocess
-    # (e.g. from servers.docker.json) instead of a standalone HTTP service —
-    # see backend/apps/client/servers.docker.json and the root Dockerfile.
+    # (e.g. from servers.docker.json) instead of a standalone HTTP service.
     if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
         mcp.run(transport="stdio")
     else:

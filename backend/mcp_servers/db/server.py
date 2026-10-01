@@ -8,6 +8,12 @@ Security model, in one sentence: the agent's intent is never trusted —
 structured tools generate their own SQL from validated identifiers, and the
 one tool that accepts raw SQL (query_data) runs it through an AST-based
 validator before anything reaches the database. See README.md.
+
+Every user gets a private workspace: their own Postgres schema
+(`ws_<hash of user_id>`), which every tool call is confined to. `user_id` is
+a parameter on every tool, always injected by the API from the signed-in
+session (never chosen by the model), and the server connects as a role with
+no access to the app's own `app`/`rag` schemas. See database/workspace.py.
 """
 
 import logging
@@ -28,6 +34,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from backend.mcp_servers.db.config.settings import get_settings
 from backend.mcp_servers.db.database.connection import get_database
+from backend.mcp_servers.db.database.workspace import use_workspace
 from backend.mcp_servers.db.errors import ValidationError, to_error_dict
 from backend.mcp_servers.db.models.mutations import DeleteDataRequest, InsertDataRequest, UpdateDataRequest
 from backend.mcp_servers.db.models.queries import QueryDataRequest
@@ -65,20 +72,25 @@ permissions = PermissionsConfig.load(settings.permissions_file)
 db = get_database(settings)
 
 
-def _handle(tool_name: str, fn, *args, table_hint: Optional[str] = None, **kwargs) -> dict[str, Any]:
-    """Shared call wrapper: request-id tracing, timing, and error translation.
+def _handle(tool_name: str, fn, *args, user_id: str, table_hint: Optional[str] = None, **kwargs) -> dict[str, Any]:
+    """Shared call wrapper: per-user workspace scoping, request-id tracing,
+    timing, and error translation.
 
-    Every tool goes through this so that (a) unexpected exceptions never leak
-    internals to the agent and (b) we get consistent structured logs without
-    duplicating the same try/except/log boilerplate six times.
+    Every tool goes through this so that (a) every database access in the
+    call is confined to the caller's own `ws_<hash>` schema (see
+    database/workspace.py), (b) unexpected exceptions never leak internals to
+    the agent and (c) we get consistent structured logs without duplicating
+    the same try/except/log boilerplate in every tool.
     """
 
     request_id = uuid.uuid4().hex[:12]
     started = time.monotonic()
-    logger.info("[%s] request_id=%s table=%s", tool_name, request_id, table_hint)
+    logger.info("[%s] request_id=%s user=%s table=%s", tool_name, request_id, user_id, table_hint)
 
     try:
-        result = fn(*args, **kwargs)
+        with use_workspace(user_id) as schema:
+            db.ensure_schema(schema)
+            result = fn(*args, **kwargs)
         elapsed_ms = (time.monotonic() - started) * 1000
         logger.info(
             "[%s] request_id=%s success elapsed_ms=%.1f rows=%s affected=%s",
@@ -96,20 +108,21 @@ def _handle(tool_name: str, fn, *args, table_hint: Optional[str] = None, **kwarg
 
 
 @mcp.tool
-def list_tables() -> dict:
-    """List tables that exist in this PostgreSQL database, with which operations
-    (select/insert/update/delete/schema_change) are currently permitted on each per
-    permissions.yaml. Tables with no permitted operation at all are omitted.
+def list_tables(user_id: str = "") -> dict:
+    """List the tables in the user's own workspace (each user has a private set
+    of tables; other users' tables are never visible), with which operations
+    (select/insert/update/delete/schema_change) are permitted on each per
+    permissions.yaml.
 
     Call this FIRST before create_table (to check whether a table you want already
     exists) or before insert_data/update_data/delete_data (to confirm you're allowed
     to write to it) — don't guess table names.
     """
-    return _handle("list_tables", _list_tables, permissions=permissions, db=db)
+    return _handle("list_tables", _list_tables, permissions=permissions, db=db, user_id=user_id)
 
 
 @mcp.tool
-def describe_table(table: str) -> dict:
+def describe_table(table: str, user_id: str = "") -> dict:
     """Describe an existing table's real columns: logical type (STRING, INTEGER,
     FLOAT, BOOLEAN, or DATETIME — the same vocabulary create_table accepts), the
     underlying Postgres type, nullability, default value, and primary-key flag.
@@ -120,7 +133,7 @@ def describe_table(table: str) -> dict:
     """
     return _handle(
         "describe_table", _describe_table, table,
-        permissions=permissions, db=db, table_hint=table,
+        permissions=permissions, db=db, table_hint=table, user_id=user_id,
     )
 
 
@@ -130,6 +143,7 @@ def create_table(
     columns: list[ColumnDef],
     indexes: Optional[list[IndexDef]] = None,
     if_exists: str = "fail",
+    user_id: str = "",
 ) -> dict:
     """Create a new table in the PostgreSQL database from a structured schema definition.
 
@@ -152,12 +166,12 @@ def create_table(
     request = CreateTableRequest(table=table, columns=columns, indexes=indexes or [], if_exists=if_exists)
     return _handle(
         "create_table", _create_table, request,
-        settings=settings, permissions=permissions, db=db, table_hint=table,
+        settings=settings, permissions=permissions, db=db, table_hint=table, user_id=user_id,
     )
 
 
 @mcp.tool
-def update_table_definition(table: str, operations: list[SchemaOperation]) -> dict:
+def update_table_definition(table: str, operations: list[SchemaOperation], user_id: str = "") -> dict:
     """Modify an existing table's schema using structured operations.
 
     Supported operations: add_column, drop_column, rename_column,
@@ -173,12 +187,12 @@ def update_table_definition(table: str, operations: list[SchemaOperation]) -> di
     request = UpdateTableDefinitionRequest(table=table, operations=operations)
     return _handle(
         "update_table_definition", _update_table_definition, request,
-        settings=settings, permissions=permissions, db=db, table_hint=table,
+        settings=settings, permissions=permissions, db=db, table_hint=table, user_id=user_id,
     )
 
 
 @mcp.tool
-def insert_data(table: str, records: list[dict], returning: bool = True) -> dict:
+def insert_data(table: str, records: list[dict], returning: bool = True, user_id: str = "") -> dict:
     """Insert one or more records into a table using parameterized SQL.
 
     `records` is a list of `{"column": value}` dicts; every record must use
@@ -190,7 +204,7 @@ def insert_data(table: str, records: list[dict], returning: bool = True) -> dict
     request = InsertDataRequest(table=table, records=records, returning=returning)
     return _handle(
         "insert_data", _insert_data, request,
-        settings=settings, permissions=permissions, db=db, table_hint=table,
+        settings=settings, permissions=permissions, db=db, table_hint=table, user_id=user_id,
     )
 
 
@@ -201,6 +215,7 @@ def update_data(
     filter: Optional[dict] = None,
     allow_full_table_update: bool = False,
     returning: bool = False,
+    user_id: str = "",
 ) -> dict:
     """Update records matching a structured filter.
 
@@ -218,7 +233,7 @@ def update_data(
     )
     return _handle(
         "update_data", _update_data, request,
-        settings=settings, permissions=permissions, db=db, table_hint=table,
+        settings=settings, permissions=permissions, db=db, table_hint=table, user_id=user_id,
     )
 
 
@@ -228,6 +243,7 @@ def delete_data(
     filter: Optional[dict] = None,
     allow_full_table_delete: bool = False,
     confirm: bool = False,
+    user_id: str = "",
 ) -> dict:
     """Delete records matching a structured filter.
 
@@ -244,12 +260,12 @@ def delete_data(
     )
     return _handle(
         "delete_data", _delete_data, request,
-        settings=settings, permissions=permissions, db=db, table_hint=table,
+        settings=settings, permissions=permissions, db=db, table_hint=table, user_id=user_id,
     )
 
 
 @mcp.tool
-def query_data(sql: str, parameters: Optional[list] = None) -> dict:
+def query_data(sql: str, parameters: Optional[list] = None, user_id: str = "") -> dict:
     """Run a postgres read-only SQL query (SELECT, with JOIN/WHERE/GROUP BY/HAVING/
     ORDER BY/LIMIT/OFFSET/CTEs) and return the matching rows.
 
@@ -270,7 +286,7 @@ def query_data(sql: str, parameters: Optional[list] = None) -> dict:
     request = QueryDataRequest(sql=sql, parameters=parameters or [])
     return _handle(
         "query_data", _query_data, request,
-        settings=settings, permissions=permissions, db=db,
+        settings=settings, permissions=permissions, db=db, user_id=user_id,
     )
 
 

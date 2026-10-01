@@ -43,8 +43,9 @@ odfpy>=1.4,<2
 # --- v2 (LangChain) pipeline: upload_and_index_document_v2 / delete_document_v2 ---
 # (backend/mcp_servers/indexing/langchain_loaders.py, langchain_pipeline.py)
 #
-# langchain-chroma/langchain-text-splitters/langchain-core carry the actual
-# v2 indexing path (loaders -> splitter -> Chroma). langchain-openai and
+# langchain-text-splitters/langchain-core carry the actual v2 indexing path
+# (loaders -> splitter -> embeddings -> Postgres via
+# backend/core/vector_store/pg_store.py). langchain-openai and
 # langchain-ollama back get_langchain_embedding (backend/config/llm_client.py) —
 # OpenAI in PROD, Ollama in DEV, mirroring the llama_index embedding switch.
 #
@@ -65,7 +66,6 @@ odfpy>=1.4,<2
 langchain-core>=0.3,<0.4
 langchain-text-splitters>=0.3,<0.4
 langchain-community>=0.3,<0.4
-langchain-chroma>=0.2,<0.3
 langchain-openai>=0.3,<0.4
 langchain-ollama>=0.3,<0.4
 docx2txt>=0.8,<1

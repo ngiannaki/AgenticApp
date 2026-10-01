@@ -177,8 +177,14 @@ class SqlValidator:
             schema = (table.db or "").lower()
             if schema and schema in _DISALLOWED_SCHEMAS:
                 raise AuthorizationError(f"Access to schema '{schema}' is not permitted.")
-            if schema and schema != "public":
-                raise AuthorizationError(f"Access to schema '{schema}' is not permitted; only 'public' is allowed.")
+            if schema or table.catalog:
+                # Every user works in their own schema (search_path is pinned to
+                # it per call — see database/workspace.py), so a qualified name
+                # can only ever be an attempt to reach someone else's tables or
+                # the app's own `app`/`rag` schemas.
+                raise AuthorizationError(
+                    "Schema-qualified table names are not permitted; refer to tables by name only."
+                )
 
             name = table.name
             if not name:

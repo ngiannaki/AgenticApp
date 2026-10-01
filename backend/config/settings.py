@@ -203,8 +203,64 @@ class ApiSettings(BaseSettings):
         description=(
             "Tool names that always pause for human approval before executing. "
             "Use ['*'] to require approval for every tool call by default. "
-            "Sessions may override this at creation time."
+            "Sessions may override this at creation time — but only on top of "
+            "mandatory_approval_tools below, which no session can opt out of."
         ),
+    )
+
+    mandatory_approval_tools: list[str] = Field(
+        default_factory=lambda: [
+            "db_create_table",
+            "db_update_table_definition",
+            "db_insert_data",
+            "db_update_data",
+            "db_delete_data",
+        ],
+        description=(
+            "Tools that always pause for human approval, regardless of what a "
+            "session asked for at creation time. Server-side policy: a client can "
+            "add tools to its session's approval list but never remove these."
+        ),
+    )
+
+    model_tools: list[str] = Field(
+        default_factory=lambda: [
+            "retrieval_retrieve_document_v2",
+            "retrieval_get_table_of_contents_v2",
+            "retrieval_get_document_info_v2",
+            "retrieval_search_my_documents_v2",
+            "retrieval_web_search",
+            "retrieval_fetch_page",
+            "db_list_tables",
+            "db_describe_table",
+            "db_create_table",
+            "db_update_table_definition",
+            "db_insert_data",
+            "db_update_data",
+            "db_delete_data",
+            "db_query_data",
+            "code_run_python_code",
+            "code_check_python_syntax",
+            "code_profile_spreadsheet",
+            "code_run_python_code_on_document",
+            "code_generate_file",
+            "code_generate_ui",
+        ],
+        description=(
+            "Allowlist of MCP tools (aggregated '<server>_<tool>' names) the chat "
+            "model is shown and may call. Anything else an MCP server registers "
+            "stays callable by the API itself (routers/files.py's upload/delete/"
+            "chunk-listing calls) but is invisible to the model — so a new tool, "
+            "or one taking a server-local file_path (indexing_upload_document), "
+            "never becomes model-reachable by accident. Use ['*'] to expose every "
+            "tool (local single-user debugging only)."
+        ),
+    )
+
+    tool_call_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="Hard ceiling on a single model-initiated MCP tool call before it's reported back to the model as a timeout.",
     )
 
     interrupt_heartbeat_seconds: float = 15.0
@@ -215,12 +271,6 @@ class ApiSettings(BaseSettings):
 
     session_idle_timeout_seconds: float = 3600.0
     """Sessions untouched for this long are evicted by the periodic cleanup task."""
-
-    mongo_url: str = "mongodb://localhost:27017"
-    """MongoDB connection string used to durably store conversations/messages."""
-
-    mongo_db_name: str = "agentic_chat"
-    """MongoDB database name for conversation persistence."""
 
     skills_enabled: bool = Field(
         default=True,
@@ -243,8 +293,13 @@ class DbMcpSettings(BaseSettings):
 
     # --- Connectivity -----------------------------------------------------
     database_url: str = Field(
-        default="postgresql://postgres:postgres@localhost:5432/postgres",
-        description="PostgreSQL connection string (libpq/psycopg URI).",
+        default="postgresql://agent_ws:changeme-agent@localhost:5432/ragdb",
+        description=(
+            "PostgreSQL connection string for the DB MCP server. Connect as the "
+            "restricted agent role (DATABASE_AGENT_ROLE), never the app's own role: "
+            "the agent role can't see the app/rag schemas, only the per-user "
+            "ws_<hash> workspace schemas this server creates."
+        ),
     )
     pool_min_size: int = Field(default=1, ge=0)
     pool_max_size: int = Field(default=10, ge=1)
@@ -301,6 +356,7 @@ class CodeMcpSettings(BaseSettings):
     )
 
     _normalize_python_executable = field_validator("python_executable", mode="before")(_blank_to_none)
+    _normalize_file_source_url = field_validator("file_source_url", mode="before")(_blank_to_none)
 
     @field_validator("python_executable", mode="after")
     @classmethod
@@ -320,6 +376,38 @@ class CodeMcpSettings(BaseSettings):
     env_passthrough: list[str] = Field(
         default_factory=lambda: ["PATH", "SYSTEMROOT", "TEMP", "TMP", "PATHEXT", "USERPROFILE", "HOME"],
         description="Host environment variables forwarded into the executed subprocess. Everything else (API keys, DB URLs, ...) is stripped so submitted code can't read backend secrets via os.environ. USERPROFILE/HOME are included so libraries that cache to a home-relative dir (e.g. matplotlib's font cache) don't rebuild it on every run.",
+    )
+
+    # --- OS-level isolation (Linux; see execution/sandbox.py) ---------------------
+    isolation: str = Field(
+        default="auto",
+        description=(
+            "'uid': run each submission as its own unprivileged user (one of the runner "
+            "uids below, never shared by two concurrent runs) with resource limits — needs "
+            "this server to run as root on Linux, as it does in the code-sandbox container. "
+            "'none': run as this server's own user (local Windows/dev only). 'auto': 'uid' "
+            "when possible, else 'none' with a warning."
+        ),
+    )
+    require_isolation: bool = Field(
+        default=False,
+        description="Refuse to run any code unless uid isolation is active. Set in the code-sandbox container so a misconfiguration fails closed.",
+    )
+    runner_uid_start: int = Field(default=20001, gt=0, description="First uid of the runner pool.")
+    runner_uid_count: int = Field(default=8, gt=0, description="Runner pool size = max concurrent code runs.")
+    runner_wait_seconds: float = Field(default=30.0, ge=0, description="How long a run waits for a free runner before failing as busy.")
+    max_memory_mb: int = Field(default=2048, gt=0, description="Address-space limit per run (RLIMIT_AS).")
+    max_processes: int = Field(default=64, gt=0, description="Process/thread limit per run (RLIMIT_NPROC, uid isolation only).")
+    max_file_size_mb: int = Field(default=200, gt=0, description="Largest file a run may write (RLIMIT_FSIZE).")
+
+    file_source_url: str | None = Field(
+        default=None,
+        description=(
+            "Where spreadsheet tools fetch an attached document from: the API's internal "
+            "one-time file endpoint (e.g. http://app:8100/internal/files). The API puts a "
+            "single-use `file_token` in each call; this server never sees the shared "
+            "document folder. Unset = read from the local document store (non-container dev)."
+        ),
     )
 
     # --- Generated-file capture (plots, CSVs, ...) --------------------------------
@@ -409,21 +497,35 @@ class RetrievalAgentSettings(BaseSettings):
     port: int = 9999
 
 
-class VectorStoreSettings(BaseSettings):
-    """Chroma is run as its own server process (see start_mcp_servers.ps1)
-    rather than opened in-process via PersistentClient, because the indexing
-    and retrieval MCP servers are two separate long-lived processes — two
-    independent PersistentClient instances against the same on-disk store
-    don't reliably see each other's writes (Chroma's embedded client caches
-    collection state per-process), so a document indexed after the retrieval
-    server started could look like it doesn't exist. Routing both through one
-    HttpClient/server gives them a single consistent view."""
+class DatabaseSettings(BaseSettings):
+    """The one Postgres (with pgvector) behind everything: users, auth
+    tokens, conversations, the document registry (schema `app`), document
+    chunks + embeddings (schema `rag`), and each user's private DB-tool
+    workspace (`ws_<hash>` schemas, reached only through the DB MCP server's
+    own restricted role — see DbMcpSettings.database_url).
 
-    model_config = _settings_config("VECTOR_STORE_")
+    Used by the API and the indexing/retrieval MCP servers. The API applies
+    backend/migrations/*.sql at startup (see backend/core/db/migrate.py).
+    """
 
-    dir: str = "data/vector_store"
-    host: str = "localhost"
-    port: int = 8010
+    model_config = _settings_config("DATABASE_")
+
+    url: str = "postgresql://raguser:changeme@localhost:5432/ragdb"
+    """Connection string for the app's own role. Must be able to CREATE
+    schemas/extensions on first start (the compose/ps1 Postgres container's
+    POSTGRES_USER is)."""
+
+    pool_min_size: int = Field(default=1, ge=0)
+    pool_max_size: int = Field(default=10, gt=0)
+
+    agent_role: str = "agent_ws"
+    """Login role the DB MCP server connects as. Has no access to the `app`
+    or `rag` schemas — only to the per-user workspace schemas it creates."""
+
+    agent_role_password: str | None = None
+    """When set, API startup creates/updates `agent_role` with this password
+    (idempotent). Must match the password in DB_MCP_DATABASE_URL. Leave unset
+    to manage that role yourself."""
 
 
 class DocumentStoreSettings(BaseSettings):
@@ -449,17 +551,12 @@ class RerankingSettings(BaseSettings):
 
 class LangchainRagSettings(BaseSettings):
     """Config for the LangChain-based v2 indexing/retrieval tools
-    (backend/mcp_servers/indexing, retrieval `..._v2` tools).
-
-    This is a parallel pipeline to the llama_index-based v1 tools, not a
-    replacement — it writes/reads its own Chroma collections (named
-    `collection_prefix + document_id`) on the same Chroma server, so v1 and
-    v2 never see each other's data.
+    (backend/mcp_servers/indexing, retrieval `..._v2` tools), which store
+    chunks + embeddings in Postgres (schema `rag`, see
+    backend/core/vector_store/pg_store.py).
     """
 
     model_config = _settings_config("RAG_V2_")
-
-    collection_prefix: str = "docv2_"
 
     # --- Parsing (indexing) ---------------------------------------------------
     pdf_engine: str = Field(
@@ -481,8 +578,8 @@ class LangchainRagSettings(BaseSettings):
     max_top_k: int = Field(default=25, gt=0, description="Hard ceiling on top_k accepted from a caller.")
     fetch_k_multiplier: int = Field(default=6, gt=0, description="Each of the dense/sparse retrievers fetches top_k * this many candidates before ensembling/reranking.")
     max_fetch_k: int = Field(default=60, gt=0, description="Hard ceiling on the fetch_k computed above.")
-    dense_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the vector (Chroma) retriever.")
-    sparse_weight: float = Field(default=0.5, ge=0, description="EnsembleRetriever weight for the keyword (BM25) retriever.")
+    dense_weight: float = Field(default=0.5, ge=0, description="Reciprocal-rank-fusion weight for the dense (pgvector cosine) leg.")
+    sparse_weight: float = Field(default=0.5, ge=0, description="Reciprocal-rank-fusion weight for the keyword (Postgres full-text) leg.")
     use_reranker: bool = Field(default=True, description="Rerank the ensembled candidates with a cross-encoder before truncating to top_k.")
     rerank_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-12-v2", description="HuggingFace cross-encoder model id used by the reranker.")
 
@@ -548,7 +645,7 @@ class Settings:
         self.indexing_server = IndexingServerSettings()
         self.retrieval_server = RetrievalServerSettings()
         self.retrieval_agent = RetrievalAgentSettings()
-        self.vector_store = VectorStoreSettings()
+        self.database = DatabaseSettings()
         self.document_store = DocumentStoreSettings()
         self.artifact_store = ArtifactStoreSettings()
         self.reranking = RerankingSettings()

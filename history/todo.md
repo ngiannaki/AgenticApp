@@ -235,3 +235,36 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ✅ Added backend/tests/test_identifier_validator.py (18 cases) covering the SQL identifier allowlist/quoting module, plus [tool.pytest.ini_options] in backend/pyproject.toml and a new `pytest` job in .github/workflows/ci.yml — all run locally first (18 passed, 0.04s) before wiring into CI
 - ⬜ Only one module has real test coverage so far — identifier_validator.py was picked as a deliberately easy, dependency-free, security-relevant starting point, not because it's the only thing worth testing. Good next candidates once this pattern is proven out: sql_validator.py (query-shape validation, also stdlib-ish), permissions.py (table/column access control), and streaming_agent.py's new _looks_like_broken_connection (2026-10-01 entry above) — that last one would need fastmcp/anyio installed in CI though, unlike today's zero-dependency module
 - ⬜ Not yet confirmed green on an actual GitHub Actions run with the new pytest job included — push and check the Actions tab
+
+## 2026-10-01
+- ✅ Phase 0 (multi-user hardening): model tool allowlist, central document-ownership guard on tool calls, retrieval denies ownerless collections, auth and owner checks on interrupts/questions/tools/session-delete, server-enforced mandatory approvals for DB writes, no client system_prompt override, sandbox CSP + nosniff on artifacts, malformed tool-args handling, tool-call timeout
+- ✅ Frontend: Approve/Reject card for paused tool calls (needed now that DB writes always require approval)
+- ✅ 12 access-control pytest cases + CI installs backend/requirements-test.txt
+- ⬜ Not yet verified live end to end (running stack + real LLM): ask the chat to call `indexing_upload_document` and confirm it's refused; confirm a `db_insert_data` call shows the Approve/Reject card and both buttons work
+- ⬜ Phase 1: one Postgres (pgvector) replacing Mongo + Chroma; per-user DB workspaces; migrate_mongo_to_pg.py + reindex_all.py
+- ⬜ Phase 2: code sandbox container (separate uid for user code, no network, no secrets, file pull via signed token)
+- ⬜ Phase 3: compose all-HTTP topology + internal MCP token + Caddy (VM) / cloudflared (PC) profiles + ps1/nginx parity + same-origin frontend
+- ⬜ Phase 4: invite-only signup, hashed expiring tokens, login rate limit, per-user quotas, background indexing, token streaming
+- ⬜ Phase 5: A2A agents service (Deep Research + Data Analyst) + /api/tasks
+- ⬜ Phase 6: frontend /research and /analyst pages
+- ⬜ Phase 7: full pytest/sandbox tests in CI, ruff, dead-code cleanup, docs consolidation
+
+## 2026-10-01
+- ✅ Phase 1: one Postgres (pgvector) replaces MongoDB + Chroma (app / rag / per-user ws_* schemas, migration runner, db_setup script)
+- ✅ Hybrid retrieval in SQL (pgvector + full-text, RRF fusion, real cross-encoder scores) + new retrieval_search_my_documents_v2 across a user's documents
+- ✅ Per-user private DB-tool workspaces + restricted agent_ws role; Data page shows only the user's own tables
+- ✅ migrate_mongo_to_pg.py + reindex_all.py so existing data and documents carry over without re-uploading
+- ✅ ps1 and compose switched to pgvector/pgvector:pg16; CI runs the Postgres integration tests
+- ⬜ Run once locally on real data: `docker compose up --build` (or ps1), then migrate_mongo_to_pg + reindex_all, then upload a PDF and ask a cited question — confirms the real Docling/embedding/cross-encoder path that tests faked
+- ⬜ Agent-created tables from before this change remain in the old `public` schema (invisible now) — copy any still needed into the owner's workspace by hand, or drop them
+- ⬜ Older root docs (HOW_TO_RUN_SERVERS.md, QUICK_START.md, ENHANCED_METADATA.md, RAG_IMPROVEMENTS_SUMMARY.md) still describe Chroma/Mongo — consolidate in Phase 7
+- ⬜ Phase 2: code sandbox container
+
+## 2026-10-01
+- ✅ Phase 2: code sandbox container (no secrets, read-only, minimal caps, limits, internal network) + per-run unprivileged uid with rlimits and leftover-process cleanup
+- ✅ Fixed: a background process left by submitted code could hang the code server forever (output pipe held open)
+- ✅ Generated files returned inline and stored by the API; spreadsheets fetched by the sandbox with one-time tokens; user_id/file_token hidden from the model's tool schemas
+- ✅ CI: sandbox isolation tests under sudo + build/run the real image and smoke-test it
+- ⬜ Locally: `docker compose up --build`, attach a spreadsheet in chat, ask for a sum and a chart; optionally `docker exec -i <code-sandbox container> python - < docker/sandbox/smoke_test.py`
+- ⬜ ps1 mode: set a real Postgres password (the sandbox can reach host ports there); compose mode is the fully isolated one
+- ⬜ Phase 3: compose all-HTTP topology + internal MCP token + Caddy / cloudflared + same-origin frontend

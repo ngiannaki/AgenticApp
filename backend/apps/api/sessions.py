@@ -114,6 +114,11 @@ class ChatSession:
         )
 
     def requires_approval(self, tool_name: str) -> bool:
+        # mandatory_approval_tools is server policy, checked live rather than
+        # merged into approval_required_tools at creation, so a session's own
+        # (client-supplied) list can only ever add to it, never remove from it.
+        if tool_name in app_settings.api.mandatory_approval_tools:
+            return True
         return "*" in self.approval_required_tools or tool_name in self.approval_required_tools
 
     def new_interrupt(self, call_id: str, tool_name: str, arguments: dict[str, Any]) -> PendingInterrupt:

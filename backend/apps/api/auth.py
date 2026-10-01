@@ -1,10 +1,11 @@
 """Email/password auth.
 
-Accounts and bearer tokens are stored in the same MongoDB database already
-used for conversation persistence (backend.apps.api.persistence) — two more
-collections, `users` and `auth_tokens`. Tokens are opaque random strings, not
-JWTs: a token is just a lookup key into `auth_tokens`, so revoking one (logout)
-is a single delete, and there's nothing to verify a signature on.
+Accounts and bearer tokens live in Postgres (app.users / app.auth_tokens,
+see backend/migrations/0001_init.sql). Tokens are opaque random strings, not
+JWTs: a token is a lookup key, so revoking one (logout) is a single delete.
+Only a SHA-256 of each token is stored — the raw token exists only in the
+client — so a database leak doesn't hand out live sessions. Emails are
+stored lowercased so "Alice@x.com" and "alice@x.com" are one account.
 
 AUTH_DEV_BYPASS=true (backend.config.settings.auth.dev_bypass) short-circuits
 all of this: every request is treated as one seeded test account, no header
@@ -13,17 +14,18 @@ so it exists before the first bypassed request needs it.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
-import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
 
 import bcrypt
+import psycopg
 from fastapi import HTTPException, Request
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from psycopg_pool import ConnectionPool
+
+from backend.core.db import run_sync
 
 logger = logging.getLogger("agentic_api")
 
@@ -46,38 +48,38 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
 class UserStore:
-    """Async repository over the `users` and `auth_tokens` collections."""
+    """Repository over app.users and app.auth_tokens."""
 
-    def __init__(self, client: AsyncIOMotorClient, db: AsyncIOMotorDatabase) -> None:
-        self.client = client
-        self._users = db["users"]
-        self._tokens = db["auth_tokens"]
-
-    @classmethod
-    async def connect(cls, client: AsyncIOMotorClient, db: AsyncIOMotorDatabase) -> "UserStore":
-        store = cls(client, db)
-        await store._ensure_indexes()
-        return store
-
-    async def _ensure_indexes(self) -> None:
-        await self._users.create_index("email", unique=True)
+    def __init__(self, pool: ConnectionPool) -> None:
+        self.pool = pool
 
     async def signup(self, email: str, password: str) -> tuple[str, str]:
         """Create a new account. Returns (user_id, token). Raises HTTPException(409) on duplicate email."""
+        email = normalize_email(email)
         user_id = str(uuid.uuid4())
+        password_hash = await run_sync(hash_password, password)
+
+        def _insert() -> None:
+            with self.pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO app.users (id, email, password_hash) VALUES (%s, %s, %s)",
+                    (user_id, email, password_hash),
+                )
+
         try:
-            await self._users.insert_one(
-                {
-                    "_id": user_id,
-                    "email": email,
-                    "password_hash": hash_password(password),
-                    "created_at": time.time(),
-                }
-            )
-        except DuplicateKeyError:
+            await run_sync(_insert)
+        except psycopg.errors.UniqueViolation:
             raise HTTPException(status_code=409, detail="An account with this email already exists")
-        except PyMongoError:
+        except psycopg.Error:
             logger.exception("Failed to create account for %s", email)
             raise HTTPException(status_code=503, detail="Could not create account")
         token = await self._issue_token(user_id)
@@ -86,69 +88,80 @@ class UserStore:
 
     async def login(self, email: str, password: str) -> tuple[str, str]:
         """Verify credentials. Returns (user_id, token). Raises HTTPException(401) on mismatch."""
+        email = normalize_email(email)
+
+        def _find():
+            with self.pool.connection() as conn:
+                return conn.execute(
+                    "SELECT id, password_hash FROM app.users WHERE email = %s", (email,)
+                ).fetchone()
+
         try:
-            doc = await self._users.find_one({"email": email})
-        except PyMongoError:
+            row = await run_sync(_find)
+        except psycopg.Error:
             logger.exception("Failed to look up account for %s", email)
             raise HTTPException(status_code=503, detail="Could not verify credentials")
-        if doc is None or not verify_password(password, doc["password_hash"]):
+        if row is None or not await run_sync(verify_password, password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        token = await self._issue_token(doc["_id"])
-        logger.info("[AUTH] User %s (%s) logged in", doc["_id"], email)
-        return doc["_id"], token
+        token = await self._issue_token(row["id"])
+        logger.info("[AUTH] User %s (%s) logged in", row["id"], email)
+        return row["id"], token
 
     async def logout(self, token: str) -> None:
+        def _delete() -> None:
+            with self.pool.connection() as conn:
+                conn.execute("DELETE FROM app.auth_tokens WHERE token_hash = %s", (hash_token(token),))
+
         try:
-            await self._tokens.delete_one({"_id": token})
-        except PyMongoError:
+            await run_sync(_delete)
+        except psycopg.Error:
             logger.exception("Failed to delete auth token on logout")
 
     async def resolve_token(self, token: str) -> AuthUser | None:
+        def _resolve():
+            with self.pool.connection() as conn:
+                return conn.execute(
+                    "SELECT u.id, u.email FROM app.auth_tokens t JOIN app.users u ON u.id = t.user_id"
+                    " WHERE t.token_hash = %s AND (t.expires_at IS NULL OR t.expires_at > now())",
+                    (hash_token(token),),
+                ).fetchone()
+
         try:
-            token_doc = await self._tokens.find_one({"_id": token})
-        except PyMongoError:
+            row = await run_sync(_resolve)
+        except psycopg.Error:
             logger.exception("Failed to resolve auth token")
             return None
-        if token_doc is None:
-            return None
-        try:
-            user_doc = await self._users.find_one({"_id": token_doc["user_id"]})
-        except PyMongoError:
-            logger.exception("Failed to load user for token")
-            return None
-        if user_doc is None:
-            return None
-        return AuthUser(user_id=user_doc["_id"], email=user_doc["email"])
+        return AuthUser(user_id=row["id"], email=row["email"]) if row else None
 
     async def seed_dev_user(self, email: str, password: str) -> AuthUser:
         """Idempotently ensure the dev-bypass account exists. Returns it either way."""
-        try:
-            existing = await self._users.find_one({"email": email})
-        except PyMongoError:
-            logger.exception("Failed to check for dev bypass user %s", email)
-            existing = None
-        if existing is not None:
-            return AuthUser(user_id=existing["_id"], email=email)
+        email = normalize_email(email)
+        password_hash = await run_sync(hash_password, password)
 
-        user_id = str(uuid.uuid4())
-        try:
-            await self._users.insert_one(
-                {
-                    "_id": user_id,
-                    "email": email,
-                    "password_hash": hash_password(password),
-                    "created_at": time.time(),
-                }
-            )
-            logger.info("[AUTH] Seeded dev bypass account %s (%s)", user_id, email)
-        except DuplicateKeyError:
-            existing = await self._users.find_one({"email": email})
-            return AuthUser(user_id=existing["_id"], email=email)
-        return AuthUser(user_id=user_id, email=email)
+        def _upsert():
+            with self.pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO app.users (id, email, password_hash) VALUES (%s, %s, %s)"
+                    " ON CONFLICT (email) DO NOTHING",
+                    (str(uuid.uuid4()), email, password_hash),
+                )
+                return conn.execute("SELECT id FROM app.users WHERE email = %s", (email,)).fetchone()
+
+        row = await run_sync(_upsert)
+        logger.info("[AUTH] Dev bypass account is %s (%s)", row["id"], email)
+        return AuthUser(user_id=row["id"], email=email)
 
     async def _issue_token(self, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
-        await self._tokens.insert_one({"_id": token, "user_id": user_id, "created_at": time.time()})
+
+        def _insert() -> None:
+            with self.pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO app.auth_tokens (token_hash, user_id) VALUES (%s, %s)",
+                    (hash_token(token), user_id),
+                )
+
+        await run_sync(_insert)
         return token
 
 

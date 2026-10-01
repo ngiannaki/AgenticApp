@@ -16,31 +16,35 @@ connection; a prompt injection or a hallucinated tool call cannot talk its
 way past that pipeline the way it might talk its way past an LLM-based
 "is this query safe?" check.
 
+## Per-user workspaces
+
+Every user gets a private Postgres schema, `ws_<hash of their user id>`
+(see `database/workspace.py`). Every tool takes a `user_id` — always injected
+by the API from the signed-in session, never chosen by the model — and the
+whole call runs inside that user's schema: introspection only looks there,
+writes run with `search_path` pinned to it, and `query_data` rejects any
+schema-qualified name. One user can never see or touch another user's
+tables.
+
+The server connects as its own restricted role (`DATABASE_AGENT_ROLE`,
+default `agent_ws`) which has no access to the app's own `app` (users,
+chats) and `rag` (document vectors) schemas — even a bug in the validator
+couldn't read them. The API creates that role at startup from
+`DATABASE_AGENT_ROLE_PASSWORD`.
+
 ## Setup
 
-1. **Install dependencies** (not yet in a shared manifest anywhere in this
-   repo — see `requirements.txt`):
-   ```
-   .venv/Scripts/python.exe -m pip install -r backend/mcp_servers/db/requirements.txt
-   ```
-2. **Point at a PostgreSQL database** and copy the env example:
-   ```
-   cp backend/mcp_servers/db/.env.example backend/mcp_servers/db/.env
-   # edit DB_MCP_DATABASE_URL, review the safety switches
-   ```
-3. **Configure permissions** (deny-by-default — nothing works until a table
-   is listed):
-   ```
-   cp backend/mcp_servers/db/permissions.example.yaml backend/mcp_servers/db/permissions.yaml
-   # edit to match your schema; keep protected_tables pointed at your
-   # ingestion internals (chunks, embeddings, document_versions, ...)
-   ```
-4. **Create the schema.** There is no migration framework anywhere in this
-   repo (no alembic, no ORM in active use), so pick one:
-   - Run the reference SQL once: `psql "$DB_MCP_DATABASE_URL" -f backend/mcp_servers/db/migrations/0001_init.sql`
-   - Or call the `create_table` tool once per table — it produces equivalent
-     DDL through the same code path as this file, generated rather than
-     hand-written.
+Normally nothing to do: `docker compose up` or `start_mcp_servers.ps1` start
+Postgres (pgvector image), run the migrations and create the role. By hand:
+
+1. **Install dependencies**: `pip install -r backend/mcp_servers/db/requirements.txt`
+2. **Prepare the database**: `python -m backend.scripts.db_setup` (reads
+   `DATABASE_URL` / `DATABASE_AGENT_ROLE_PASSWORD` from `backend/.env`).
+3. **Point this server at the restricted role**: `DB_MCP_DATABASE_URL=postgresql://agent_ws:<password>@localhost:5432/ragdb`
+4. **Permissions** (`permissions.yaml`): inside a user's own workspace
+   everything is allowed by default; writes are still gated by the API's
+   mandatory human approval (`API_MANDATORY_APPROVAL_TOOLS`). See
+   `permissions.example.yaml` for per-table rules.
 5. **Run the server** (matches how `indexing`/`retrieval` are started; see
    the repo's `start_mcp_servers.ps1` / `HOW_TO_RUN_SERVERS.md`):
    ```
@@ -91,7 +95,8 @@ length check -> parse (sqlglot, postgres dialect) -> single-statement check
    of an overall SELECT)
 -> dangerous-function denylist (pg_sleep, pg_read_file, dblink, lo_*,
    pg_terminate_backend, set_config, xpath, ...)
--> table authorization (schema must be 'public', table must exist, must have
+-> table authorization (no schema-qualified names, table must exist in the
+   caller's own workspace, must have
    'select' permission, table count under the configured limit)
 -> column authorization (per-table deny_columns; SELECT * blocked when a
    referenced table has any denied columns, since * can't be filtered)

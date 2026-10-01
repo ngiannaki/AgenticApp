@@ -32,6 +32,34 @@ code says:
 5. **Output is size-capped** (`CODE_MCP_MAX_OUTPUT_BYTES`); a run that
    produces more stdout/stderr than that is truncated, never buffered
    without bound.
+6. **Runs as its own unprivileged user, with resource limits** (Linux, when
+   this server runs as root — the `code-sandbox` container). Each run takes
+   a uid from a small pool (`CODE_MCP_RUNNER_UID_START`/`_COUNT`) that no
+   other concurrent run shares; its directory is `0700` and owned by that
+   uid, so two users' runs can't read each other's files, and the code can't
+   read this server's memory or `/proc/*/environ`. A launcher sets address
+   space / CPU / file-size / process-count limits before exec. When the run
+   ends, every process still running as that uid is killed — including ones
+   that escaped the process group — before the directory is read back.
+   `CODE_MCP_REQUIRE_ISOLATION=true` (set in the image) refuses to run code
+   at all if this isolation isn't available.
+
+## The container (`docker/sandbox/Dockerfile`)
+
+The image holds only this server and the libraries submitted code may use
+(pandas, numpy, matplotlib, openpyxl, ...) — no other server code, no
+`backend/.env`, no secrets. docker-compose.yml runs it with a read-only root
+filesystem (tmpfs at `/work` and `/tmp`), all capabilities dropped except
+the five needed to start runs as other uids, `no-new-privileges`,
+memory/pids/cpu limits, `init` to reap stray processes, and on an
+`internal` network shared only with the API: no internet, no Postgres.
+
+Attached spreadsheets reach it without any shared disk: the API injects a
+single-use `file_token` into each spreadsheet tool call (the model never
+sees that parameter), and this server downloads the file once from the
+API's `/internal/files/{token}` (`CODE_MCP_FILE_SOURCE_URL`). Generated
+files go back the same way in reverse — inline in the tool result — see
+below. `docker/sandbox/smoke_test.py` checks a running container.
 
 ## Setup
 
@@ -104,22 +132,23 @@ just `evil.<ext>`.
 
 Both tools that can produce a file — `run_python_code` (anything the code
 writes into its working directory besides `script.py`) and `generate_file`
-(always) — save it through the same `ArtifactStore`
-(`backend/core/storage/artifact_store.py`, `ARTIFACT_STORE_DIR`, default
-`data/artifacts`) and hand back the same shape: `{filename, url,
-content_type, size_bytes}` (`run_python_code` nests a list of these under
-`artifacts`; `generate_file` returns the fields directly, since it only
-ever produces one file per call). So `plt.savefig("plot.png")` in
-`run_python_code` (no `plt.show()` — there's no display) works the same way
-a `generate_file` call does: the agent references the returned `url` in its
-reply (e.g. markdown `![plot](url)` or `[report.xlsx](url)`) and the chat
-UI renders or links it inline.
+(always) — return it **inline** in the tool result: `{filename,
+content_type, size_bytes, data_base64}` (`run_python_code` nests a list of
+these under `artifacts`; `generate_file`/`generate_ui` return the fields
+directly). The API (`backend/apps/api/artifacts.py`) stores each one in its
+`ArtifactStore` (`ARTIFACT_STORE_DIR`, default `data/artifacts`) and swaps
+the bytes for a `url` before the model, the UI or the chat history see the
+result. So `plt.savefig("plot.png")` in `run_python_code` (no `plt.show()` —
+there's no display) works the same way a `generate_file` call does: the
+agent references the returned `url` in its reply (e.g. markdown
+`![plot](url)` or `[report.xlsx](url)`) and the chat UI renders or links
+it inline. This server keeps nothing on disk between calls.
 
-Unlike a `run_python_code` call's sandbox directory, saved artifacts are
-**not** cleaned up automatically, since the point is for the UI to be able
-to fetch them after the call has finished. They're served by the Agentic
-API at `GET /api/files/{artifact_id}/{filename}`
-(`backend/apps/api/routers/files.py`).
+Stored artifacts are **not** cleaned up automatically, since the point is
+for the UI to be able to fetch them after the call has finished. They're
+served by the Agentic API at `GET /api/files/{artifact_id}/{filename}`
+(`backend/apps/api/routers/files.py`), with a `sandbox` Content Security
+Policy so a generated page can't act as the app.
 
 Controlled by:
 - `CODE_MCP_CAPTURE_ARTIFACTS` (default `true`) — master switch for
@@ -131,18 +160,14 @@ Controlled by:
   silently dropped, since there's no run to otherwise report success on.
 - `CODE_MCP_MAX_ARTIFACTS_PER_RUN` (default 5) — `run_python_code` only.
 - `CODE_MCP_ARTIFACT_PUBLIC_BASE_URL` (default `http://localhost:8100`) —
-  where the Agentic API is actually reachable from a browser; the returned
-  `url` is built from this, not from anything the code server itself
-  listens on. Point it at nginx (e.g. `https://localhost:8443`) if you're
+  read by the **API**: where it is reachable from a browser; the returned
+  `url` is built from this. Point it at nginx (e.g. `https://localhost:8443`) if you're
   not running the API directly on 8100.
 
-Capture only ever looks at top-level entries actually present in the run's
-own sandbox directory (`Path.iterdir()`), so it can't be tricked into
-picking up a file from somewhere else on disk by way of a crafted
-"filename". That said, the executed code itself is not otherwise sandboxed
-against writing outside its working directory — there's no OS-level
-container/chroot here, only the process isolation described above — so
-this doesn't change that pre-existing risk, it just doesn't add to it.
+Capture only ever looks at top-level entries of the run's own directory,
+and only reads plain regular files without following symlinks (a
+`plot.png -> /etc/shadow` link is skipped, since the read happens with this
+server's privileges).
 
 ## `generate_ui`: free-form, LLM-authored UI, not a fixed component set
 
