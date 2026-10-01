@@ -1,0 +1,32 @@
+name: Backend CI
+
+# Scope note: this repo (AgenticApp) holds the backend only -- the frontend
+# lives in a separate repo/remote (AgenticApp-frontend) and needs its own
+# workflow there. There is no pytest suite wired in here yet (backend's
+# existing backend/mcp_servers/client/test_*.py scripts are ad-hoc/print-based,
+# not pytest-discoverable) -- see history/todo.md 2026-10-01 for that gap.
+# This workflow catches what's cheap and real today: Python syntax errors
+# across the whole backend, and a broken docker-compose.yml/Dockerfile.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Byte-compile every backend module (catches syntax errors)
+        run: python -m compileall -q backend
+
+  docker-compose-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml resolves and parses
+        run: docker compose config

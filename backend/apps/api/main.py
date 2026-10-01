@@ -25,6 +25,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from backend.apps.api.auth import UserStore
 from backend.apps.api.config import get_api_settings
@@ -163,8 +164,36 @@ def create_app() -> FastAPI:
     app.include_router(data.router)
 
     @app.get("/api/health")
-    def health() -> dict:
-        return {"status": "ok", "tools": len(app.state.runtime.tools)}
+    async def health() -> JSONResponse:
+        """Actually probes the MCP connection and Mongo, instead of just
+        reporting the tool count captured once at startup -- that alone
+        can't tell you the shared MCP client died (see the 2026-10-01
+        ClosedResourceError incident, where /api/health kept reporting "ok"
+        while every real tool call was 502ing). Returns 503 if either
+        dependency is unreachable so uptime monitoring/orchestration can
+        actually tell."""
+        runtime = app.state.runtime
+        checks: dict[str, str] = {}
+
+        try:
+            await asyncio.wait_for(runtime.mcp.ping(), timeout=5)
+            checks["mcp"] = "ok"
+        except Exception as exc:  # noqa: BLE001 — surfaced in the response body, not a 500
+            checks["mcp"] = f"error: {exc}"
+
+        store = app.state.conversation_store
+        if store is None:
+            checks["mongo"] = "not configured"
+        else:
+            try:
+                await asyncio.wait_for(store.client.admin.command("ping"), timeout=5)
+                checks["mongo"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                checks["mongo"] = f"error: {exc}"
+
+        healthy = all(v in ("ok", "not configured") for v in checks.values())
+        body = {"status": "ok" if healthy else "degraded", "tools": len(runtime.tools), "checks": checks}
+        return JSONResponse(body, status_code=200 if healthy else 503)
 
     return app
 

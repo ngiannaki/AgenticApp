@@ -16,14 +16,17 @@ interrupts, approval policy) lives on ChatSession instead.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
 import uuid
 from typing import Any, AsyncIterator
 
+import anyio
 import openai
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 from backend.apps.api import events
 from backend.apps.api import skills as skills_lib
@@ -389,53 +392,195 @@ def _extract_text(result: Any) -> str:
     return text or f"Tool returned no content. Raw result: {str(result)[:200]}"
 
 
+def _looks_like_broken_connection(exc: Exception) -> bool:
+    """True for failures that mean the underlying MCP connection itself died
+    (vs. an ordinary application-level tool error like bad SQL or a denied
+    permission). A dead stdio pipe surfaces server-side as an anyio
+    ClosedResourceError/BrokenResourceError (observed 2026-10-01, after the
+    host machine slept/resumed); fastmcp re-wraps that as a ToolError whose
+    message is "Error calling tool '<name>': " + str(underlying_exc) -- and
+    those anyio exceptions carry no message of their own, so the text
+    trails off right after the colon. A real application-level error always
+    has text there (e.g. a SQL error or a permissions.yaml denial), so this
+    is what distinguishes the two without needing a stricter protocol-level
+    signal.
+    """
+    if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError)):
+        return True
+    if isinstance(exc, ToolError):
+        text = str(exc)
+        if text.startswith("Error calling tool"):
+            return not text.rsplit(":", 1)[-1].strip()
+    return False
+
+
+class ResilientMcpClient:
+    """Wraps the single process-wide stdio MCP connection (AgentRuntime.mcp)
+    and transparently reconnects it when the connection itself has died,
+    instead of requiring a manual `docker compose restart app` (see
+    2026-10-01 incident: a ClosedResourceError left every subsequent call
+    502ing until the container was restarted by hand).
+
+    Every ChatSession under stdio transport shares this exact object (see
+    AgentRuntime.acquire_session_client's docstring for why real per-session
+    isolation isn't available there), so reconnecting here repairs every
+    session at once rather than leaving already-handed-out references
+    pointing at a dead client.
+
+    Deliberately does NOT retry on an ordinary application-level tool error
+    (bad SQL, a permissions.yaml denial, bad arguments) -- see
+    _looks_like_broken_connection -- reconnecting there would just bolt a
+    slow, pointless ~10s subprocess restart onto a failure that was never
+    about the connection.
+    """
+
+    def __init__(self, servers: dict) -> None:
+        self._servers = servers
+        self._client: Client | None = None
+        self._lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        client = Client(self._servers)
+        await client.__aenter__()
+        self._client = client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.__aexit__(None, None, None)
+            self._client = None
+
+    async def _reconnect(self, failed_client: Client) -> None:
+        async with self._lock:
+            if self._client is not failed_client:
+                # Another concurrent caller already reconnected us.
+                return
+            logger.warning("MCP connection appears broken, reconnecting...")
+            with contextlib.suppress(Exception):
+                await failed_client.__aexit__(None, None, None)
+            await self.connect()
+            logger.info("MCP connection re-established")
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        client = self._client
+        try:
+            return await client.call_tool(name, arguments)
+        except Exception as exc:  # noqa: BLE001 — inspected below, re-raised when not connection-shaped
+            if not _looks_like_broken_connection(exc):
+                raise
+            await self._reconnect(client)
+            return await self._client.call_tool(name, arguments)
+
+    async def list_tools(self) -> Any:
+        client = self._client
+        try:
+            return await client.list_tools()
+        except Exception as exc:  # noqa: BLE001 — same reasoning as call_tool
+            if not _looks_like_broken_connection(exc):
+                raise
+            await self._reconnect(client)
+            return await self._client.list_tools()
+
+    async def ping(self) -> bool:
+        client = self._client
+        try:
+            return await client.ping()
+        except Exception as exc:  # noqa: BLE001 — same reasoning as call_tool
+            if not _looks_like_broken_connection(exc):
+                raise
+            await self._reconnect(client)
+            return await self._client.ping()
+
+    def new(self) -> Client:
+        """Only meaningful under HTTP transport (isolated per-session
+        clients, see AgentRuntime.acquire_session_client) -- delegates to
+        the underlying raw client, unwrapped, same as before this class
+        existed. Resilience here is scoped to the shared stdio client."""
+        return self._client.new()
+
+
 class AgentRuntime:
     """Shared, process-wide MCP connection + tool list + LLM client."""
 
-    def __init__(self, mcp_client: Client, llm_client: openai.AsyncOpenAI, settings: ApiSettings) -> None:
+    def __init__(
+        self,
+        mcp_client: ResilientMcpClient,
+        llm_client: openai.AsyncOpenAI,
+        settings: ApiSettings,
+        isolated_sessions: bool,
+    ) -> None:
         self.mcp = mcp_client
         self.llm = llm_client
         self.settings = settings
         self.tools: list[dict[str, Any]] = []
         self._skill_index: list[skills_lib.SkillMeta] = []
+        self._isolated_sessions = isolated_sessions
+        """True when every chat session can safely get its own independent
+        MCP protocol session (streamable-HTTP servers.json, run via
+        start_mcp_servers.ps1 — each Client.new() opens a real new HTTP
+        connection). False when every server is launched as a stdio
+        subprocess of this process (servers.docker.json, the Docker image):
+        there all sessions necessarily share the one already-initialized
+        subprocess session underneath (fastmcp's StdioTransport.connect() is
+        a no-op once connected, see transports/stdio.py), so handing out a
+        "fresh" Client there would just re-send `initialize` over the
+        shared pipe — confirmed in practice by the "Starting MCP server..."
+        banners re-appearing in docker logs on every new chat, ~10s+ each,
+        and able to race/break other sessions' in-flight requests while the
+        server's init state flips back to Initializing. See
+        AgentRuntime.acquire_session_client and sessions.py's ChatSession.
+        """
 
     @classmethod
     async def connect(cls, servers: dict, settings: ApiSettings) -> "AgentRuntime":
-        mcp_client = Client(servers)
-        await mcp_client.__aenter__()
+        isolated_sessions = not any("command" in cfg for cfg in servers["mcpServers"].values())
+        mcp_client = ResilientMcpClient(servers)
+        await mcp_client.connect()
         llm_client = get_async_openai_client()
-        runtime = cls(mcp_client, llm_client, settings)
+        runtime = cls(mcp_client, llm_client, settings, isolated_sessions=isolated_sessions)
         await runtime._load_tools()
         return runtime
 
     async def close(self) -> None:
-        await self.mcp.__aexit__(None, None, None)
+        await self.mcp.close()
 
-    def new_client(self) -> Client:
-        """A fresh MCP client scoped to one session (or one-off request),
-        instead of every caller sharing `self.mcp` directly.
+    async def acquire_session_client(self) -> tuple[Client | ResilientMcpClient, bool]:
+        """A per-session MCP client, plus whether the caller owns its
+        lifecycle (and must therefore close it when the session ends).
 
-        `Client.new()` shallow-copies `self.mcp` onto a new instance with
-        its own per-client state (task registry, notification/roots
-        handlers) but the SAME underlying transport — for our stdio servers
-        (keep_alive=True, the default), entering it reuses the already-
-        running subprocess and its already-established session instead of
-        spawning a new one (see StdioTransport.connect/connect_session).
-        This fixes FastMCP's own logged warning for the shared-client
-        pattern ("reusing existing session for all requests... may cause
-        context mixing in concurrent scenarios") without changing the
-        process topology: still exactly 4 long-lived MCP subprocesses,
-        shared by every session, same as before.
+        Over HTTP (isolated_sessions=True) this is a fresh `Client.new()`,
+        entered as its own independent connection/protocol session — so
+        concurrent chat sessions never interleave requests on the same MCP
+        session, and the caller owns it: it must `__aexit__` it when the
+        chat session is deleted or evicted.
+
+        Over stdio (isolated_sessions=False) real per-session isolation
+        isn't available — every session necessarily shares the one
+        subprocess session already opened in `connect()` — so this just
+        hands back the shared `self.mcp` itself (a ResilientMcpClient, so a
+        dead connection self-heals on next use — see its docstring), and the
+        caller does NOT own it: closing it would tear down the one MCP
+        connection for every other active session and the process as a
+        whole. Only AgentRuntime.close() (app shutdown) may close it.
         """
-        return self.mcp.new()
+        if not self._isolated_sessions:
+            return self.mcp, False
+        client = self.mcp.new()
+        await client.__aenter__()
+        return client, True
 
     async def call_tool_isolated(self, name: str, arguments: dict[str, Any]) -> Any:
-        """One-shot tool call on its own fresh client — for request-scoped
-        callers outside any ChatSession (e.g. the upload/delete endpoints in
-        routers/files.py), which have no session object to hang a
-        longer-lived client off of."""
-        async with self.new_client() as client:
+        """One-shot tool call for request-scoped callers outside any
+        ChatSession (e.g. the upload/delete endpoints in routers/files.py),
+        which have no session object to hang a longer-lived client off of.
+        Uses the same isolated-vs-shared logic as acquire_session_client so
+        it's cheap and safe under both transports."""
+        client, owns_lifecycle = await self.acquire_session_client()
+        if not owns_lifecycle:
             return await client.call_tool(name, arguments)
+        try:
+            return await client.call_tool(name, arguments)
+        finally:
+            await client.__aexit__(None, None, None)
 
     async def _load_tools(self) -> None:
         mcp_tools = await self.mcp.list_tools()

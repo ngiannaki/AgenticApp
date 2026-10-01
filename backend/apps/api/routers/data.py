@@ -3,20 +3,17 @@ page, where a signed-in user can browse tables created via the agent's
 create_table tool (e.g. while working a document) without going through
 chat. Calls the MCP tool directly, never through the LLM — same idea as
 routers/files.py's indexing calls, but deliberately NOT via
-AgentRuntime.call_tool_isolated: under stdio-transport MCP servers
-(servers.docker.json), `runtime.new_client()` (what call_tool_isolated uses
-internally) actually forks a whole fresh set of all 4 server subprocesses
-rather than reusing the already-running ones, despite its docstring's claim
-otherwise (confirmed by the "Starting MCP server ..." banners re-appearing
-for every call, ~10s+ each, in docker logs). Fine for files.py's rare
-one-off upload/delete calls; far too expensive for a page hit on every
-list/select/paginate click. This router instead reuses
-`request.app.state.runtime.mcp` — the same single client opened once at
-app startup — directly. Our calls here are one-shot, stateless
+AgentRuntime.call_tool_isolated: even now that call_tool_isolated no longer
+re-triggers a stdio reconnect per call (it shares the process-wide client
+under stdio transport too — see AgentRuntime.acquire_session_client), it
+still does real per-call work for the isolated-sessions/HTTP case (opening
+and closing a fresh connection). This router's calls are one-shot, stateless
 request/response (list/describe/query), with none of the pending-interrupt
-or streaming state that made per-session clients necessary for chat
-(see sessions.py's ChatSession), so sharing this client across concurrent
-requests is safe.
+or streaming state that made per-session clients necessary for chat (see
+sessions.py's ChatSession), and get hit on every list/select/paginate click
+— so it skips that entirely and reuses `request.app.state.runtime.mcp` — the
+same single client opened once at app startup — directly, under both
+transports. Sharing this client across concurrent requests is safe.
 
 There is currently no per-user table ownership in the db MCP server (single
 shared Postgres DB, permissions.yaml scopes by table only) — every

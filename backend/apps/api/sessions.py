@@ -1,11 +1,18 @@
 """In-memory chat session state.
 
-Each session owns its own conversation memory, its own set of pending
-human-in-the-loop interrupts, and — since 2026-09-30 — its own MCP client
-(AgentRuntime.new_client()), so concurrent sessions no longer multiplex
-every tool call through one shared client/session object (see that
-method's docstring for why). All sessions still share the same 4 long-lived
-MCP subprocesses underneath; only the per-client state is now per-session.
+Each session owns its own conversation memory and its own set of pending
+human-in-the-loop interrupts. Since 2026-09-30, each session also gets its
+own MCP client where that's actually possible — over HTTP (servers.json,
+start_mcp_servers.ps1) AgentRuntime.acquire_session_client() hands back a
+genuinely independent connection/protocol session, so concurrent chats
+never multiplex tool calls through one shared client/session object. Over
+stdio (servers.docker.json, the Docker image) real per-session isolation
+isn't available — every session shares the one already-initialized
+subprocess session underneath — so that method instead hands back the
+shared client itself (see its docstring in streaming_agent.py for why
+pretending otherwise there is actively harmful, not just redundant).
+ChatSession.mcp_owns_lifecycle records which case applies for a given
+session so SessionManager.delete knows whether it's safe to close it.
 """
 from __future__ import annotations
 
@@ -22,7 +29,7 @@ from backend.apps.api.schemas import InterruptDecisionRequest, QuestionAnswerReq
 from backend.config import settings as app_settings
 
 if TYPE_CHECKING:
-    from backend.apps.api.streaming_agent import AgentRuntime
+    from backend.apps.api.streaming_agent import AgentRuntime, ResilientMcpClient
 
 # Tokens reserved out of num_ctx for the model's own generation on a single
 # turn: the visible answer plus, on a thinking model with reasoning_effort
@@ -70,11 +77,18 @@ class ChatSession:
     session_id: str
     memory: ConversationMemory
     approval_required_tools: list[str]
-    mcp: Client
-    """This session's own MCP client (see AgentRuntime.new_client) — entered
-    (connected) by SessionManager.create/restore, exited by
-    SessionManager.delete. Never share this across sessions; that's the
-    exact thing it exists to avoid."""
+    mcp: "Client | ResilientMcpClient"
+    """This session's MCP client (see AgentRuntime.acquire_session_client).
+    Over HTTP this is a dedicated connection entered by
+    SessionManager.create/restore and exited by SessionManager.delete —
+    never share it across sessions, that's the exact thing it exists to
+    avoid. Over stdio it's the one process-wide shared client; see
+    mcp_owns_lifecycle."""
+    mcp_owns_lifecycle: bool = True
+    """Whether this session owns `mcp`'s connection and must close it on
+    delete/eviction (HTTP), vs. it being the shared runtime client that only
+    AgentRuntime.close() (app shutdown) may close (stdio). Set from
+    AgentRuntime.acquire_session_client's return value."""
     user_id: str = ""
     """Owner of this session — set at creation from the authenticated caller
     (backend.apps.api.auth.get_current_user). Never taken from model/tool
@@ -156,8 +170,7 @@ class SessionManager:
         user_id: str,
         max_tool_result_chars: int = 8000,
     ) -> ChatSession:
-        mcp = self._runtime.new_client()
-        await mcp.__aenter__()
+        mcp, mcp_owns_lifecycle = await self._runtime.acquire_session_client()
         session = ChatSession(
             session_id=str(uuid.uuid4()),
             memory=ConversationMemory(
@@ -165,6 +178,7 @@ class SessionManager:
             ),
             approval_required_tools=approval_required_tools,
             mcp=mcp,
+            mcp_owns_lifecycle=mcp_owns_lifecycle,
             user_id=user_id,
         )
         self._sessions[session.session_id] = session
@@ -191,13 +205,13 @@ class SessionManager:
                 memory.add_user(turn["content"])
             elif turn["role"] == "assistant":
                 memory.add_assistant(turn["content"])
-        mcp = self._runtime.new_client()
-        await mcp.__aenter__()
+        mcp, mcp_owns_lifecycle = await self._runtime.acquire_session_client()
         session = ChatSession(
             session_id=session_id,
             memory=memory,
             approval_required_tools=approval_required_tools,
             mcp=mcp,
+            mcp_owns_lifecycle=mcp_owns_lifecycle,
             user_id=user_id,
         )
         self._sessions[session_id] = session
@@ -215,10 +229,15 @@ class SessionManager:
             for pending_q in session.pending_questions.values():
                 if not pending_q.future.done():
                     pending_q.future.cancel()
-            # keep_alive=True on the underlying stdio transport (default)
-            # means this doesn't kill the shared subprocess — just releases
-            # this session's own client-side state. See AgentRuntime.new_client.
-            await session.mcp.__aexit__(None, None, None)
+            if session.mcp_owns_lifecycle:
+                # HTTP: this session's own dedicated connection — safe to
+                # close without affecting anyone else.
+                await session.mcp.__aexit__(None, None, None)
+            # stdio: session.mcp IS the process-wide shared client (see
+            # AgentRuntime.acquire_session_client) — closing it here would
+            # tear down the one MCP connection for every other active
+            # session (and happens routinely via evict_idle), so leave it
+            # open. Only AgentRuntime.close() (app shutdown) may close it.
 
     async def evict_idle(self) -> list[str]:
         cutoff = time.time() - self._idle_timeout
