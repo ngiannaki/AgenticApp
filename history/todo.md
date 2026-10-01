@@ -277,3 +277,16 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Try with a real model: set AGENTS_INTERNAL_TOKEN in backend/.env, start everything, run a Deep Research task and a Data Analyst task from /agents
 - ⬜ Optional later: chat-to-agent handoff tool (start an agent task from the chat)
 - ⬜ Phase 3 (deployment), Phase 4 (accounts/limits/streaming), Phase 7 (cleanup) still to do
+
+## 2026-10-01
+- ✅ ExtractorAgent: JSON-only extraction with per-value sources, pretty Table/JSON view in the UI
+- ✅ Agent tasks: delete, rename, rerun with feedback (linked to the original)
+- ✅ Agents page polish: status pill, elapsed time, collapsible activity, Copy/Download on results
+- ✅ Phase 3: all-HTTP compose, internal MCP token, Caddy edge + Cloudflare tunnel profiles, DEPLOY.md (not deployed)
+- ✅ Phase 4: invite code / sign-up switch, 30-day sliding tokens, login rate limit, daily quotas, background indexing, token streaming
+- ✅ Phase 7: removed legacy v2/v3 runtimes + ad-hoc client scripts + retrieval-agent settings, docs archived, ruff + frontend CI
+- ⬜ Set MCP_INTERNAL_TOKEN in backend/.env (and the root .env for compose) — then run both local modes once: `.\start_mcp_servers.ps1` and `docker compose up --build`
+- ⬜ If you used the devtunnels URL in the frontend: put `NEXT_PUBLIC_API_BASE_URL=<url>` in agenticapp-frontend/.env.local (the default is now http://localhost:8100 in dev)
+- ⬜ Try the Extractor and "Rerun with feedback" with a real model
+- ⬜ Before sharing: follow the DEPLOY.md checklist (invite code, daily limits, tokens, passwords)
+- ⬜ Optional later: chat-to-agent handoff tool; move `./data` uploads into Postgres or object storage for multi-host setups

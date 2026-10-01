@@ -40,7 +40,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import httpx
-from a2a.helpers.proto_helpers import new_data_part, new_task_from_user_message, new_text_part
+from a2a.helpers.proto_helpers import new_task_from_user_message, new_text_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.tasks import TaskUpdater
 from a2a.types import TaskState

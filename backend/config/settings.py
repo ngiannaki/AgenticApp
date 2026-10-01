@@ -136,15 +136,6 @@ class RetrievalModelSettings(BaseSettings):
     temperature: float = 0.3
 
 
-class RetrievalAgentModelSettings(BaseSettings):
-    """Evaluation/answer LLM used by the standalone A2A retrieval agent (backend/apps/retrieval_agent)."""
-
-    model_config = _settings_config("RETRIEVAL_AGENT_MODEL_")
-
-    dev: str = "gpt-oss:20b"
-    prod: str = "gpt-4o-mini"
-
-
 class MetadataModelSettings(BaseSettings):
     """Document summary/section extraction LLM (backend/infrastructure/vector_store/metadata_enhancer.py)."""
 
@@ -197,6 +188,12 @@ class ApiSettings(BaseSettings):
     URL, as tool authors are asked to do)."""
 
     log_level: str = "INFO"
+
+    stream_tokens: bool = Field(default=True, description="Stream the model's reply token by token (`token` SSE events). false = whole reply at once.")
+
+    daily_chat_turns: int = Field(default=0, description="Chat messages per user per day (0 = unlimited).")
+    daily_uploads: int = Field(default=0, description="Document uploads per user per day (0 = unlimited).")
+    daily_agent_tasks: int = Field(default=0, description="Agent tasks (incl. reruns) per user per day (0 = unlimited).")
 
     approval_required_tools: list[str] = Field(
         default_factory=list,
@@ -485,18 +482,6 @@ class RetrievalServerSettings(BaseSettings):
     )
 
 
-class RetrievalAgentSettings(BaseSettings):
-    """Process/networking config for the standalone A2A retrieval agent."""
-
-    model_config = _settings_config("RETRIEVAL_AGENT_")
-
-    mcp_url: str = "http://localhost:8001/mcp"
-    top_k: int = 10
-    max_iterations: int = 5
-    host: str = "localhost"
-    port: int = 9999
-
-
 class DatabaseSettings(BaseSettings):
     """The one Postgres (with pgvector) behind everything: users, auth
     tokens, conversations, the document registry (schema `app`), document
@@ -623,6 +608,10 @@ class AuthSettings(BaseSettings):
             "this in a deployment reachable by more than one person."
         ),
     )
+    signup_enabled: bool = Field(default=True, description="false = no self sign-up; create accounts with python -m backend.scripts.create_user.")
+    invite_code: str = Field(default="", description="When set, sign-up requires this code. Set it before sharing a deployment.")
+    token_ttl_days: int = Field(default=30, description="Sign-in lifetime; renewed while the user keeps using the app.")
+    login_max_failures: int = Field(default=10, description="Failed sign-ins per IP or email per 15 minutes before 429.")
     dev_bypass_email: str = "dev@local.test"
     dev_bypass_password: str = "dev-password"
     """Only used to seed the bypass account at startup; never required to authenticate while dev_bypass is on."""
@@ -657,7 +646,6 @@ class Settings:
         self.chat = ChatModelSettings()
         self.embedding = EmbeddingModelSettings()
         self.retrieval = RetrievalModelSettings()
-        self.retrieval_agent_model_cfg = RetrievalAgentModelSettings()
         self.metadata = MetadataModelSettings()
 
         self.api = ApiSettings()
@@ -665,7 +653,6 @@ class Settings:
         self.code_mcp = CodeMcpSettings()
         self.indexing_server = IndexingServerSettings()
         self.retrieval_server = RetrievalServerSettings()
-        self.retrieval_agent = RetrievalAgentSettings()
         self.database = DatabaseSettings()
         self.document_store = DocumentStoreSettings()
         self.artifact_store = ArtifactStoreSettings()
@@ -701,9 +688,6 @@ class Settings:
     def retrieval_temperature(self) -> float:
         return self.retrieval.temperature
 
-    @property
-    def retrieval_agent_model(self) -> str:
-        return self.retrieval_agent_model_cfg.prod if self.is_prod else self.retrieval_agent_model_cfg.dev
 
     @property
     def metadata_model(self) -> str:

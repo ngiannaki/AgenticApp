@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
+from backend.apps.api import quotas
 from backend.apps.api import events
 from backend.apps.api.auth import AuthUser, get_current_user
 from backend.apps.api.config import get_api_settings
@@ -100,6 +101,7 @@ async def send_message(
 
     if session.lock.locked():
         raise HTTPException(status_code=409, detail="A turn is already in progress for this session")
+    await quotas.consume(request, user.user_id, "chat_turns")
 
     async def stream() -> AsyncIterator[dict]:
         steps: list[dict[str, Any]] = []

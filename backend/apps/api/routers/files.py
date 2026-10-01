@@ -14,6 +14,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from backend.apps.api import quotas
 from backend.apps.api.auth import AuthUser, get_current_user
 from backend.apps.api.session_helpers import get_or_rehydrate_session
 from backend.core.storage.artifact_store import ArtifactStore
@@ -113,35 +114,32 @@ async def _store_uploaded_file(request: Request, file: UploadFile, user: AuthUse
     return {"document_id": document_id, "filename": filename, "extension": extension, "file_bytes": file_bytes}
 
 
-async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) -> dict:
-    """Stores + parses + chunks + embeds `file` and registers it in the
-    per-user document registry, indexed status. Used by both the standalone
-    Documents page and, for non-spreadsheet types, the chat inbox."""
-    stored = await _store_uploaded_file(request, file, user)
-    document_id, filename, extension = stored["document_id"], stored["filename"], stored["extension"]
-
-    runtime = request.app.state.runtime
+async def index_stored_document(runtime, document_id: str, filename: str, user_id: str) -> dict:
+    """Parse + chunk + embed a file already in the document store. Returns the
+    indexing tool's result ({document_id, content_type, chunks_indexed, ...});
+    raises HTTPException on failure."""
     try:
-        # Uses the "_v2" (LangChain) indexing pipeline — retrieval on these
-        # documents (streaming_agent.py's _with_attached_documents_note) is
-        # pointed at the matching "_v2" retrieval tools, since v1/v2 write to
-        # separate vector collections and can't read each other's documents.
+        # The "_v2" (LangChain/pgvector) pipeline, matching the "_v2" retrieval tools.
         result = await runtime.call_tool_isolated(
             "indexing_upload_and_index_document_v2",
-            {
-                "document_id": document_id,
-                "filename": filename,
-                "user_id": user.user_id,
-            },
+            {"document_id": document_id, "filename": filename, "user_id": user_id},
         )
     except Exception as exc:  # noqa: BLE001 — surface as a normal HTTP error, not a 500 stack trace
         logger.exception("upload_and_index_document_v2 call failed for %s", filename)
         raise HTTPException(status_code=502, detail=f"Indexing failed: {exc}")
-
     data = _tool_result_json(result)
     if not data.get("success"):
         raise HTTPException(status_code=422, detail=data.get("error", "Indexing failed"))
+    return data
 
+
+async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) -> dict:
+    """Stores + indexes `file` before returning (the chat inbox needs it
+    searchable right away) and registers it as indexed."""
+    stored = await _store_uploaded_file(request, file, user)
+    document_id, filename, extension = stored["document_id"], stored["filename"], stored["extension"]
+
+    data = await index_stored_document(request.app.state.runtime, document_id, filename, user.user_id)
     document_id = data["document_id"]
     content_type = data.get("content_type", extension.lstrip("."))
     chunks_indexed = data.get("chunks_indexed", 0)
@@ -163,6 +161,7 @@ async def _upload_and_index(request: Request, file: UploadFile, user: AuthUser) 
         "filename": filename,
         "content_type": content_type,
         "chunks_indexed": chunks_indexed,
+        "status": "indexed",
     }
 
 
@@ -206,6 +205,7 @@ async def upload_file(
     session = await get_or_rehydrate_session(request, session_id, user.user_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    await quotas.consume(request, user.user_id, "uploads")
 
     extension = Path(file.filename or "upload").suffix.lower()
     if extension in _SPREADSHEET_EXTENSIONS:
@@ -216,16 +216,36 @@ async def upload_file(
     return result
 
 
-@documents_router.post("/api/documents/upload")
+@documents_router.post("/api/documents/upload", status_code=202)
 async def upload_document(
     request: Request,
     file: UploadFile,
     user: AuthUser = Depends(get_current_user),
 ) -> dict:
-    """Uploads + indexes a document from the standalone Documents page, with
-    no chat session involved — the user references it later by document_id
-    from any conversation."""
-    return await _upload_and_index(request, file, user)
+    """Documents page upload: stores the file and returns at once with
+    status "indexing"; indexing runs in the background (backend/apps/api/
+    indexer.py) and the page polls GET /api/documents until it is "indexed"
+    or "failed". The user references it later by document_id from any chat."""
+    await quotas.consume(request, user.user_id, "uploads")
+    stored = await _store_uploaded_file(request, file, user)
+    document_id, filename, extension = stored["document_id"], stored["filename"], stored["extension"]
+    await request.app.state.document_registry.create(
+        document_id=document_id,
+        user_id=user.user_id,
+        original_name=filename,
+        stored_name=f"original{extension}",
+        file_type=extension.lstrip("."),
+        status="indexing",
+        chunks_indexed=0,
+    )
+    request.app.state.indexer.submit(document_id, filename, user.user_id)
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "content_type": extension.lstrip("."),
+        "chunks_indexed": 0,
+        "status": "indexing",
+    }
 
 
 @documents_router.get("/api/documents")

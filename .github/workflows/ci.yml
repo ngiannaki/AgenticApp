@@ -27,6 +27,8 @@ jobs:
           python-version: "3.13"
       - name: Byte-compile every backend module (catches syntax errors)
         run: python -m compileall -q backend
+      - name: Lint (pyflakes rules: unused imports, undefined names, ...)
+        run: pip install -q ruff && ruff check backend --select F
 
   pytest:
     runs-on: ubuntu-latest
@@ -113,5 +115,10 @@ jobs:
         # values don't matter here: this job only validates that the compose
         # file itself parses and resolves, never builds or runs anything.
         run: cp backend/.env.example backend/.env
-      - name: Validate docker-compose.yml resolves and parses
-        run: docker compose config
+      - name: Validate docker-compose.yml resolves and parses (every profile)
+        run: |
+          docker compose config -q
+          docker compose --profile edge config -q
+          FRONTEND_DIR=. docker compose --profile tunnel config -q
+      - name: Validate the Caddyfile
+        run: docker run --rm -v "$PWD/docker/web/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.10-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

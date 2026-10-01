@@ -39,7 +39,7 @@ _STATE = {
     "TASK_STATE_REJECTED": "failed",
 }
 _TASK_COLUMNS = (
-    "id, user_id, agent_id, title, status, inputs, error,"
+    "id, user_id, agent_id, title, status, inputs, error, parent_task_id,"
     " extract(epoch FROM created_at)::float8 AS created_at, extract(epoch FROM updated_at)::float8 AS updated_at"
 )
 
@@ -48,15 +48,15 @@ class TaskStore:
     def __init__(self, pool: ConnectionPool) -> None:
         self.pool = pool
 
-    async def create(self, user_id: str, agent_id: str, title: str, inputs: dict) -> dict:
+    async def create(self, user_id: str, agent_id: str, title: str, inputs: dict, parent_task_id: str | None = None) -> dict:
         task_id = str(uuid.uuid4())
 
         def _do():
             with self.pool.connection() as conn:
                 return conn.execute(
-                    f"INSERT INTO app.agent_tasks (id, user_id, agent_id, title, status, inputs)"
-                    f" VALUES (%s, %s, %s, %s, 'submitted', %s::jsonb) RETURNING {_TASK_COLUMNS}",
-                    (task_id, user_id, agent_id, title[:200], json.dumps(inputs)),
+                    f"INSERT INTO app.agent_tasks (id, user_id, agent_id, title, status, inputs, parent_task_id)"
+                    f" VALUES (%s, %s, %s, %s, 'submitted', %s::jsonb, %s) RETURNING {_TASK_COLUMNS}",
+                    (task_id, user_id, agent_id, title[:200], json.dumps(inputs), parent_task_id),
                 ).fetchone()
 
         return await run_sync(_do)
@@ -101,6 +101,13 @@ class TaskStore:
         def _do():
             with self.pool.connection() as conn:
                 conn.execute(f"UPDATE app.agent_tasks SET {cols}, updated_at = now() WHERE id = %s", [*fields.values(), task_id])
+
+        await run_sync(_do)
+
+    async def delete(self, task_id: str) -> None:
+        def _do():
+            with self.pool.connection() as conn:
+                conn.execute("DELETE FROM app.agent_tasks WHERE id = %s", (task_id,))
 
         await run_sync(_do)
 
@@ -214,18 +221,45 @@ class AgentHub:
             self._agents, self._agents_at = response.json(), time.monotonic()
         return self._agents
 
-    async def start(self, user_id: str, agent_id: str, inputs: dict) -> dict:
+    async def start(self, user_id: str, agent_id: str, inputs: dict, parent: dict | None = None, feedback: str = "") -> dict:
         agents = {a["id"]: a for a in await self.agents()}
         if agent_id not in agents:
             raise LookupError(agent_id)
         if await self.store.count_active(user_id) >= self.max_active:
             raise PermissionError(f"You already have {self.max_active} agent tasks running; wait for one to finish.")
-        title = str(inputs.get("question") or next((v for v in inputs.values() if isinstance(v, str) and v), agents[agent_id]["name"]))
-        task = await self.store.create(user_id, agent_id, title, inputs)
-        message = Message(role=Role.ROLE_USER, message_id=str(uuid.uuid4()), parts=[new_text_part(json.dumps(inputs))])
+        first_text = next((v for v in inputs.values() if isinstance(v, str) and v), agents[agent_id]["name"])
+        title = str(inputs.get("question") or inputs.get("request") or first_text)
+        if parent is not None:
+            title = f"{parent['title']} (rerun)"
+        task = await self.store.create(user_id, agent_id, title, inputs, parent["id"] if parent else None)
+        sent = dict(inputs)
+        if parent is not None and feedback:
+            sent = await self._with_feedback(agents[agent_id], parent, sent, feedback)
+        message = Message(role=Role.ROLE_USER, message_id=str(uuid.uuid4()), parts=[new_text_part(json.dumps(sent))])
         message.metadata.update({"user_id": user_id})
         self._spawn(task["id"], agent_id, message)
         return task
+
+    async def _with_feedback(self, agent: dict, parent: dict, inputs: dict, feedback: str) -> dict:
+        """Generic for any agent: fold the user's feedback (and a short
+        excerpt of the previous result) into the agent's main text input."""
+        main = next((f["name"] for f in agent["inputs"] if f["kind"] in ("textarea", "text")), None)
+        if main is None:
+            return inputs
+        previous = ""
+        for event in await self.store.events(parent["id"]):
+            if event["kind"] == "artifact":
+                data = event["data"]
+                previous += (data.get("text") or json.dumps(data.get("data"), default=str) or "")[:2000] + "\n"
+        note = f"\n\nFeedback on a previous attempt — take it into account: {feedback}"
+        if previous:
+            note += f"\n\nPrevious result (excerpt):\n{previous[:4000]}"
+        return {**inputs, main: f"{inputs.get(main) or ''}{note}"}
+
+    async def delete(self, task: dict) -> None:
+        if task["status"] not in TERMINAL:
+            await self.cancel(task)
+        await self.store.delete(task["id"])
 
     async def reply(self, task: dict, text: str) -> None:
         await self.store.add_event(task["id"], "answer", {"text": text})

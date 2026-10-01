@@ -6,9 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from types import SimpleNamespace
 
-import pytest
 import uvicorn
 
 from backend.apps.agents import base as agents_base
@@ -115,6 +113,15 @@ def test_agent_task_lifecycle(pg_pool, make_user, monkeypatch) -> None:
             report = next(e["data"]["text"] for e in events if e["kind"] == "artifact" and e["data"]["name"] == "report.md")
             assert "Revenue grew 12% [1]" in report and "made-up" not in report and "annual.pdf (p. 4)" in report
 
+            # Rerun with feedback: new linked task; the feedback and previous result reach the agent.
+            echo_task = next(t for t in await store.list(user) if t["agent_id"] == "echo")
+            rerun = await hub.start(user, "echo", echo_task["inputs"], parent=echo_task, feedback="shorter please")
+            assert rerun["parent_task_id"] == echo_task["id"] and rerun["title"].endswith("(rerun)")
+            await _wait(store, rerun["id"], {"input_required"})
+            rerun_row = await store.get(rerun["id"])
+            await hub.delete(rerun_row)
+            assert await store.get(rerun["id"]) is None
+
             # Inputs are validated by the agent: a missing required field fails the task.
             bad = await hub.start(user, "echo", {})
             bad = await _wait(store, bad["id"], {"failed"})
@@ -125,6 +132,33 @@ def test_agent_task_lifecycle(pg_pool, make_user, monkeypatch) -> None:
             await serving
 
     asyncio.run(scenario())
+
+
+def test_extractor_returns_json_with_sources(monkeypatch) -> None:
+    from backend.apps.agents.base import RunContext
+    from backend.apps.agents.extractor import ExtractorAgent
+
+    llm = FakeLlm([
+        {"fields": [{"key": "revenue_growth", "description": "growth %", "query": "revenue growth"},
+                    {"key": "ceo", "description": "CEO name", "query": "chief executive"}]},
+        '```json\n{"revenue_growth": {"value": 12, "source": "E1"}, "ceo": {"value": null, "source": null}}\n```',
+    ])
+    agent = ExtractorAgent()
+    ctx = RunContext(agent, "t1", "alice", tools=FakeTools(), llm=llm)
+    out: dict = {}
+
+    async def step(*a, **k):
+        pass
+
+    async def artifact(name, text=None, data=None, kind="markdown"):
+        out.update(name=name, data=data, kind=kind)
+
+    ctx.step, ctx.artifact = step, artifact
+    asyncio.run(agent.run(ctx, agent.validate({"request": "summarize growth and CEO"})))
+    assert out["kind"] == "json" and out["name"] == "extraction.json"
+    assert out["data"]["values"] == {"revenue_growth": 12, "ceo": None}
+    assert out["data"]["sources"]["revenue_growth"]["document"] == "annual.pdf"
+    assert out["data"]["sources"]["ceo"] is None
 
 
 def test_agents_service_requires_the_internal_token(monkeypatch) -> None:

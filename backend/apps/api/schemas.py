@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class SignupRequest(BaseModel):
     email: str = Field(min_length=3)
     password: str = Field(min_length=8)
+    invite_code: str = ""
 
 
 class LoginRequest(BaseModel):

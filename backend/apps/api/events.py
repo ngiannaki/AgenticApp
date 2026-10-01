@@ -23,11 +23,6 @@ message   - the assistant's final natural-language answer for this turn
 error     - something went wrong; the stream ends after this
 done      - turn finished (echoes the answer + iteration count)
 
-Orchestrator-only event types (streaming_agent_v2.py / streaming_agent_v3.py)
--------------------------------------------------------------------------
-plan      - the orchestrator broke the request into steps
-handoff   - work was handed off to an executor sub-agent for one step
-critic    - the critic judged whether the work so far satisfies the request
 """
 from __future__ import annotations
 
@@ -85,6 +80,12 @@ def citations(items: list[dict[str, Any]]) -> dict[str, Any]:
     return sse("citations", {"items": items})
 
 
+def token(content: str) -> dict[str, Any]:
+    """A piece of the model's reply as it is generated (display only; the
+    final `message` event carries the full, citation-rendered answer)."""
+    return sse("token", {"content": content})
+
+
 def message(content: str) -> dict[str, Any]:
     return sse("message", {"content": content})
 
@@ -95,15 +96,3 @@ def error(detail: str) -> dict[str, Any]:
 
 def done(answer: str, iterations: int) -> dict[str, Any]:
     return sse("done", {"answer": answer, "iterations": iterations})
-
-
-def plan(steps: list[str]) -> dict[str, Any]:
-    return sse("plan", {"steps": steps})
-
-
-def handoff(to: str, instructions: str) -> dict[str, Any]:
-    return sse("handoff", {"to": to, "instructions": instructions})
-
-
-def critic(done_: bool, feedback: str, followup: str | None = None) -> dict[str, Any]:
-    return sse("critic", {"done": done_, "feedback": feedback, "followup": followup})

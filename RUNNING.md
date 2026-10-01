@@ -41,38 +41,36 @@ it as-is; nothing about this mode changed.
 Requires: Docker Desktop running (for Postgres), and nginx if you want the
 reverse-proxy step.
 
-## Option B — one container (Docker)
+## Option B — Docker Compose
 
-The deploy-friendly path: the API and all 4 MCP servers run as a single
-process tree inside one container (the MCP servers are launched as stdio
-subprocesses of the API instead of separate HTTP services — see
-`backend/apps/client/servers.docker.json` and each server's
-`MCP_TRANSPORT=stdio` handling in its `__main__` block). Postgres runs as
-its own container.
+Everything in containers, the same shape as Option A: each MCP server is its
+own HTTP service (all from one `agenticapp-backend` image), talking to the
+API over the compose network with the internal token.
 
 ```bash
-docker compose up --build
+cp .env.example .env          # passwords + MCP_INTERNAL_TOKEN (same value as backend/.env)
+docker compose up --build     # API on http://localhost:8100
 ```
 
-This brings up 3 containers: `app` (API + the indexing/retrieval/db MCP
-servers, port 8100), `code-sandbox` (the code MCP server, locked down — see
-`backend/mcp_servers/code/README.md`; reachable only from `app`, no internet)
-and `postgres` (pgvector image; reachable from the host on `127.0.0.1:5432`
-only). `docker-compose.yml` reuses `backend/.env` for everything (API keys,
-model names, feature flags, ...) and only overrides the database URLs to
-point at the `postgres` service. Passwords come from a root `.env` file
-(`POSTGRES_PASSWORD`, `AGENT_DB_PASSWORD`); the defaults are for local use
-only. Note: Postgres only reads `POSTGRES_PASSWORD` when it creates a fresh
-data volume — changing it later means changing the password inside the
-database too.
+Services: `postgres` (pgvector; `127.0.0.1:5432` only), `db-setup`
+(migrations + the DB tool's role, runs once), `indexing`, `retrieval`, `db`,
+`code-sandbox` (locked down, internal network with the API only, no
+internet), `agents`, and `app` (the API, `127.0.0.1:8100`). Only the API is
+published, and only on localhost. Every service reuses `backend/.env`;
+compose overrides the database URLs, the hosts and the server list
+(`backend/apps/client/servers.compose.json`). Postgres only reads
+`POSTGRES_PASSWORD` when it creates a fresh data volume — changing it later
+means changing it inside the database too.
 
-This is also the shape a free-tier host (Render/Fly.io/Railway) expects: one
-`Dockerfile`, one exposed port. For an actual deploy you can point the
-same env vars at a managed Postgres instead, as long as it offers the
-`vector` extension.
+The old single-container stdio setup still works if you want it: set
+`API_SERVERS_PATH=/app/backend/apps/client/servers.docker.json` on `app`
+(the MCP servers then run as its subprocesses) and drop the four MCP
+services.
 
-Requires: Docker (no local Python/venv install needed — it's all
-inside the image).
+To put it on the internet (VM with a domain, or your PC through a
+Cloudflare tunnel) see **DEPLOY.md** — that's the `edge` / `tunnel` profiles.
+
+Requires: Docker (no local Python/venv install needed).
 
 ## Either way
 
@@ -85,6 +83,14 @@ inside the image).
   user — fine for solo local use, must be `false` before anyone else can
   reach the deployment.
 - Health check once running: `GET http://localhost:8100/api/health`.
+- `MCP_INTERNAL_TOKEN` (backend/.env, and the root `.env` for compose): the
+  MCP servers only accept calls carrying it; the API sends it automatically.
+  Leave blank only for a quick solo test (each server logs a warning).
+- Frontend: `npm run dev` talks to `http://localhost:8100` by default. To use
+  nginx (`https://localhost:8443`) or a dev tunnel instead, put
+  `NEXT_PUBLIC_API_BASE_URL=<url>` in the frontend's `.env.local`.
+  `nginx.conf` now proxies only `/api/` — the MCP servers are no longer
+  reachable through it.
 
 ## Upgrading from MongoDB/Chroma
 

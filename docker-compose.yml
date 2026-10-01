@@ -1,86 +1,137 @@
-# Local/single-host way to run the whole stack with one command:
-#   docker compose up --build
+# The whole app with one command (see RUNNING.md, and DEPLOY.md for a server):
 #
-# This is the Docker alternative to start_mcp_servers.ps1 — see RUNNING.md
-# for how the two compare. It reuses backend/.env for every setting (API
-# keys, model names, feature flags, ...) except the database URLs, which must
-# point at this compose network's `postgres` service instead of localhost and
-# are overridden below.
+#   docker compose up --build                      # local: API on http://localhost:8100
+#   docker compose --profile edge up --build -d    # + Caddy serving the frontend and /api (HTTPS with a domain)
+#   docker compose --profile tunnel up --build -d  # + a named Cloudflare tunnel (your PC, no open ports)
 #
-# One database: Postgres with pgvector holds users, chats, the document
-# registry, the vector index and each user's private DB-tool tables.
-# Passwords come from the root .env (POSTGRES_PASSWORD, AGENT_DB_PASSWORD) —
-# the defaults below are for local use only.
+# Every service reads backend/.env (API keys, models, secrets). Shared
+# secrets come from there too: MCP_INTERNAL_TOKEN (API <-> MCP servers),
+# AGENTS_INTERNAL_TOKEN (API <-> agents). Database passwords come from a root
+# .env (POSTGRES_PASSWORD, AGENT_DB_PASSWORD); the defaults are for local use.
+#
+# Topology: each MCP server is its own HTTP service (same image as the API),
+# reachable only inside the compose network and only with the internal token.
+# The code sandbox sits on an internal network with the API alone (no
+# internet, no Postgres). Postgres and the API are published on 127.0.0.1
+# only; the edge/tunnel profiles are the only way in from outside.
+
+x-backend: &backend
+  # One image for the API, the MCP servers and the agents (built once, cached).
+  image: agenticapp-backend
+  build: .
+  env_file:
+    - backend/.env
+  restart: unless-stopped
+  volumes:
+    - ./data:/app/data
+    - ./logs:/app/logs
+
+x-db-env: &db-env
+  DATABASE_URL: postgresql://raguser:${POSTGRES_PASSWORD:-changeme}@postgres:5432/ragdb
+  DATABASE_AGENT_ROLE_PASSWORD: ${AGENT_DB_PASSWORD:-changeme-agent}
+  DB_MCP_DATABASE_URL: postgresql://agent_ws:${AGENT_DB_PASSWORD:-changeme-agent}@postgres:5432/ragdb
+
 services:
   app:
-    build: .
-    ports:
-      - "8100:8100"
-    env_file:
-      - backend/.env
+    <<: *backend
     environment:
-      DATABASE_URL: postgresql://raguser:${POSTGRES_PASSWORD:-changeme}@postgres:5432/ragdb
-      DATABASE_AGENT_ROLE_PASSWORD: ${AGENT_DB_PASSWORD:-changeme-agent}
-      DB_MCP_DATABASE_URL: postgresql://agent_ws:${AGENT_DB_PASSWORD:-changeme-agent}@postgres:5432/ragdb
+      <<: *db-env
+      API_SERVERS_PATH: /app/backend/apps/client/servers.compose.json
       AGENTS_URL: http://agents:9100
+    ports:
+      - "127.0.0.1:8100:8100"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      indexing:
+        condition: service_started
+      retrieval:
+        condition: service_started
+      db:
+        condition: service_started
+      code-sandbox:
+        condition: service_started
+    networks: [default, sandbox]
+    # Probes MCP + Postgres (503 when either is down).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/api/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+
+  # Migrations + the DB tool's restricted role, once, before anything else.
+  db-setup:
+    <<: *backend
+    restart: "no"
+    command: ["python", "-m", "backend.scripts.db_setup"]
+    environment:
+      <<: *db-env
     depends_on:
       postgres:
         condition: service_healthy
-      code-sandbox:
-        condition: service_started
-    networks:
-      - default
-      - sandbox
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      # Bind-mounts the actual source over the image's baked-in COPY, so
-      # edits on the host are visible inside the container immediately —
-      # no rebuild needed. No auto-reload though: run
-      # `docker compose restart app` yourself when you want the running
-      # process to pick up the new code. The Dockerfile's CMD (used for
-      # real deploys, not this compose file) is untouched and still bakes
-      # the code in instead.
-      - ./backend:/app/backend
 
-  # The A2A agents (Deep Research, Data Analyst, ...). Same image as `app`;
-  # reaches tools only through the API (/internal/tools), with
-  # AGENTS_INTERNAL_TOKEN from backend/.env.
+  indexing:
+    <<: *backend
+    command: ["python", "-m", "backend.mcp_servers.indexing.server"]
+    environment:
+      <<: *db-env
+      MCP_TRANSPORT: http
+      INDEXING_MCP_HOST: 0.0.0.0
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+
+  retrieval:
+    <<: *backend
+    command: ["python", "-m", "backend.mcp_servers.retrieval.server"]
+    environment:
+      <<: *db-env
+      MCP_TRANSPORT: http
+      RETRIEVAL_MCP_HOST: 0.0.0.0
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+
+  db:
+    <<: *backend
+    command: ["python", "-m", "backend.mcp_servers.db.server"]
+    environment:
+      <<: *db-env
+      MCP_TRANSPORT: http
+      DB_MCP_HOST: 0.0.0.0
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+
+  # The A2A agents (Deep Research, Data Analyst, Extractor, ...). Tools only
+  # through the API (/internal/tools) with AGENTS_INTERNAL_TOKEN.
   agents:
-    build: .
+    <<: *backend
     command: ["python", "-m", "backend.apps.agents.main"]
-    env_file:
-      - backend/.env
     environment:
       AGENTS_HOST: 0.0.0.0
       AGENTS_URL: http://agents:9100
       AGENTS_API_URL: http://app:8100
-    volumes:
-      - ./backend:/app/backend
 
   # Runs the code the assistant writes (run_python_code, spreadsheet
-  # analysis). Locked down: no secrets, read-only filesystem, minimal
+  # analysis). Locked down: no app secrets except the internal token (only
+  # its root server process can read it), read-only filesystem, minimal
   # capabilities, resource limits, and on the `sandbox` network only — it
-  # can reach the API (to fetch an attached spreadsheet with a one-time
-  # token) but not Postgres or the internet. Each submission runs as its own
-  # unprivileged uid inside (backend/mcp_servers/code/execution/sandbox.py).
+  # can reach the API (one-time file tokens) but not Postgres or the
+  # internet. Each submission runs as its own unprivileged uid inside.
   code-sandbox:
     build:
       context: .
       dockerfile: docker/sandbox/Dockerfile
+    restart: unless-stopped
     init: true
     read_only: true
     tmpfs:
       - /work:size=1g,mode=0711
       - /tmp:size=256m
-    cap_drop:
-      - ALL
-    cap_add:
-      - SETUID
-      - SETGID
-      - CHOWN
-      - DAC_OVERRIDE
-      - KILL
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE, KILL]
     security_opt:
       - no-new-privileges:true
     mem_limit: 2g
@@ -88,11 +139,12 @@ services:
     cpus: 2
     environment:
       CODE_MCP_FILE_SOURCE_URL: http://app:8100/internal/files
-    networks:
-      - sandbox
+      MCP_INTERNAL_TOKEN: ${MCP_INTERNAL_TOKEN:-}
+    networks: [sandbox]
 
   postgres:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: raguser
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
@@ -108,11 +160,47 @@ services:
       timeout: 5s
       retries: 20
 
+  # --- optional: public entrance (profiles) ---------------------------------
+
+  # Caddy: serves the built frontend at / and proxies /api to the API (never
+  # /internal). With SITE_ADDRESS set to a domain pointing at this machine,
+  # Caddy gets an HTTPS certificate automatically. Builds the frontend from
+  # FRONTEND_DIR (default ../agenticapp-frontend).
+  web:
+    profiles: [edge, tunnel]
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+      additional_contexts:
+        frontend: ${FRONTEND_DIR:-../agenticapp-frontend}
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "${WEB_HTTP_PORT:-80}:80"
+      - "${WEB_HTTPS_PORT:-443}:443"
+    volumes:
+      - caddy_data:/data
+    depends_on: [app]
+
+  # A named Cloudflare tunnel to `web` — for running on your PC without
+  # opening ports. Create the tunnel in the Cloudflare dashboard with its
+  # public hostname pointing at http://web:80, put its token in
+  # CLOUDFLARE_TUNNEL_TOKEN (root .env).
+  cloudflared:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:2025.9.1
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on: [web]
+
 networks:
-  # internal: no route to the outside world. Only `app` and `code-sandbox`
-  # are on it.
+  # internal: no route to the outside world. Only `app` and `code-sandbox`.
   sandbox:
     internal: true
 
 volumes:
   agenticapp_pgdata:
+  caddy_data:

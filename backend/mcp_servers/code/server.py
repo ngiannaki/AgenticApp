@@ -37,6 +37,8 @@ if str(project_root) not in sys.path:
 
 from fastmcp import FastMCP
 
+from backend.core.mcp_http import run_mcp_http
+
 from backend.mcp_servers.code.config.settings import get_settings
 from backend.mcp_servers.code.errors import to_error_dict
 from backend.mcp_servers.code.execution.runner import run_python_code as _run_python_code
@@ -375,8 +377,4 @@ if __name__ == "__main__":
     if os.environ.get("MCP_TRANSPORT", "http") == "stdio":
         mcp.run(transport="stdio")
     else:
-        mcp.run(
-            transport="http",
-            host=settings.host,
-            port=settings.port,
-        )
+        run_mcp_http(mcp, settings.host, settings.port)

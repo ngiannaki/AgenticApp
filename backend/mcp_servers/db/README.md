@@ -46,7 +46,7 @@ Postgres (pgvector image), run the migrations and create the role. By hand:
    mandatory human approval (`API_MANDATORY_APPROVAL_TOOLS`). See
    `permissions.example.yaml` for per-table rules.
 5. **Run the server** (matches how `indexing`/`retrieval` are started; see
-   the repo's `start_mcp_servers.ps1` / `HOW_TO_RUN_SERVERS.md`):
+   the repo's `start_mcp_servers.ps1` / `RUNNING.md`):
    ```
    .venv/Scripts/python.exe backend/mcp_servers/db/server.py
    ```

@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 from backend.apps.api.auth import UserStore
 from backend.apps.api.config import get_api_settings
 from backend.apps.api.document_registry import DocumentRegistry
+from backend.apps.api.indexer import Indexer
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
 from backend.apps.api.routers import agents, auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
@@ -45,6 +46,7 @@ from backend.apps.api.sessions import SessionManager
 # router, references the runtime class name directly.
 from backend.apps.api.streaming_agent import AgentRuntime
 from backend.config import settings as app_settings
+from backend.core.mcp_http import internal_token
 from backend.core.db import apply_migrations, close_pool, ensure_agent_role, get_pool, run_sync
 
 logger = logging.getLogger("agentic_api")
@@ -66,6 +68,9 @@ def _load_servers(servers_path: Path) -> dict:
         # just reads backend/.env directly).
         if "command" in entry:
             entry["env"] = {**os.environ, **entry.get("env", {})}
+        elif "url" in entry and internal_token():
+            # HTTP MCP servers require the internal token (backend/core/mcp_http.py).
+            entry["headers"] = {**entry.get("headers", {}), "Authorization": f"Bearer {internal_token()}"}
     return {"mcpServers": mapping}
 
 
@@ -139,6 +144,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.user_store = UserStore(pool)
     app.state.document_registry = DocumentRegistry(pool)
     runtime.document_registry = app.state.document_registry
+    app.state.indexer = Indexer(runtime, app.state.document_registry)
+    requeued = await app.state.indexer.requeue_pending()
+    if requeued:
+        logger.info("Re-queued %d document(s) left mid-indexing by the restart", requeued)
 
     if app_settings.auth.dev_bypass:
         app.state.dev_user = await app.state.user_store.seed_dev_user(
@@ -172,6 +181,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reaper_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reaper_task
+        await app.state.indexer.close()
         if app.state.agent_hub is not None:
             await app.state.agent_hub.close()
         await runtime.close()
