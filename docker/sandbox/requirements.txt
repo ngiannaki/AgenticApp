@@ -1,0 +1,23 @@
+# The code sandbox image: the Code MCP server itself, plus the libraries
+# submitted code may use. Deliberately small — none of the indexing,
+# retrieval, database or LLM stack, and no app secrets.
+
+# server
+fastmcp==3.4.7
+mcp==1.29.0
+pydantic==2.13.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+httpx==0.28.1
+
+# generate_file + spreadsheet tools (see backend/mcp_servers/code/requirements.txt)
+python-docx>=1.1,<2
+openpyxl>=3.1,<4
+pandas>=2.0,<3
+xlrd>=2.0,<3
+odfpy>=1.4,<2
+
+# common analysis libraries for submitted code
+numpy>=2.0,<3
+matplotlib>=3.9,<4
+tabulate>=0.9,<1

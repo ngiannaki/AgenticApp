@@ -1,7 +1,6 @@
 """Dispatches generate_file's {format, filename, content} to the right
-writer, then persists the result the same way run_python_code's captured
-artifacts are — through ArtifactStore, served back at
-GET /api/files/{id}/{filename}.
+writer, then returns the file inline the same way run_python_code's captured
+artifacts are; the API stores it and serves it at GET /api/files/{id}/{filename}.
 
 Unlike run_python_code, this never executes anything: content is validated,
 structured input (see documents.py / tables.py), so there's no subprocess,
@@ -13,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from backend.mcp_servers.code.artifacts import artifact_url, get_artifact_store
+from backend.mcp_servers.code.artifacts import inline_artifact
 from backend.mcp_servers.code.errors import ValidationError
 from backend.mcp_servers.code.generation import writers
 
@@ -49,16 +48,8 @@ def generate_file(format: str, filename: str, content: dict[str, Any], *, settin
         raise ValidationError(f"Generated file is {len(data)} bytes, exceeding the {settings.max_artifact_bytes}-byte limit.")
 
     safe_name = _finalize_filename(filename, fmt)
-    store = get_artifact_store()
-    artifact_id = store.save(data, safe_name)
-
-    return {
-        "success": True,
-        "filename": safe_name,
-        "url": artifact_url(settings, artifact_id, safe_name),
-        "content_type": _CONTENT_TYPES[fmt],
-        "size_bytes": len(data),
-    }
+    # Returned inline; the API stores it and swaps in a URL (see artifacts.py).
+    return {"success": True, **inline_artifact(data, safe_name, _CONTENT_TYPES[fmt])}
 
 
 def _finalize_filename(filename: str, fmt: str) -> str:

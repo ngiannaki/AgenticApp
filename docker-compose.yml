@@ -25,6 +25,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      code-sandbox:
+        condition: service_started
+    networks:
+      - default
+      - sandbox
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -36,6 +41,39 @@ services:
       # real deploys, not this compose file) is untouched and still bakes
       # the code in instead.
       - ./backend:/app/backend
+
+  # Runs the code the assistant writes (run_python_code, spreadsheet
+  # analysis). Locked down: no secrets, read-only filesystem, minimal
+  # capabilities, resource limits, and on the `sandbox` network only — it
+  # can reach the API (to fetch an attached spreadsheet with a one-time
+  # token) but not Postgres or the internet. Each submission runs as its own
+  # unprivileged uid inside (backend/mcp_servers/code/execution/sandbox.py).
+  code-sandbox:
+    build:
+      context: .
+      dockerfile: docker/sandbox/Dockerfile
+    init: true
+    read_only: true
+    tmpfs:
+      - /work:size=1g,mode=0711
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    pids_limit: 256
+    cpus: 2
+    environment:
+      CODE_MCP_FILE_SOURCE_URL: http://app:8100/internal/files
+    networks:
+      - sandbox
 
   postgres:
     image: pgvector/pgvector:pg16
@@ -53,6 +91,12 @@ services:
       interval: 2s
       timeout: 5s
       retries: 20
+
+networks:
+  # internal: no route to the outside world. Only `app` and `code-sandbox`
+  # are on it.
+  sandbox:
+    internal: true
 
 volumes:
   agenticapp_pgdata:

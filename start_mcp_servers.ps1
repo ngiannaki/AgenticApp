@@ -89,7 +89,8 @@ $logDir    = Join-Path $repoRoot "logs"   # each server's console output is tee'
 $indexingModule  = "backend.mcp_servers.indexing.server"
 $retrievalModule = "backend.mcp_servers.retrieval.server"
 $dbModule = "backend.mcp_servers.db.server"
-$codeModule = "backend.mcp_servers.code.server"
+$sandboxImage = "agenticapp-code-sandbox"
+$sandboxName  = "agenticapp-code-sandbox"
 $apiModule = "backend.apps.api.main"
 
 # Set this to the folder containing nginx.exe if you want this script to also launch nginx.
@@ -167,7 +168,7 @@ if ($LASTEXITCODE -eq 0) {
             -e "POSTGRES_USER=$pgUser" `
             -e "POSTGRES_PASSWORD=$pgPassword" `
             -e "POSTGRES_DB=$pgDb" `
-            -p "${pgPort}:5432" `
+            -p "127.0.0.1:${pgPort}:5432" `
             -v "${pgVolume}:/var/lib/postgresql/data" `
             $pgImage *> $null
     }
@@ -213,13 +214,42 @@ Write-Host "Starting DB MCP server (port 8002)..." -ForegroundColor Cyan
 $dbProc = Start-PythonServer -Name "db" -Module $dbModule `
     -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
 
-# --- Start Code Execution server (port 8003, assumed hardcoded in server.py) ---
-Write-Host "Starting Code Execution MCP server (port 8003)..." -ForegroundColor Cyan
-$codeProc = Start-PythonServer -Name "code" -Module $codeModule `
-    -PythonExe $pythonExe -WorkDir $repoRoot -LogDir $logDir
+# --- Start the code sandbox (port 8003) in its own locked-down container ---
+# Same image and restrictions as docker-compose.yml's code-sandbox service:
+# no secrets, read-only filesystem, minimal capabilities, resource limits;
+# each submission runs as its own unprivileged uid inside. Only published on
+# 127.0.0.1. It fetches attached spreadsheets from the API on the host
+# (host.docker.internal) with one-time tokens. Unlike compose, Docker Desktop
+# can't cut a container off from the internet while still letting it reach
+# the host, so submitted code here does have outbound network access — and
+# can reach ports on this PC via host.docker.internal (including Postgres).
+# Its own network keeps it away from the other containers, but use a real
+# Postgres password (not the default) if anyone else can use this app; for a
+# fully isolated sandbox use docker compose instead.
+Write-Host "Building/starting the code sandbox container (port 8003)..." -ForegroundColor Cyan
+$prevErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+docker build -q -t $sandboxImage -f (Join-Path $repoRoot "docker\sandbox\Dockerfile") $repoRoot | Out-Null
+if ($pgPassword -eq "changeme") {
+    Write-Warning "Postgres still uses the default password 'changeme' - code run in the sandbox could reach it via host.docker.internal. Change it before sharing this app."
+}
+docker network inspect agenticapp-sandbox *> $null
+if ($LASTEXITCODE -ne 0) { docker network create agenticapp-sandbox *> $null }
+docker rm -f $sandboxName *> $null
+docker run -d --name $sandboxName --network agenticapp-sandbox --init --read-only `
+    --tmpfs "/work:size=1g,mode=0711" --tmpfs "/tmp:size=256m" `
+    --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add KILL `
+    --security-opt "no-new-privileges:true" --memory 2g --pids-limit 256 --cpus 2 `
+    -p "127.0.0.1:8003:8003" `
+    -e "CODE_MCP_FILE_SOURCE_URL=http://host.docker.internal:8100/internal/files" `
+    $sandboxImage *> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Could not start the code sandbox container - code execution will be unavailable."
+}
+$ErrorActionPreference = $prevErrorActionPreference
 
 Write-Host "DB server PID:        $($dbProc.Id)"
-Write-Host "Code server PID:      $($codeProc.Id)"
+Write-Host "Code sandbox:         container '$sandboxName' (docker logs $sandboxName)"
 
 Write-Host "Indexing server PID:  $($indexingProc.Id)"
 Write-Host "Retrieval server PID: $($retrievalProc.Id)"
@@ -231,7 +261,7 @@ Write-Host "Waiting for MCP servers before starting the Agentic API..." -Foregro
 $indexingReady  = Wait-ForPort -ServerName "Indexing MCP server"  -Port 8000
 $retrievalReady = Wait-ForPort -ServerName "Retrieval MCP server" -Port 8001
 $dbReady        = Wait-ForPort -ServerName "DB MCP server"        -Port 8002
-$codeReady      = Wait-ForPort -ServerName "Code Execution MCP server" -Port 8003
+$codeReady      = Wait-ForPort -ServerName "Code sandbox" -Port 8003 -TimeoutSeconds 120
 
 if ($indexingReady -and $retrievalReady -and $dbReady -and $codeReady) {
     Write-Host "Starting Agentic API server (port 8100)..." -ForegroundColor Cyan
@@ -261,6 +291,6 @@ if ($nginxDir) {
 Write-Host ""
 Write-Host "All set. Servers are running in their own windows." -ForegroundColor Green
 Write-Host "Closing this window will NOT stop them (they were launched as separate processes)."
-$allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id, $codeProc.Id)
+$allPids = @($indexingProc.Id, $retrievalProc.Id, $dbProc.Id)
 if ($apiProc) { $allPids += $apiProc.Id }
-Write-Host "To stop them manually: Stop-Process -Id $($allPids -join ',')"
+Write-Host "To stop them manually: Stop-Process -Id $($allPids -join ',') ; docker stop $sandboxName"

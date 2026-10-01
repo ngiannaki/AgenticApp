@@ -259,3 +259,12 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Agent-created tables from before this change remain in the old `public` schema (invisible now) — copy any still needed into the owner's workspace by hand, or drop them
 - ⬜ Older root docs (HOW_TO_RUN_SERVERS.md, QUICK_START.md, ENHANCED_METADATA.md, RAG_IMPROVEMENTS_SUMMARY.md) still describe Chroma/Mongo — consolidate in Phase 7
 - ⬜ Phase 2: code sandbox container
+
+## 2026-10-01
+- ✅ Phase 2: code sandbox container (no secrets, read-only, minimal caps, limits, internal network) + per-run unprivileged uid with rlimits and leftover-process cleanup
+- ✅ Fixed: a background process left by submitted code could hang the code server forever (output pipe held open)
+- ✅ Generated files returned inline and stored by the API; spreadsheets fetched by the sandbox with one-time tokens; user_id/file_token hidden from the model's tool schemas
+- ✅ CI: sandbox isolation tests under sudo + build/run the real image and smoke-test it
+- ⬜ Locally: `docker compose up --build`, attach a spreadsheet in chat, ask for a sum and a chart; optionally `docker exec -i <code-sandbox container> python - < docker/sandbox/smoke_test.py`
+- ⬜ ps1 mode: set a real Postgres password (the sandbox can reach host ports there); compose mode is the fully isolated one
+- ⬜ Phase 3: compose all-HTTP topology + internal MCP token + Caddy / cloudflared + same-origin frontend

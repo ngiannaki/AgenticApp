@@ -356,6 +356,7 @@ class CodeMcpSettings(BaseSettings):
     )
 
     _normalize_python_executable = field_validator("python_executable", mode="before")(_blank_to_none)
+    _normalize_file_source_url = field_validator("file_source_url", mode="before")(_blank_to_none)
 
     @field_validator("python_executable", mode="after")
     @classmethod
@@ -375,6 +376,38 @@ class CodeMcpSettings(BaseSettings):
     env_passthrough: list[str] = Field(
         default_factory=lambda: ["PATH", "SYSTEMROOT", "TEMP", "TMP", "PATHEXT", "USERPROFILE", "HOME"],
         description="Host environment variables forwarded into the executed subprocess. Everything else (API keys, DB URLs, ...) is stripped so submitted code can't read backend secrets via os.environ. USERPROFILE/HOME are included so libraries that cache to a home-relative dir (e.g. matplotlib's font cache) don't rebuild it on every run.",
+    )
+
+    # --- OS-level isolation (Linux; see execution/sandbox.py) ---------------------
+    isolation: str = Field(
+        default="auto",
+        description=(
+            "'uid': run each submission as its own unprivileged user (one of the runner "
+            "uids below, never shared by two concurrent runs) with resource limits — needs "
+            "this server to run as root on Linux, as it does in the code-sandbox container. "
+            "'none': run as this server's own user (local Windows/dev only). 'auto': 'uid' "
+            "when possible, else 'none' with a warning."
+        ),
+    )
+    require_isolation: bool = Field(
+        default=False,
+        description="Refuse to run any code unless uid isolation is active. Set in the code-sandbox container so a misconfiguration fails closed.",
+    )
+    runner_uid_start: int = Field(default=20001, gt=0, description="First uid of the runner pool.")
+    runner_uid_count: int = Field(default=8, gt=0, description="Runner pool size = max concurrent code runs.")
+    runner_wait_seconds: float = Field(default=30.0, ge=0, description="How long a run waits for a free runner before failing as busy.")
+    max_memory_mb: int = Field(default=2048, gt=0, description="Address-space limit per run (RLIMIT_AS).")
+    max_processes: int = Field(default=64, gt=0, description="Process/thread limit per run (RLIMIT_NPROC, uid isolation only).")
+    max_file_size_mb: int = Field(default=200, gt=0, description="Largest file a run may write (RLIMIT_FSIZE).")
+
+    file_source_url: str | None = Field(
+        default=None,
+        description=(
+            "Where spreadsheet tools fetch an attached document from: the API's internal "
+            "one-time file endpoint (e.g. http://app:8100/internal/files). The API puts a "
+            "single-use `file_token` in each call; this server never sees the shared "
+            "document folder. Unset = read from the local document store (non-container dev)."
+        ),
     )
 
     # --- Generated-file capture (plots, CSVs, ...) --------------------------------

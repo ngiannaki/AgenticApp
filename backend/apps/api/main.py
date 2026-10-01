@@ -35,7 +35,7 @@ from backend.apps.api.config import get_api_settings
 from backend.apps.api.document_registry import DocumentRegistry
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import auth, chat, conversations, data, files, interrupts, questions, sessions, tools
+from backend.apps.api.routers import auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
 from backend.apps.api.sessions import SessionManager
 # ROLLBACK: swapped from `from backend.apps.api.streaming_agent import
 # AgentRuntime` to try the v2 orchestrator/executor/critic runtime live. To
@@ -188,6 +188,7 @@ def create_app() -> FastAPI:
     app.include_router(files.router)
     app.include_router(files.documents_router)
     app.include_router(data.router)
+    app.include_router(internal.router)
 
     @app.get("/api/health")
     async def health() -> JSONResponse:

@@ -1,25 +1,26 @@
-"""Shared ArtifactStore access for the Code MCP server's tools.
+"""How the Code MCP server hands generated files back.
 
-Both run_python_code (captured output files) and generate_file (directly
-produced documents) persist through the same store and URL scheme, so this
-lives in one place rather than being duplicated per tool.
+Captured run outputs (a matplotlib plot, a CSV...) and generate_file /
+generate_ui results all come back *inline*: base64 bytes plus filename and
+content type, in the tool result itself. The API turns each one into a
+stored, downloadable artifact and replaces the bytes with a URL before the
+model or the UI ever see the result (backend/apps/api/artifacts.py). This
+server therefore keeps nothing on disk between calls and needs no storage
+shared with the API — which is what lets it run in its own locked-down
+container.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
-
-from backend.core.storage.artifact_store import ArtifactStore
-
-_artifact_store: Optional[ArtifactStore] = None
+import base64
+import mimetypes
+from typing import Any
 
 
-def get_artifact_store() -> ArtifactStore:
-    global _artifact_store
-    if _artifact_store is None:
-        _artifact_store = ArtifactStore()
-    return _artifact_store
-
-
-def artifact_url(settings: Any, artifact_id: str, filename: str) -> str:
-    return f"{settings.artifact_public_base_url}/api/files/{artifact_id}/{filename}"
+def inline_artifact(data: bytes, filename: str, content_type: str | None = None) -> dict[str, Any]:
+    return {
+        "filename": filename,
+        "content_type": content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        "size_bytes": len(data),
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }

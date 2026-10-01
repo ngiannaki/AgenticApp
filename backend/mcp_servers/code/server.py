@@ -7,11 +7,17 @@ profile_spreadsheet, run_python_code_on_document (the latter two operate on
 a spreadsheet attached in the chat inbox — see execution/spreadsheet.py —
 and are unrelated to the indexing/retrieval MCP servers' document pipeline).
 
-Security model, in one sentence: submitted code always runs as a fresh
-subprocess in a throwaway temp directory with a stripped environment and a
-hard timeout — never inside this server's own process — and the one tool
-that can reach an arbitrary executable (run_shell_command) is off by
-default and, even when enabled, restricted to an explicit allowlist.
+Security model: submitted code always runs as a fresh subprocess in a
+throwaway directory, as its own unprivileged runner uid with resource limits
+(when this server runs as root on Linux — the code-sandbox container, see
+execution/sandbox.py), with a stripped environment and a hard timeout —
+never inside this server's own process. The container itself has no secrets,
+a read-only filesystem and no network route except to the API. The one tool
+that can reach an arbitrary executable (run_shell_command) is off by default
+and, even when enabled, restricted to an explicit allowlist.
+
+`file_token` on the spreadsheet tools is a single-use grant the API injects
+(never chosen by the model) for downloading the attached file.
 generate_file is a different animal entirely: it never executes anything,
 only renders validated structured input into a file via python-docx /
 openpyxl / the stdlib csv module. See README.md.
@@ -41,15 +47,16 @@ from backend.mcp_servers.code.execution.spreadsheet import run_python_code_on_do
 from backend.mcp_servers.code.generation.generator import generate_file as _generate_file
 from backend.mcp_servers.code.generation.ui import generate_ui as _generate_ui
 
-# Ensure logs directory exists
-log_dir = Path(__file__).parent.parent.parent.parent / "logs"
-log_dir.mkdir(exist_ok=True)
-
 logger = logging.getLogger(__name__)
-handlers = [
-    logging.FileHandler(log_dir / "code_server.log", encoding="utf-8"),
-    logging.StreamHandler(),
-]
+handlers: list[logging.Handler] = [logging.StreamHandler()]
+# Also log to a file when there's somewhere writable for it (not in the
+# code-sandbox container, whose filesystem is read-only — stdout only there).
+log_dir = Path(__file__).parent.parent.parent.parent / "logs"
+try:
+    log_dir.mkdir(exist_ok=True)
+    handlers.append(logging.FileHandler(log_dir / "code_server.log", encoding="utf-8"))
+except OSError:
+    pass
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 root_logger = logging.getLogger()
 for handler in handlers:
@@ -173,7 +180,7 @@ def run_shell_command(
 
 
 @mcp.tool
-def profile_spreadsheet(document_id: str) -> dict:
+def profile_spreadsheet(document_id: str, file_token: str = "") -> dict:
     """Inspect a spreadsheet attached in this chat (xlsx/xlsm/xls/ods/csv)
     without running any code: sheet names, row/column counts, column headers,
     and 3 sample rows per sheet. Use this first for a spreadsheet the user
@@ -192,7 +199,7 @@ def profile_spreadsheet(document_id: str) -> dict:
     sheet). Unlike retrieval over an indexed document, `rows` here is the
     real, exact row count for that sheet — not a sampled estimate.
     """
-    return _handle("profile_spreadsheet", _profile_spreadsheet, document_id, settings=settings)
+    return _handle("profile_spreadsheet", _profile_spreadsheet, document_id, settings=settings, file_token=file_token)
 
 
 @mcp.tool
@@ -201,6 +208,7 @@ def run_python_code_on_document(
     code: str,
     timeout_seconds: Optional[int] = None,
     stdin: Optional[str] = None,
+    file_token: str = "",
 ) -> dict:
     """Run pandas (or any Python) code against the full, real contents of a
     spreadsheet attached in this chat — for anything profile_spreadsheet's
@@ -228,7 +236,7 @@ def run_python_code_on_document(
     """
     return _handle(
         "run_python_code_on_document", _run_python_code_on_document, document_id, code,
-        settings=settings, timeout_seconds=timeout_seconds, stdin=stdin,
+        settings=settings, timeout_seconds=timeout_seconds, stdin=stdin, file_token=file_token,
     )
 
 

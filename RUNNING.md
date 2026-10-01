@@ -29,8 +29,12 @@ cd C:\Users\Nigia\source\repos\AgenticApp
 This script starts, in order: Postgres (Docker, pgvector image — an old
 `postgres:16` container is recreated on the new image, keeping its data
 volume), `python -m backend.scripts.db_setup` (migrations + the DB server's
-restricted role), the 4 MCP servers (ports 8000-8003), then the Agentic API
-(port 8100) once all 4 report healthy. `backend/apps/client/servers.json`
+restricted role), the indexing/retrieval/db MCP servers (ports 8000-8002),
+the code sandbox as a locked-down container (`agenticapp-code-sandbox`,
+published on `127.0.0.1:8003`), then the Agentic API (port 8100) once all 4
+are up. Unlike the compose setup, Docker Desktop can't cut the sandbox off
+from the internet or from ports on your PC (`host.docker.internal`), so set
+a real Postgres password before letting anyone else use a ps1-run app. `backend/apps/client/servers.json`
 points the API at `http://localhost:800{0,1,2,3}/mcp` for this mode — leave
 it as-is; nothing about this mode changed.
 
@@ -50,8 +54,10 @@ its own container.
 docker compose up --build
 ```
 
-This brings up 2 containers: `app` (API + 4 MCP servers, port 8100) and
-`postgres` (pgvector image; reachable from the host on `127.0.0.1:5432`
+This brings up 3 containers: `app` (API + the indexing/retrieval/db MCP
+servers, port 8100), `code-sandbox` (the code MCP server, locked down — see
+`backend/mcp_servers/code/README.md`; reachable only from `app`, no internet)
+and `postgres` (pgvector image; reachable from the host on `127.0.0.1:5432`
 only). `docker-compose.yml` reuses `backend/.env` for everything (API keys,
 model names, feature flags, ...) and only overrides the database URLs to
 point at the `postgres` service. Passwords come from a root `.env` file

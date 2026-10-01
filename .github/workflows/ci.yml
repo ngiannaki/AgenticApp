@@ -59,6 +59,48 @@ jobs:
       - name: Run backend/tests
         run: python -m pytest backend/tests
 
+  sandbox-isolation:
+    # The code sandbox's uid isolation needs root (as in its container), so
+    # these tests run under sudo; everywhere else they're skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies (+ pandas for the spreadsheet tests)
+        run: pip install -r backend/requirements-test.txt pandas openpyxl
+      - name: Run sandbox tests as root
+        run: sudo -E env "PATH=$PATH" python -m pytest backend/tests/test_code_sandbox.py -v
+
+  sandbox-image:
+    # Build the real code-sandbox image and run it the way docker-compose.yml
+    # does (read-only, minimal capabilities, internal network), then check
+    # from inside that submitted code is unprivileged, can't read the
+    # server's environment, has no internet and can't write the filesystem.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t agenticapp-code-sandbox -f docker/sandbox/Dockerfile .
+      - name: Start it like compose does
+        run: |
+          docker network create --internal sandbox-ci
+          docker run -d --name sandbox --network sandbox-ci --init --read-only \
+            --tmpfs /work:size=1g,mode=0711 --tmpfs /tmp:size=256m \
+            --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add KILL \
+            --security-opt no-new-privileges:true --memory 2g --pids-limit 256 \
+            agenticapp-code-sandbox
+          for i in $(seq 1 30); do
+            docker exec sandbox python -c "import socket; socket.create_connection(('127.0.0.1', 8003), 1)" 2>/dev/null && break
+            sleep 1
+          done
+      - name: Smoke test
+        run: docker exec -i sandbox python - < docker/sandbox/smoke_test.py
+      - name: Server logs
+        if: always()
+        run: docker logs sandbox
+
   docker-compose-validate:
     runs-on: ubuntu-latest
     steps:

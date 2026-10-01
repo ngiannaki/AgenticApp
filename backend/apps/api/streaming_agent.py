@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import re
@@ -29,10 +30,12 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from backend.apps.api import events
+from backend.apps.api.artifacts import FileTokenStore, materialize_artifacts
 from backend.apps.api import skills as skills_lib
 from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
 from backend.config import get_async_openai_client, get_chat_extra_body, settings as app_settings
+from backend.core.storage.artifact_store import ArtifactStore
 
 logger = logging.getLogger("agentic_api")
 
@@ -54,6 +57,13 @@ GET_SKILL_TOOL_NAME = "get_skill"
 # the code server's spreadsheet tools, and any future document-taking tool,
 # instead of trusting every MCP server to implement its own ownership check.
 _DOCUMENT_ID_ARGS = ("document_id", "document_ids")
+
+# Tool parameters the API always fills in itself and hides from the model's
+# view of the schema (see AgentRuntime.register_tool_schemas):
+# - user_id: the signed-in user, so a model can't act as someone else;
+# - file_token: a single-use grant letting the code sandbox download the one
+#   document named in the call (backend/apps/api/artifacts.py).
+_INJECTED_PARAMS = ("user_id", "file_token")
 
 # Tool calls whose user_id argument must come from the authenticated session,
 # never from the model. The model is told which document_ids are attached
@@ -522,6 +532,9 @@ class AgentRuntime:
         self.settings = settings
         self.tools: list[dict[str, Any]] = []
         self._skill_index: list[skills_lib.SkillMeta] = []
+        self._injected_params: dict[str, set[str]] = {}
+        self.file_tokens = FileTokenStore()
+        self._artifact_store: ArtifactStore | None = None
         self.document_registry: Any = None
         """backend.apps.api.document_registry.DocumentRegistry, set by main.py's
         lifespan once Mongo is connected (None if it isn't). Used by
@@ -596,6 +609,27 @@ class AgentRuntime:
         finally:
             await client.__aexit__(None, None, None)
 
+    def register_tool_schemas(self, specs: list[tuple[str, str, dict[str, Any] | None]]) -> None:
+        """Set the model-visible MCP tools from (name, description, input
+        schema) triples. Parameters the API fills in itself (_INJECTED_PARAMS:
+        the caller's user_id, a sandbox file_token) are recorded per tool and
+        removed from the schema the model sees — it never has to (and
+        can't usefully) supply them."""
+        self.tools = []
+        self._injected_params = {}
+        for name, description, schema in specs:
+            schema = copy.deepcopy(schema or {"type": "object", "properties": {}})
+            props = schema.get("properties") or {}
+            injected = {p for p in _INJECTED_PARAMS if p in props}
+            for p in injected:
+                props.pop(p, None)
+            if injected and isinstance(schema.get("required"), list):
+                schema["required"] = [r for r in schema["required"] if r not in injected]
+            self._injected_params[name] = injected
+            self.tools.append(
+                {"type": "function", "function": {"name": name, "description": description, "parameters": schema}}
+            )
+
     async def _load_tools(self) -> None:
         mcp_tools = await self.mcp.list_tools()
         allowed = set(self.settings.model_tools)
@@ -603,18 +637,9 @@ class AgentRuntime:
         hidden = sorted(t.name for t in mcp_tools if not expose_all and t.name not in allowed)
         if hidden:
             logger.info("Withheld from the model (not in API_MODEL_TOOLS): %s", ", ".join(hidden))
-        self.tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description or "",
-                    "parameters": t.inputSchema,
-                },
-            }
-            for t in mcp_tools
-            if expose_all or t.name in allowed
-        ]
+        self.register_tool_schemas(
+            [(t.name, t.description or "", t.inputSchema) for t in mcp_tools if expose_all or t.name in allowed]
+        )
         self.tools.append(_ASK_USER_TOOL_SCHEMA)
 
         if self.settings.skills_enabled:
@@ -676,14 +701,10 @@ class AgentRuntime:
 
     @property
     def user_scoped_tool_names(self) -> set[str]:
-        """Names of tools whose MCP input schema declares a `user_id`
-        parameter — see _USER_SCOPED_TOOLS's comment above for why this is
-        derived rather than hardcoded."""
-        return {
-            t["function"]["name"]
-            for t in self.tools
-            if "user_id" in ((t["function"]["parameters"] or {}).get("properties") or {})
-        }
+        """Tools whose MCP schema declares a `user_id` parameter — always
+        filled in from the session (see _handle_tool_call), derived from
+        each tool's own schema rather than a hardcoded list."""
+        return {name for name, params in self._injected_params.items() if "user_id" in params}
 
     async def _chat(
         self, session: ChatSession, tools_enabled: bool = True
@@ -895,8 +916,13 @@ class AgentRuntime:
             session.memory.add_tool_result(name, text, tool_call_id=call.id)
             return
 
-        if name in self.user_scoped_tool_names:
+        injected = self._injected_params.get(name, set())
+        if "user_id" in injected:
             arguments["user_id"] = session.user_id
+        if "file_token" in injected:
+            # Only ever for a document that just passed _check_document_access.
+            document_id = arguments.get("document_id")
+            arguments["file_token"] = self.file_tokens.issue(str(document_id)) if document_id else ""
 
         yield events.status(f"calling {name}")
         timeout = self.settings.tool_call_timeout_seconds
@@ -913,9 +939,20 @@ class AgentRuntime:
             ok = False
             logger.error(text)
 
+        if ok:
+            text = self.materialize_artifacts(text)
         text = _collect_and_stamp_citations(citations, chunk_numbers, name, ok, text)
         yield events.tool_result(call_id, name, ok, text)
         session.memory.add_tool_result(name, text, tool_call_id=call.id)
+
+    def materialize_artifacts(self, text: str) -> str:
+        """Store any inline files in a tool result and replace them with URLs
+        (see backend/apps/api/artifacts.py)."""
+        if '"data_base64"' not in text:
+            return text
+        if self._artifact_store is None:
+            self._artifact_store = ArtifactStore()
+        return materialize_artifacts(text, self._artifact_store, app_settings.code_mcp.artifact_public_base_url)
 
     async def _check_document_access(self, session: ChatSession, arguments: dict[str, Any]) -> str | None:
         """Return a denial reason if `arguments` name any document the

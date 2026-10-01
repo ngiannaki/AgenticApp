@@ -49,7 +49,9 @@ class FakeMcp:
 
 def _runtime(tools: list[dict[str, Any]], registry: FakeRegistry | None) -> AgentRuntime:
     runtime = AgentRuntime(FakeMcp(), llm_client=None, settings=app_settings.api, isolated_sessions=False)  # type: ignore[arg-type]
-    runtime.tools = tools
+    runtime.register_tool_schemas(
+        [(t["function"]["name"], t["function"]["description"], t["function"]["parameters"]) for t in tools]
+    )
     runtime.document_registry = registry
     return runtime
 
