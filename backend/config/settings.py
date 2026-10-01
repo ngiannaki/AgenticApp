@@ -588,6 +588,27 @@ class LangchainRagSettings(BaseSettings):
     neighbor_window: int = Field(default=1, ge=0, description="Number of adjacent chunks on each side to splice in when neighbor_expansion is on.")
 
 
+class AgentsSettings(BaseSettings):
+    """The A2A agents service (backend/apps/agents) and how the API reaches it."""
+
+    model_config = _settings_config("AGENTS_")
+
+    enabled: bool = True
+    url: str = "http://localhost:9100"
+    """Where the API reaches the agents service."""
+    api_url: str = "http://localhost:8100"
+    """Where the agents service reaches the API (internal tool endpoint)."""
+    host: str = "127.0.0.1"
+    port: int = 9100
+    internal_token: str | None = None
+    """Shared secret for agents <-> API internal calls. Required: agents are
+    disabled until it's set (to the same value for both processes)."""
+    max_active_tasks_per_user: int = Field(default=2, gt=0)
+    tool_call_timeout_seconds: float = Field(default=300.0, gt=0)
+
+    _normalize = field_validator("internal_token", mode="before")(_blank_to_none)
+
+
 class AuthSettings(BaseSettings):
     """Email/password auth for the API (backend/apps/api/auth.py)."""
 
@@ -652,6 +673,7 @@ class Settings:
         self.rag_v2 = LangchainRagSettings()
         self.google_docai = GoogleDocAISettings()
         self.auth = AuthSettings()
+        self.agents = AgentsSettings()
 
     # --- environment helpers -------------------------------------------------
     @property

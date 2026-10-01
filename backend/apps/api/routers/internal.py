@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import secrets
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from backend.config import settings as app_settings
 
 from backend.apps.api.routers.files import _document_store
 
@@ -48,3 +53,40 @@ def redeem_file(token: str, request: Request) -> FileResponse:
         media_type="application/octet-stream",
         headers={"X-Document-Id": document_id, "X-Document-Suffix": path.suffix.lower()},
     )
+
+
+# --- tool access for the agents service ----------------------------------
+# The agents (backend/apps/agents) never talk to MCP servers themselves:
+# they call tools here, as the task's user, so ownership checks, approvals,
+# sandbox file tokens and artifact handling are exactly the chat's.
+
+
+def _require_agents_token(request: Request) -> None:
+    expected = app_settings.agents.internal_token or ""
+    given = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not expected or not secrets.compare_digest(given, expected):
+        raise HTTPException(status_code=401)
+
+
+class ToolCall(BaseModel):
+    user_id: str
+    agent_id: str = ""
+    name: str
+    arguments: dict[str, Any] = {}
+    approved: bool = False
+
+
+@router.get("/tools")
+def tool_schemas(request: Request, names: str = "") -> list[dict]:
+    """Model-facing schemas (injected params already hidden) of the named tools."""
+    _require_agents_token(request)
+    wanted = {n for n in names.split(",") if n}
+    return [t for t in request.app.state.runtime.tools if t["function"]["name"] in wanted]
+
+
+@router.post("/tools/call")
+async def call_tool(body: ToolCall, request: Request) -> dict:
+    _require_agents_token(request)
+    logger.info("[AGENT TOOL] agent=%s user=%s tool=%s", body.agent_id, body.user_id, body.name)
+    ok, text = await request.app.state.runtime.execute_tool(body.user_id, body.name, body.arguments, approved=body.approved)
+    return {"ok": ok, "text": text}
