@@ -28,5 +28,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Stand in for the real (gitignored) backend/.env
+        # docker-compose.yml's `app` service declares `env_file: backend/.env`,
+        # which is never committed (.gitignore:2) and so doesn't exist on this
+        # runner -- `docker compose config` hard-fails just resolving that
+        # reference, before it even gets to checking syntax. The actual
+        # values don't matter here: this job only validates that the compose
+        # file itself parses and resolves, never builds or runs anything.
+        run: cp backend/.env.example backend/.env
       - name: Validate docker-compose.yml resolves and parses
         run: docker compose config
