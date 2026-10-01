@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from backend.apps.agents.analyst import DataAnalystAgent
 from backend.apps.agents.base import BaseAgent
+from backend.apps.agents.extractor import ExtractorAgent
 from backend.apps.agents.research import DeepResearchAgent
 
-AGENTS: list[BaseAgent] = [DeepResearchAgent(), DataAnalystAgent()]
+AGENTS: list[BaseAgent] = [DeepResearchAgent(), DataAnalystAgent(), ExtractorAgent()]
 BY_ID: dict[str, BaseAgent] = {a.id: a for a in AGENTS}
