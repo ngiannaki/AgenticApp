@@ -17,11 +17,12 @@ Ollama classes there. That branch lives only here.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
-
-from openai import AsyncOpenAI
+from typing import TYPE_CHECKING, Any
 
 from .settings import settings
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 
 
 def _client_kwargs() -> dict[str, Any]:
@@ -31,8 +32,12 @@ def _client_kwargs() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
-def get_async_openai_client() -> AsyncOpenAI:
+def get_async_openai_client() -> "AsyncOpenAI":
     """The one AsyncOpenAI client shared by every functionality."""
+    # Imported here, not at module level: backend.config is also imported by
+    # processes with no LLM stack at all (the code-sandbox container).
+    from openai import AsyncOpenAI
+
     return AsyncOpenAI(**_client_kwargs())
 
 
