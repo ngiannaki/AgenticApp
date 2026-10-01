@@ -268,3 +268,6 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Locally: `docker compose up --build`, attach a spreadsheet in chat, ask for a sum and a chart; optionally `docker exec -i <code-sandbox container> python - < docker/sandbox/smoke_test.py`
 - ⬜ ps1 mode: set a real Postgres password (the sandbox can reach host ports there); compose mode is the fully isolated one
 - ⬜ Phase 3: compose all-HTTP topology + internal MCP token + Caddy / cloudflared + same-origin frontend
+
+## 2026-10-01
+- ✅ Fixed code-sandbox image startup (lazy `openai` import in backend/config/llm_client.py); confirm the `sandbox-image` CI job is green on the next run
