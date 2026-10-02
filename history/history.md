@@ -572,3 +572,12 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
      - Status chatter still appears only in debug mode.
   2. **Agents page:** the tasks rail has a hide button and folds to a slim icon strip (show tasks, new task, build an agent, skills, plus a badge with the running count). The choice is remembered per browser. On phones the strip runs across the top.
   - **Verification:** tsc/eslint/build clean. Screenshots against a mocked API: chat collapsed and expanded with a failed tool's error, and the collapsed agents rail.
+
+## 2026-10-02
+- **Change:** generate_file can now produce PowerPoint decks (pptx), so agents no longer hand-write python-pptx
+- **Files:** backend/mcp_servers/code/generation/pptx_writer.py (new), generation/generator.py, server.py (tool docstring), requirements.txt (code server + docker/sandbox), skills/code-execution-and-artifacts/SKILL.md, apps/agents/custom.py (agent prompt), tests/test_generate_html.py
+- **Details:**
+  1. **Why:** an agent asked for "NVIDIA balance sheet as a professional ppt" produced a poor deck. generate_file had no pptx format, so the agent fell back to writing python-pptx inside run_python_code (unstyled, no real charts/tables).
+  2. **New pptx format:** a themed 16:9 deck from the same document shape as html/docx. The title becomes a dark title slide; `metrics` become KPI-card slides (coloured by trend); each section becomes a slide with text on the left and a native, editable column or line chart on the right; each `table` gets its own styled table slide (split every 9 rows); optional per-section `notes` become speaker notes.
+  3. **Routing:** the SKILL.md tool table, the content-shape list, the agent system prompt and the tool docstring now tell the model to use generate_file for decks and never hand-write pptx. python-pptx was added to the code-server and sandbox requirements.
+  - **Verification:** new test (slide count, native chart, table slides split, notes); a sample deck was exported through PowerPoint and checked slide by slide.

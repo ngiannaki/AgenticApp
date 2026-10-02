@@ -11,6 +11,7 @@
 
 python-docx>=1.1,<2
 openpyxl>=3.1,<4
+python-pptx>=1.0,<2
 pandas>=2.0,<3
 xlrd>=2.0,<3
 odfpy>=1.4,<2

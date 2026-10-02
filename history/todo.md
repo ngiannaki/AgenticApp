@@ -324,3 +324,7 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 ## 2026-10-02
 - ✅ Chat: collapsible tool Activity with friendly names, summaries, status and input/output
 - ✅ Agents: collapsible tasks rail (remembered per browser)
+
+## 2026-10-02
+- ✅ generate_file pptx format (title/KPI/chart/table slides, speaker notes) + prompts/skill route decks to it
+- ⬜ Rebuild the sandbox/code-server image or venv so python-pptx is installed where the code MCP server runs, then rerun the NVIDIA ppt task

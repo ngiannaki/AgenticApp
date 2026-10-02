@@ -244,7 +244,7 @@ def run_python_code_on_document(
 
 @mcp.tool
 def generate_file(format: str, filename: str, content: dict) -> dict:
-    """Generate a properly-formatted txt, md, html, csv, xlsx, or docx file from
+    """Generate a properly-formatted txt, md, html, pptx, csv, xlsx, or docx file from
     structured content and return a URL the user can open it at.
 
     Unlike run_python_code, nothing is executed — `content` is validated,
@@ -292,6 +292,15 @@ def generate_file(format: str, filename: str, content: dict) -> dict:
     [{"name": "Assets", "values": [65728, 111601]}]}` (bar chart, numbers
     only). It has no scripts: for a page the user interacts with (filters,
     toggles, inputs) use generate_ui instead.
+
+    **pptx** renders a themed 16:9 slide deck from the same document shape plus
+    `subtitle`, `metrics` and per-section `chart` as for html: the title becomes
+    a title slide, `metrics` become KPI-card slides, each section becomes a
+    slide (text left, native editable chart right; add `"type": "line"` to a
+    chart for a line chart), and a section `table` gets its own styled table
+    slide (split every 9 rows). Optional per-section `"notes"` become speaker
+    notes. Keep text short - slides, not prose: ~3-6 bullets per section. For a
+    deck, ALWAYS use this rather than writing python-pptx in run_python_code.
 
     For **csv** (a single table):
     ```

@@ -11,12 +11,12 @@ compatibility: Requires the code MCP server (backend/mcp_servers/code). code_gen
 | Goal | Tool | Why not the others |
 |---|---|---|
 | Compute a result, analyze data, draw a static chart | `code_run_python_code` | Only tool that actually executes |
-| Produce a .docx/.xlsx/.csv/.md/.txt from data you already have | `code_generate_file` | Renders real formatting declaratively — no code to get wrong |
+| Produce a .pptx deck/.docx/.xlsx/.csv/.md/.txt from data you already have | `code_generate_file` | Renders real formatting declaratively — no code to get wrong |
 | Something the user clicks/interacts with — an interactive chart, dashboard, form, calculator | `code_generate_ui` | Renders inline as a live sandboxed page |
 
 If `code_generate_ui` is not in your tool list, the operator disabled it — answer without it (a static chart from `run_python_code`, or a table). Don't ask the user to enable it.
 
-Do not hand-write docx/xlsx/csv formatting inside `run_python_code`. `generate_file` produces proper Word heading styles, bordered tables, styled Excel headers and Excel-safe CSV encoding with far fewer ways to fail.
+Do not hand-write pptx/docx/xlsx/csv formatting inside `run_python_code`. `generate_file` produces proper Word heading styles, bordered tables, styled Excel headers and Excel-safe CSV encoding with far fewer ways to fail.
 
 ## Step 2 — generate_ui: build charts as self-contained SVG, not an external library
 
@@ -90,6 +90,7 @@ On `timed_out: true`, the process (and its children) were killed. Reduce the wor
 ## generate_file content shapes
 
 - **txt/md/docx**: `{"title": "...", "sections": [{"heading": "...", "level": 1-4, "paragraphs": [...], "bullets": [...], "numbered": [...], "table": {"headers": [...], "rows": [[...]]}}]}`
+- **pptx**: the document shape plus top-level `subtitle`, `metrics: [{label, value, note, trend?}]` (KPI slides) and per-section `chart: {title, labels, series: [{name, values}], type?: "line"}` and `notes`. Title -> title slide, each section -> a slide (text + native chart), each `table` -> its own table slide. Keep slide text short (3-6 bullets).
 - **csv**: `{"headers": [...], "rows": [[...]]}` (`headers` optional, `rows` required)
 - **xlsx**: as csv for one sheet, or `{"sheets": [{"name": "Q1", "headers": [...], "rows": [[...]]}]}`
 
@@ -104,7 +105,7 @@ Every row must have exactly as many cells as `headers` (or as the first row when
 | `pip install` anything | Shell tool is disabled; the call just fails |
 | Query the DB from inside Python | No credentials in the sandbox — use `db_query_data` and pass values in |
 | `print()` a whole dataframe | Blows the 200KB output cap and truncates what you needed |
-| Build a .docx by hand in Python | `generate_file` does it properly with less risk |
+| Build a .docx or .pptx by hand in Python | `generate_file` does it properly with less risk |
 | Produce an artifact and not link its URL | User never sees it |
 | Load Plotly/Chart.js/etc. via CDN in `generate_ui` for a chart | Silently blank page — the library's storage access throws in the sandbox and halts all script execution, with no visible error |
 | Debug a non-rendering charting-library integration | Rebuild in SVG instead — faster and actually works here |

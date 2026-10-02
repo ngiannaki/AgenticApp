@@ -13,6 +13,7 @@ httpx==0.28.1
 # generate_file + spreadsheet tools (see backend/mcp_servers/code/requirements.txt)
 python-docx>=1.1,<2
 openpyxl>=3.1,<4
+python-pptx>=1.0,<2
 pandas>=2.0,<3
 xlrd>=2.0,<3
 odfpy>=1.4,<2

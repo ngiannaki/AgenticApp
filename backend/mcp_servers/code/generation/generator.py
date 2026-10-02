@@ -15,8 +15,9 @@ from typing import Any
 from backend.mcp_servers.code.artifacts import inline_artifact
 from backend.mcp_servers.code.errors import ValidationError
 from backend.mcp_servers.code.generation import writers
+from backend.mcp_servers.code.generation.pptx_writer import render_pptx
 
-_EXTENSIONS = {"txt": ".txt", "md": ".md", "csv": ".csv", "xlsx": ".xlsx", "docx": ".docx", "html": ".html"}
+_EXTENSIONS = {"txt": ".txt", "md": ".md", "csv": ".csv", "xlsx": ".xlsx", "docx": ".docx", "html": ".html", "pptx": ".pptx"}
 _CONTENT_TYPES = {
     "txt": "text/plain",
     "md": "text/markdown",
@@ -24,6 +25,7 @@ _CONTENT_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "html": "text/html",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 _WRITERS = {
     "txt": writers.render_txt,
@@ -32,6 +34,7 @@ _WRITERS = {
     "xlsx": writers.render_xlsx,
     "docx": writers.render_docx,
     "html": writers.render_html,
+    "pptx": render_pptx,
 }
 
 
