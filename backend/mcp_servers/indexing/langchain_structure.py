@@ -273,6 +273,73 @@ def _extract_table_blocks(text: str) -> list[tuple[str, str]]:
     return segments or [("text", text)]
 
 
+def _caption_candidate(text: str) -> str | None:
+    """The last non-empty line of the text before a table, if it reads like a
+    caption ("Table 3: Revenue by region", "**Balance sheet**")."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    line = lines[-1].lstrip("#").strip().strip("*_").strip()
+    if not line or len(line) > 150 or "|" in line:
+        return None
+    return line
+
+
+def _cells(row: str) -> list[str]:
+    return [c.strip() for c in row.strip().strip("|").split("|")]
+
+
+def _is_trivial(text: str) -> bool:
+    """Running headers/footers and page numbers: at most two short lines."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return len(lines) <= 2 and all(len(ln.strip()) <= 60 and "|" not in ln for ln in lines)
+
+
+def stitch_cross_page_tables(docs: list[Document]) -> list[Document]:
+    """Join tables that a page break cut in two (documents parsed page by
+    page). When a page ends with a table (ignoring a short footer) and a
+    later page starts with one (ignoring a short running header) with the
+    same number of columns, the continuation rows are moved onto the end of
+    the first table — dropping a repeated header, or keeping a "header" that
+    is really the first continued data row. The first table's page records
+    the pages the table spans (`table_pages`)."""
+    out: list[Document] = []
+    target: int | None = None  # index in `out` of the page whose last table may continue
+    for doc in docs:
+        segments = _extract_table_blocks(doc.page_content)
+        merged = False
+        if target is not None:
+            prev = out[target]
+            prev_segments = _extract_table_blocks(prev.page_content)
+            last_table = max((i for i, (k, _) in enumerate(prev_segments) if k == "table"), default=None)
+            first_table = next((i for i, (k, _) in enumerate(segments) if k == "table"), None)
+            if (
+                last_table is not None
+                and first_table is not None
+                and all(_is_trivial(t) for _, t in prev_segments[last_table + 1:])
+                and all(_is_trivial(t) for _, t in segments[:first_table])
+            ):
+                prev_lines = prev_segments[last_table][1].splitlines()
+                cont_lines = [ln for ln in segments[first_table][1].splitlines() if ln.strip()]
+                if len(_cells(prev_lines[0])) == len(_cells(cont_lines[0])):
+                    same_header = _cells(prev_lines[0]) == _cells(cont_lines[0])
+                    rows = cont_lines[2:] if same_header else [cont_lines[0], *cont_lines[2:]]
+                    prev_segments[last_table] = ("table", "\n".join(prev_lines + rows))
+                    pages = prev.metadata.get("table_pages") or [prev.metadata.get("page")]
+                    out[target] = Document(
+                        page_content="\n".join(t for _, t in prev_segments),
+                        metadata={**prev.metadata, "table_pages": [*pages, doc.metadata.get("page")]},
+                    )
+                    del segments[first_table]
+                    merged = True
+        rest = "\n".join(t for _, t in segments)
+        out.append(Document(page_content=rest, metadata=dict(doc.metadata)))
+        if merged and _is_trivial(rest):
+            continue  # the whole page was the continuation: the table may go on
+        target = len(out) - 1
+    return out
+
+
 def _extract_headings(text: str) -> list[dict]:
     headings = []
     for line in text.splitlines():
@@ -330,20 +397,48 @@ def split_markdown_preserving_structure(
 
     out: list[Document] = []
     heading_state: dict = {"h1": None, "h2": None, "h3": None}
-    for kind, segment in _extract_table_blocks(text):
+    table_no = 0
+    caption: str | None = None
+    # Set by stitch_cross_page_tables on a page whose last table continues
+    # onto later pages: belongs to that table's chunks only.
+    table_pages = base_metadata.pop("table_pages", None)
+    segments = _extract_table_blocks(text)
+    tables_on_page = sum(kind == "table" for kind, _ in segments)
+    for kind, segment in segments:
         if not segment.strip():
             continue
 
         if kind == "table":
             section_meta = {k: v for k, v in heading_state.items() if v}
-            for table_chunk in _split_table_by_rows(segment, max_chars=chunk_size * 2):
+            table_no += 1
+            table_id = f"p{page}-t{table_no}" if page is not None else f"t{table_no}"
+            # Context the bare numbers lack: the section it sits in and its
+            # caption (the short line just above it), so it embeds/ranks well.
+            breadcrumb = " > ".join(section_meta[k] for k in ("h1", "h2", "h3") if section_meta.get(k))
+            prefix = "".join(
+                [f"Section: {breadcrumb}\n" if breadcrumb else "", f"Table: {caption}\n" if caption else ""]
+            )
+            parts = _split_table_by_rows(segment, max_chars=chunk_size * 2)
+            for part_no, table_chunk in enumerate(parts, start=1):
                 out.append(
                     Document(
-                        page_content=table_chunk,
-                        metadata={**base_metadata, **section_meta, "chunk_content_type": "table"},
+                        page_content=f"{prefix}\n{table_chunk}" if prefix else table_chunk,
+                        metadata={
+                            **base_metadata,
+                            **section_meta,
+                            "chunk_content_type": "table",
+                            "table_id": table_id,
+                            "table_part": part_no,
+                            "table_parts": len(parts),
+                            **({"table_caption": caption} if caption else {}),
+                            **({"table_pages": table_pages} if table_pages and table_no == tables_on_page else {}),
+                        },
                     )
                 )
+            caption = None
             continue
+
+        caption = _caption_candidate(segment)
 
         _update_heading_state(heading_state, _extract_headings(segment))
 

@@ -571,6 +571,7 @@ class LangchainRagSettings(BaseSettings):
     # --- Grounding / citation context ----------------------------------------
     neighbor_expansion: bool = Field(default=True, description="Splice adjacent chunks (by chunk_index) around each returned hit for extra citation context.")
     neighbor_window: int = Field(default=1, ge=0, description="Number of adjacent chunks on each side to splice in when neighbor_expansion is on.")
+    table_expand_max_chars: int = Field(default=8000, gt=0, description="A hit on part of a table split over several chunks returns the whole table, up to this many characters (parts nearest the hit first).")
 
 
 class AgentsSettings(BaseSettings):

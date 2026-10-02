@@ -24,6 +24,7 @@ caller can cite exactly where an answer came from.
 from __future__ import annotations
 
 import logging
+import re
 from functools import lru_cache
 from typing import Any
 
@@ -78,6 +79,44 @@ def _row_to_document(row: dict[str, Any]) -> Document:
     meta.setdefault("chunk_index", row["chunk_index"])
     meta.setdefault("document_id", row["document_id"])
     return Document(page_content=row["content"], metadata=meta)
+
+
+_TABLE_SEP_LINE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
+
+
+def _join_table_parts(parts: list[dict], hit_part: int, max_chars: int) -> str:
+    """Rebuild a table split over several chunks: the first part as stored
+    (section/caption lines + header), then only the data rows of the others
+    (each part repeats the header). Past max_chars, keeps the parts nearest
+    the hit and says how many rows were left out."""
+    parts = sorted(parts, key=lambda r: (r["metadata"] or {}).get("table_part") or 0)
+    rows_of = []
+    for i, part in enumerate(parts):
+        lines = part["content"].splitlines()
+        if i:
+            sep = next((n for n, ln in enumerate(lines) if _TABLE_SEP_LINE.match(ln.strip())), None)
+            lines = lines[sep + 1:] if sep is not None else lines
+        rows_of.append(lines)
+
+    hit = min(max(hit_part - 1, 0), len(parts) - 1)
+    order = sorted(range(len(parts)), key=lambda i: abs(i - hit))
+    keep = {0, hit}  # the header part and the part that matched, always
+    size = sum(len("\n".join(rows_of[i])) for i in keep)
+    for i in order:
+        if i in keep:
+            continue
+        extra = len("\n".join(rows_of[i]))
+        if size + extra > max_chars:
+            break
+        keep.add(i)
+        size += extra
+    lines: list[str] = []
+    for i in range(len(parts)):
+        if i in keep:
+            lines.extend(rows_of[i])
+        elif not lines or lines[-1] != "| … (rows omitted) |":
+            lines.append("| … (rows omitted) |")
+    return "\n".join(lines)
 
 
 def fuse_rankings(
@@ -162,37 +201,52 @@ class LangchainRetrievalPipelineV2:
             "chunk_content_type": metadata.get("chunk_content_type"),
             "section": cls._section(metadata),
             "expanded": expanded,
+            **({"table_id": metadata["table_id"], "table_pages": metadata.get("table_pages")} if metadata.get("table_id") else {}),
         }
 
     def _expand_neighbors(self, docs: list[Document]) -> list[tuple[Document, bool]]:
-        """For each hit, splice in ±neighbor_window adjacent chunks (by
-        chunk_index within the same document) so a citation carries more
-        surrounding context than one isolated chunk. Returns (doc, expanded)
-        pairs — `doc.page_content` is replaced with the merged text when
-        expansion happened; the original chunk's own metadata is kept."""
-        window = self.cfg.neighbor_window
-        if not window or not docs:
-            return [(d, False) for d in docs]
+        """Give each hit more context. A part of a table that was split into
+        several chunks comes back as the whole table (up to
+        table_expand_max_chars, centred on the hit), and further hits on the
+        same table are dropped. Any other hit gets ±neighbor_window adjacent
+        chunks (by chunk_index) spliced in. Returns (doc, expanded) pairs —
+        `doc.page_content` is replaced with the merged text when expansion
+        happened; the hit's own metadata is kept."""
+        window = self.cfg.neighbor_window if self.cfg.neighbor_expansion else 0
+        if not docs:
+            return []
 
         wanted: dict[str, set[int]] = {}
+        tables: dict[tuple[str, str], list[dict]] = {}
         for doc in docs:
-            idx = doc.metadata.get("chunk_index")
-            if idx is not None:
-                wanted.setdefault(doc.metadata["document_id"], set()).update(
-                    range(idx - window, idx + window + 1)
-                )
+            idx, meta = doc.metadata.get("chunk_index"), doc.metadata
+            if meta.get("table_id") and (meta.get("table_parts") or 1) > 1:
+                key = (meta["document_id"], meta["table_id"])
+                if key not in tables:
+                    tables[key] = self.store.get_chunks(meta["document_id"], metadata={"table_id": meta["table_id"]})
+            elif idx is not None and window:
+                wanted.setdefault(meta["document_id"], set()).update(range(idx - window, idx + window + 1))
         by_key: dict[tuple[str, int], str] = {}
         for document_id, indexes in wanted.items():
             for row in self.store.get_chunks(document_id, chunk_indexes=sorted(indexes)):
                 by_key[(document_id, row["chunk_index"])] = row["content"]
 
-        out = []
+        out: list[tuple[Document, bool]] = []
+        tables_returned: set[tuple[str, str]] = set()
         for doc in docs:
-            idx = doc.metadata.get("chunk_index")
-            if idx is None:
+            meta, idx = doc.metadata, doc.metadata.get("chunk_index")
+            key = (meta.get("document_id"), meta.get("table_id"))
+            if key in tables:
+                if key in tables_returned:
+                    continue
+                tables_returned.add(key)
+                text = _join_table_parts(tables[key], meta.get("table_part") or 1, self.cfg.table_expand_max_chars)
+                out.append((Document(page_content=text, metadata=meta), True))
+                continue
+            if idx is None or not window:
                 out.append((doc, False))
                 continue
-            document_id = doc.metadata["document_id"]
+            document_id = meta["document_id"]
             pieces, expanded = [], False
             for offset in range(-window, window + 1):
                 text = doc.page_content if offset == 0 else by_key.get((document_id, idx + offset))
@@ -201,10 +255,7 @@ class LangchainRetrievalPipelineV2:
                 if offset != 0:
                     expanded = True
                 pieces.append(text)
-            if expanded:
-                out.append((Document(page_content="\n\n".join(pieces), metadata=doc.metadata), True))
-            else:
-                out.append((doc, False))
+            out.append((Document(page_content="\n\n".join(pieces), metadata=meta), True) if expanded else (doc, False))
         return out
 
     # --- search ---------------------------------------------------------------
@@ -235,7 +286,7 @@ class LangchainRetrievalPipelineV2:
                 logger.warning(f"[RETRIEVAL_V2] Reranker unavailable, skipping: {e}")
         docs = candidates[:top_k]
 
-        expanded_docs = self._expand_neighbors(docs) if self.cfg.neighbor_expansion else [(d, False) for d in docs]
+        expanded_docs = self._expand_neighbors(docs)
         source_chunks = []
         for doc, expanded in expanded_docs:
             metadata = dict(doc.metadata)

@@ -20,7 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from backend.config import get_langchain_embedding, settings
 from backend.core.vector_store.pg_store import ChunkRecord, PgVectorStore
 from backend.mcp_servers.indexing.langchain_loaders import load_documents_v2
-from backend.mcp_servers.indexing.langchain_structure import split_markdown_preserving_structure
+from backend.mcp_servers.indexing.langchain_structure import split_markdown_preserving_structure, stitch_cross_page_tables
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class LangchainIndexPipelineV2:
         split_docs: list[Document] = []
         toc_entries: list[dict] = []
         seen = set()
-        for doc in raw_docs:
+        for doc in stitch_cross_page_tables(raw_docs):
             chunks, headings = split_markdown_preserving_structure(doc, self.cfg.chunk_size, self.cfg.chunk_overlap)
             split_docs.extend(chunks)
             for h in headings:
