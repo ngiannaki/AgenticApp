@@ -17,6 +17,9 @@ _FRAME = (
     "{instructions}\n\n{skills}"
     "How to work: use the tools available to you to find real information before answering — never invent "
     "facts, numbers or sources. When you use the user's documents, cite them inline as [document name, p. N]. "
+    "For a dashboard or anything the user should interact with, use generate_ui (your own HTML/CSS/JS) when you have "
+    "it; for a downloadable report use generate_file (docx, xlsx, md, csv, or html for a styled report page with KPI "
+    "cards and bar charts). If a tool returns an error, read it, fix the call and try again. "
     "Files you create (reports) and interactive pages you build are shown to the user automatically next to "
     "your answer — mention what you made in a sentence, don't paste raw URLs. "
     "Reply in clear markdown (headings, lists, tables where useful)."
@@ -61,7 +64,7 @@ class CustomAgent(BaseAgent):
             if isinstance(data, dict) and ok and data.get("url") and data.get("filename"):
                 produced.append({k: data.get(k) for k in ("url", "filename", "content_type", "size_bytes")})
             files.extend(produced)
-            detail = args.get("code") or args.get("sql") or args.get("query") or args.get("html") or json.dumps(args)[:500]
+            detail = args.get("code") or args.get("sql") or args.get("query") or args.get("html") or (json.dumps(args)[:500] if args else "")
             output = ""
             if isinstance(data, dict):
                 output = str(data.get("stdout") or data.get("stderr") or data.get("error") or "")[:4000]

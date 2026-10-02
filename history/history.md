@@ -538,3 +538,23 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
     - pytest 91 passed; the custom-agent run now also builds a UI page and checks it comes back in `files`.
     - Frontend tsc/eslint/build clean.
     - Screenshot of a result with a live page and report files.
+
+## 2026-10-02
+- **Change:** Fixed custom agents failing to produce an HTML dashboard ("format must be one of ['csv', 'docx', 'md', 'txt', 'xlsx'], got 'html'")
+- **Files:** backend/mcp_servers/code/generation/{writers,generator}.py, backend/mcp_servers/code/server.py (generate_file docs), backend/apps/agents/custom.py, backend/tests/test_generate_html.py (new)
+- **Details:**
+  1. **`generate_file` now supports `format: "html"`:** a styled, self-contained report page.
+     - Light/dark aware, printable, no scripts or external assets.
+     - Takes the same title + sections as md/docx.
+     - Optional `subtitle`, `footer` and `metrics` (KPI cards; notes coloured by sign, or by `trend: good|bad`).
+     - A per-section `chart` (grouped bar chart drawn as inline SVG).
+     - Tables right-align numeric columns.
+  2. **Clearer error:** an unknown format now says to use `generate_ui` for an interactive page.
+  3. **Custom-agent instructions:**
+     - Use `generate_ui` for dashboards and anything interactive.
+     - Use `generate_file` for downloadable reports, including the html report page.
+     - When a tool returns an error, read it, fix the call and retry.
+     - Empty tool arguments no longer show an empty `{}` block in the Activity tab.
+  - **Verification:**
+    - pytest 93 passed (new: html report with KPIs, chart and table, HTML escaping, no scripts; the unknown-format hint).
+    - Rendered a sample NVIDIA balance-sheet report and checked it with a screenshot.
