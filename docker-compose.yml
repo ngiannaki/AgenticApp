@@ -44,11 +44,11 @@ services:
       db-setup:
         condition: service_completed_successfully
       indexing:
-        condition: service_started
+        condition: service_healthy
       retrieval:
-        condition: service_started
+        condition: service_healthy
       db:
-        condition: service_started
+        condition: service_healthy
       code-sandbox:
         condition: service_started
     networks: [default, sandbox]
@@ -81,6 +81,11 @@ services:
     depends_on:
       db-setup:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
 
   retrieval:
     <<: *backend
@@ -92,6 +97,11 @@ services:
     depends_on:
       db-setup:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8001), 2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
 
   db:
     <<: *backend
@@ -103,6 +113,11 @@ services:
     depends_on:
       db-setup:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8002), 2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
 
   # The A2A agents (Deep Research, Data Analyst, Extractor, ...). Tools only
   # through the API (/internal/tools) with AGENTS_INTERNAL_TOKEN.

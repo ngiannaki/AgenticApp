@@ -290,3 +290,12 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Try the Extractor and "Rerun with feedback" with a real model
 - ⬜ Before sharing: follow the DEPLOY.md checklist (invite code, daily limits, tokens, passwords)
 - ⬜ Optional later: chat-to-agent handoff tool; move `./data` uploads into Postgres or object storage for multi-host setups
+
+## 2026-10-01
+- ✅ Extractor: surface the real reason when no excerpts are found
+- ⬜ Check the user's documents are indexed with the current embedding model (re-index via scripts/reindex_all.py if the new message says so)
+
+## 2026-10-01
+- ✅ docker-compose: app waits for indexing/retrieval/db to be healthy before connecting
+- ⬜ Rebuild/restart with `docker compose up --build`, confirm app log lists retrieval_* and indexing_* tools, re-upload/re-index docs if needed, retry the Extractor
+- ⬜ Optional: retry-on-startup (or a runtime reconnect) for MCP servers that are skipped, so a late server isn't lost until restart

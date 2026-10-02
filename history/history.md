@@ -448,3 +448,20 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
   - `ruff check backend --select F` is clean (unused imports removed) and enforced in CI.
   - The frontend repo now has CI: lint + static build.
   - **Verification:** pytest 85 passed, compileall OK, ruff clean, frontend lint/build clean.
+
+## 2026-10-01
+- **Change:** Extractor agent — real failure reasons instead of a generic "No relevant text" error
+- **Files:** backend/apps/agents/extractor.py
+- **Details:**
+  - The search loop used to swallow tool failures and skipped documents, so every cause ended as "No relevant text was found in your documents."
+  - It now collects tool errors and `skipped` reasons (e.g. embedding-model mismatch), and reads `documents_searched`.
+  - When nothing is found it reports: search failed + reason, or no indexed documents (none uploaded / still indexing / needs re-index), or no match in N documents.
+  - In the reported log the tool calls returned 200 with no chunks, which points to the user having no documents indexed with the current embedding model; the new message will confirm which.
+
+## 2026-10-01
+- **Change:** Fixed the app starting before the indexing/retrieval MCP servers were reachable
+- **Files:** docker-compose.yml
+- **Details:**
+  - The app log showed "Failed to connect to MCP server 'indexing'/'retrieval', skipping" and only 16 tools: the API connected while those servers were still loading, so retrieval and indexing tools were missing for the whole run. This is why the Extractor found no text (its search call was an unknown tool; the failure was swallowed before the earlier extractor fix).
+  - indexing, retrieval and db now have a TCP healthcheck (ports 8000/8001/8002) and `app` depends on them with `service_healthy` instead of `service_started`.
+  - Not run here (no Docker): verify with `docker compose up --build` that the app log says "Connected to 2x MCP tool(s)" including retrieval_* and indexing_*.

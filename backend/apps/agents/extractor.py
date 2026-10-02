@@ -47,13 +47,21 @@ class ExtractorAgent(BaseAgent):
 
         excerpts: list[dict] = []
         seen: set[str] = set()
+        problems: set[str] = set()
+        searched = 0
         for f in fields:
             await ctx.step("search", f"Searching for {f['key']}", f.get("query", ""))
             args: dict[str, Any] = {"query": f.get("query") or f.get("description") or f["key"], "top_k": 4}
             if inputs["document_ids"]:
                 args["document_ids"] = inputs["document_ids"]
             result = await ctx.call_tool("retrieval_search_my_documents_v2", args)
-            for chunk in (result.data or {}).get("source_chunks", []) if result.ok else []:
+            payload = result.data if isinstance(result.data, dict) else {}
+            if not result.ok or not payload.get("success", False):
+                problems.add((payload.get("error") or result.text or "search failed")[:300])
+            searched = max(searched, payload.get("documents_searched") or 0)
+            for skip in payload.get("skipped") or []:
+                problems.add(skip.get("reason", "")[:300])
+            for chunk in payload.get("source_chunks") or []:
                 grounding = chunk.get("grounding") or {}
                 chunk_id = grounding.get("chunk_id") or chunk.get("text", "")[:40]
                 if chunk_id in seen:
@@ -61,7 +69,15 @@ class ExtractorAgent(BaseAgent):
                 seen.add(chunk_id)
                 excerpts.append({"tag": f"E{len(excerpts) + 1}", "text": chunk.get("text", "")[:1500], "grounding": grounding})
         if not excerpts:
-            raise AgentError("No relevant text was found in your documents.")
+            problems.discard("")
+            if problems:
+                raise AgentError("Document search failed: " + "; ".join(sorted(problems)))
+            if not searched:
+                raise AgentError(
+                    "You have no indexed documents to search (none uploaded yet, still indexing, "
+                    "or indexed with a different embedding model — re-index them)."
+                )
+            raise AgentError(f"No relevant text was found in your {searched} document(s).")
 
         await ctx.step("extract", "Extracting values")
         listing = "\n\n".join(f"[{e['tag']}] ({e['grounding'].get('document_name')}) {e['text']}" for e in excerpts[:40])
