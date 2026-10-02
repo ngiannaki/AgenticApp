@@ -32,7 +32,7 @@ def _client(pg_pool, user_id: str) -> TestClient:
 def test_skills_and_agents_crud(pg_pool, make_user) -> None:
     alice, bob = make_user(), make_user()
     a, b = _client(pg_pool, alice), _client(pg_pool, bob)
-    assert {c["id"] for c in a.get("/api/agent-capabilities").json()} == {"documents", "web", "database", "code"}
+    assert {c["id"] for c in a.get("/api/agent-capabilities").json()} == {"documents", "web", "database", "code", "reports", "ui"}
 
     skill = a.post("/api/skills", json={"name": "Invoices", "instructions": "Read invoices", "tools": ["documents", "code"]}).json()
     assert skill["tools"] == ["code", "documents"]
@@ -82,6 +82,9 @@ class RecordingTools(FakeTools):
         RecordingTools.seen.append((name, approved))
         if name == "db_insert_data":
             return agents_base.ToolResult(True, '{"success": true}')
+        if name == "code_generate_ui":
+            return agents_base.ToolResult(True, json.dumps({"success": True, "filename": "dash.html", "content_type": "text/html",
+                                                            "url": "http://x/api/files/a1/dash.html", "size_bytes": 10}))
         return await super().call(name, arguments, approved)
 
 
@@ -91,7 +94,7 @@ def test_custom_agent_runs_with_its_tools_and_asks_before_changes(pg_pool, make_
     monkeypatch.setattr(settings.agents, "internal_token", TOKEN)
     llm = ScriptedLlm(
         [("retrieval_search_my_documents_v2", {"query": "revenue"}), ("code_run_python_code", {"code": "1"}),
-         ("db_insert_data", {"table": "t", "records": []})],
+         ("db_insert_data", {"table": "t", "records": []}), ("code_generate_ui", {"html": "<b>dash</b>"})],
         "## Answer\nRevenue grew 12% [annual.pdf, p. 4]",
     )
     monkeypatch.setattr(agents_base, "ToolClient", RecordingTools)
@@ -104,7 +107,7 @@ def test_custom_agent_runs_with_its_tools_and_asks_before_changes(pg_pool, make_
     monkeypatch.setattr(RecordingTools, "schemas", schemas, raising=False)
     user = make_user()
     definition = {"name": "Analyst Ann", "instructions": "Be brief", "skills": [{"name": "S", "instructions": "x"}],
-                  "tools": ["retrieval_search_my_documents_v2", "db_insert_data"]}
+                  "tools": ["retrieval_search_my_documents_v2", "db_insert_data", "code_generate_ui"]}
     info = {"id": "custom:abc", "name": "Analyst Ann", "inputs": CustomAgent().describe()["inputs"]}
 
     async def scenario():
@@ -126,8 +129,11 @@ def test_custom_agent_runs_with_its_tools_and_asks_before_changes(pg_pool, make_
             events = await store.events(task["id"])
             report = next(e["data"]["text"] for e in events if e["kind"] == "artifact")
             assert "Revenue grew 12%" in report
+            files = next(e["data"]["data"] for e in events if e["kind"] == "artifact" and e["data"].get("kind") == "files")
+            assert files == [{"url": "http://x/api/files/a1/dash.html", "filename": "dash.html", "content_type": "text/html", "size_bytes": 10}]
             # Search ran; the code tool wasn't granted so it never reached the API; the insert ran approved.
-            assert RecordingTools.seen == [("retrieval_search_my_documents_v2", False), ("db_insert_data", True)]
+            assert RecordingTools.seen == [("retrieval_search_my_documents_v2", False), ("db_insert_data", True),
+                                           ("code_generate_ui", False)]
         finally:
             await hub.close()
             server.should_exit = True

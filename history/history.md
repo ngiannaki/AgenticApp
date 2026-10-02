@@ -522,3 +522,19 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
     - Screenshots at 390×844: chat closed and open, agents task view and home, documents.
     - Tapping a link in the drawer navigates and closes it.
     - Desktop at 1280 is unchanged.
+
+## 2026-10-02
+- **Change:** Custom agents can create reports and interactive UIs
+- **Files:** backend/core/agent_tools.py, backend/apps/agents/custom.py, backend/tests/test_custom_agents.py; frontend: src/app/agents/{page,ui}.tsx, src/components/ChatWindow.tsx (exports UiArtifactBlock), src/app/globals.css
+- **Details:**
+  1. **Two new skill capabilities**, from the code server tools that already exist:
+     - **Reports & files** (`code_generate_file`): formatted Word, Excel, Markdown or CSV.
+     - **Interactive UI** (`code_generate_ui`): a self-contained HTML page in a sandboxed iframe.
+  2. **The custom runner collects these files.** It picks up files these tools return (top-level `url`/`filename`) as well as code-run artifacts, and adds them to the task's `files` result. The agent is told its files and pages are shown automatically.
+  3. **Agent results:**
+     - Generated pages render live, using the chat's UiArtifactBlock (Preview/Code tabs, fullscreen, open in a new tab).
+     - Report files appear as download rows with a type badge (DOCX/XLSX/MD/CSV) and size.
+  - **Verification:**
+    - pytest 91 passed; the custom-agent run now also builds a UI page and checks it comes back in `files`.
+    - Frontend tsc/eslint/build clean.
+    - Screenshot of a result with a live page and report files.

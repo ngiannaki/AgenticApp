@@ -17,6 +17,8 @@ _FRAME = (
     "{instructions}\n\n{skills}"
     "How to work: use the tools available to you to find real information before answering — never invent "
     "facts, numbers or sources. When you use the user's documents, cite them inline as [document name, p. N]. "
+    "Files you create (reports) and interactive pages you build are shown to the user automatically next to "
+    "your answer — mention what you made in a sentence, don't paste raw URLs. "
     "Reply in clear markdown (headings, lists, tables where useful)."
 )
 
@@ -55,12 +57,15 @@ class CustomAgent(BaseAgent):
         async def on_call(name: str, args: dict, ok: bool, text: str) -> None:
             data = _json(text)
             produced = [a for a in (data or {}).get("artifacts", []) if a.get("url")] if isinstance(data, dict) else []
+            # generate_file / generate_ui return a single file at the top level.
+            if isinstance(data, dict) and ok and data.get("url") and data.get("filename"):
+                produced.append({k: data.get(k) for k in ("url", "filename", "content_type", "size_bytes")})
             files.extend(produced)
-            detail = args.get("code") or args.get("sql") or args.get("query") or json.dumps(args)[:500]
+            detail = args.get("code") or args.get("sql") or args.get("query") or args.get("html") or json.dumps(args)[:500]
             output = ""
             if isinstance(data, dict):
                 output = str(data.get("stdout") or data.get("stderr") or data.get("error") or "")[:4000]
-            kind = "code" if "code" in args else "search" if "query" in args else "tool"
+            kind = "code" if "code" in args or "html" in args else "search" if "query" in args else "write" if name.endswith("generate_file") else "tool"
             await ctx.step(kind, f"{_label(name)}{'' if ok else ' (failed)'}", str(detail), {"output": output, "files": produced})
 
         await ctx.step("plan", f"{d['name']} is working on it", f"Tools: {', '.join(sorted(_label(t) for t in tools)) or 'none'}")

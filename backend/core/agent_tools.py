@@ -41,8 +41,17 @@ TOOL_GROUPS: dict[str, dict] = {
             "code_run_python_code",
             "code_profile_spreadsheet",
             "code_run_python_code_on_document",
-            "code_generate_file",
         ],
+    },
+    "reports": {
+        "label": "Reports & files",
+        "description": "Create formatted Word, Excel, Markdown or CSV reports to download.",
+        "tools": ["code_generate_file"],
+    },
+    "ui": {
+        "label": "Interactive UI",
+        "description": "Build interactive pages — dashboards, calculators, forms — shown live in the result.",
+        "tools": ["code_generate_ui"],
     },
 }
 
