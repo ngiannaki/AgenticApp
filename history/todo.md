@@ -320,3 +320,7 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 ## 2026-10-02
 - ✅ generate_file html format (styled report page with KPIs and charts) + agents prefer generate_ui for dashboards and retry after tool errors
 - ⬜ Rerun the NVIDIA dashboard task; for a live interactive dashboard give the agent a skill with the Interactive UI capability
+
+## 2026-10-02
+- ✅ Chat: collapsible tool Activity with friendly names, summaries, status and input/output
+- ✅ Agents: collapsible tasks rail (remembered per browser)

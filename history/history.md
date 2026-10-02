@@ -558,3 +558,17 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
   - **Verification:**
     - pytest 93 passed (new: html report with KPIs, chart and table, HTML escaping, no scripts; the unknown-format hint).
     - Rendered a sample NVIDIA balance-sheet report and checked it with a screenshot.
+
+## 2026-10-02
+- **Change:** Chat tool activity redesigned, and the Agents tasks rail can be collapsed
+- **Files:** frontend: src/components/ChatWindow.tsx (StepsPanel), src/app/agents/{page,ui}.tsx, src/app/globals.css
+- **Details:**
+  1. **Chat tool activity:** instead of a monospace list of "🔧 Using tool …" / "✅ Got result from …" lines, each tool call and its result are merged into one row.
+     - Each row has an icon by kind (documents, web, database, code, file, UI) and a plain-English name ("Searched your documents", "Queried your data", "Ran Python code").
+     - It also shows what the call was about (the query, SQL, URL or table) and its status: a spinner while running, ✓ or ⚠.
+     - Clicking a row shows its input and output (pretty-printed JSON or code), for every user, not only in debug mode.
+     - The rows sit in an "Activity" box. It is open while the answer is being written and folds to "Used 3 tools · 1 failed — Searched your documents · Queried your data · …" afterwards; the user can toggle it.
+     - Questions, approvals and generated interactive views stay outside the box as cards, because they need attention.
+     - Status chatter still appears only in debug mode.
+  2. **Agents page:** the tasks rail has a hide button and folds to a slim icon strip (show tasks, new task, build an agent, skills, plus a badge with the running count). The choice is remembered per browser. On phones the strip runs across the top.
+  - **Verification:** tsc/eslint/build clean. Screenshots against a mocked API: chat collapsed and expanded with a failed tool's error, and the collapsed agents rail.
