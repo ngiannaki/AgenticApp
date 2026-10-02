@@ -312,3 +312,7 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 
 ## 2026-10-02
 - ✅ Mobile: sidebar as a slide-in drawer on all pages; agents page full-width views on phones
+
+## 2026-10-02
+- ✅ Custom agents: Reports & files and Interactive UI capabilities; live page preview + report downloads in results
+- ⬜ Try a skill with Interactive UI + Your documents with a real model (CODE_MCP_ALLOW_UI_GENERATION must be true)
