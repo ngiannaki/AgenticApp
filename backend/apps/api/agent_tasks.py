@@ -221,9 +221,19 @@ class AgentHub:
             self._agents, self._agents_at = response.json(), time.monotonic()
         return self._agents
 
-    async def start(self, user_id: str, agent_id: str, inputs: dict, parent: dict | None = None, feedback: str = "") -> dict:
+    async def start(
+        self, user_id: str, agent_id: str, inputs: dict, parent: dict | None = None, feedback: str = "",
+        custom: tuple[dict, dict] | None = None,
+    ) -> dict:
+        """`custom` = (agent info, definition) for a user-built agent
+        ("custom:<id>"): it runs on the agents service's "custom" runner with
+        the definition added to the inputs it is sent (not stored)."""
         agents = {a["id"]: a for a in await self.agents()}
-        if agent_id not in agents:
+        if custom is not None:
+            if "custom" not in agents:
+                raise LookupError(agent_id)
+            agents[agent_id] = custom[0]
+        if agent_id not in agents or agent_id == "custom":
             raise LookupError(agent_id)
         if await self.store.count_active(user_id) >= self.max_active:
             raise PermissionError(f"You already have {self.max_active} agent tasks running; wait for one to finish.")
@@ -235,6 +245,8 @@ class AgentHub:
         sent = dict(inputs)
         if parent is not None and feedback:
             sent = await self._with_feedback(agents[agent_id], parent, sent, feedback)
+        if custom is not None:
+            sent["_definition"] = custom[1]
         message = Message(role=Role.ROLE_USER, message_id=str(uuid.uuid4()), parts=[new_text_part(json.dumps(sent))])
         message.metadata.update({"user_id": user_id})
         self._spawn(task["id"], agent_id, message)
@@ -282,7 +294,9 @@ class AgentHub:
         await self.store.add_event(task["id"], "status", {"status": "canceled"})
 
     async def _client(self, agent_id: str):
-        return await create_client(f"{self.base_url}/agents/{agent_id}", ClientConfig(httpx_client=self._http, streaming=True))
+        # User-built agents ("custom:<id>") all run on the "custom" runner.
+        target = "custom" if agent_id.startswith("custom:") else agent_id
+        return await create_client(f"{self.base_url}/agents/{target}", ClientConfig(httpx_client=self._http, streaming=True))
 
     def _spawn(self, task_id: str, agent_id: str, message: Message) -> None:
         runner = asyncio.create_task(self._consume(task_id, agent_id, message))

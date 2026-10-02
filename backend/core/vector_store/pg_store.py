@@ -202,8 +202,10 @@ class PgVectorStore:
         chunk_indexes: Sequence[int] | None = None,
         chunk_id: str | None = None,
         page: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """A document's chunks in chunk_index order, optionally narrowed."""
+        """A document's chunks in chunk_index order, optionally narrowed
+        (`metadata`: exact-match JSONB containment, e.g. {"table_id": "p3-t1"})."""
         clauses = ["document_id = %s"]
         params: list[Any] = [document_id]
         if chunk_indexes is not None:
@@ -215,6 +217,9 @@ class PgVectorStore:
         if page is not None:
             clauses.append("metadata @> %s::jsonb")
             params.append(json.dumps({"page": page}))
+        if metadata:
+            clauses.append("metadata @> %s::jsonb")
+            params.append(json.dumps(metadata))
         with self.pool.connection() as conn:
             return conn.execute(
                 "SELECT chunk_id, document_id, chunk_index, content, metadata FROM rag.chunks"

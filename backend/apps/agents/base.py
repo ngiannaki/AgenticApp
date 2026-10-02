@@ -277,10 +277,12 @@ class RunContext:
         local_tools: dict[str, tuple[dict, Any]] | None = None,
         max_iterations: int = 12,
         on_call=None,
+        confirm: set[str] | None = None,
     ) -> str:
         """A generic LLM tool-calling loop over API tools (+ optional local
         tools: name -> (openai tool schema, async handler(args) -> str)).
-        Returns the model's final text."""
+        Tools in `confirm` ask the user before running (and then run as
+        approved). Returns the model's final text."""
         local_tools = local_tools or {}
         schemas = await self.tools.schemas(tool_names) + [schema for schema, _ in local_tools.values()]
         messages: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -291,14 +293,25 @@ class RunContext:
             messages.append({"role": "assistant", "content": message.content, "tool_calls": [tc.model_dump() for tc in message.tool_calls]})
             for call in message.tool_calls:
                 args = parse_json(call.function.arguments or "{}") or {}
-                if call.function.name in local_tools:
-                    text = str(await local_tools[call.function.name][1](args))
+                name = call.function.name
+                if name in local_tools:
+                    text = str(await local_tools[name][1](args))
                     ok = True
+                elif name not in tool_names:
+                    text, ok = f"Tool {name!r} is not available here.", False
+                elif confirm and name in confirm:
+                    summary = json.dumps(args, default=str)[:600]
+                    answer = await self.ask(f"Allow the agent to run {name} with {summary}?", ["Approve", "Reject"])
+                    if answer.strip().lower().startswith("approve"):
+                        result = await self.call_tool(name, args, approved=True)
+                        text, ok = result.text, result.ok
+                    else:
+                        text, ok = "The user declined this action. Do not retry it; continue without it.", False
                 else:
-                    result = await self.call_tool(call.function.name, args)
+                    result = await self.call_tool(name, args)
                     text, ok = result.text, result.ok
                 if on_call:
-                    await on_call(call.function.name, args, ok, text)
+                    await on_call(name, args, ok, text)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": text[:12000]})
         messages.append({"role": "user", "content": "Stop calling tools now and give your final answer."})
         return (await self.llm.complete(messages)).content or ""

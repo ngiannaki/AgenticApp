@@ -17,9 +17,14 @@ _PLANNER = (
 _EXTRACTOR = (
     "You extract values from document excerpts. For each requested field return the value exactly as "
     "supported by the excerpts (numbers as numbers, dates as ISO strings, lists as arrays), or null if not "
-    "found — never guess. Cite the excerpt tag (e.g. E3) each value came from. Output JSON only: "
-    '{"<key>": {"value": <any>, "source": "E<n>" | null}}'
+    "found — never guess. For every value cite the excerpt tag (e.g. E3) it came from and copy the exact "
+    "words from that excerpt that support it (a short verbatim quote; for a table, the row). Output JSON only: "
+    '{"<key>": {"value": <any>, "source": "E<n>" | null, "quote": string | null}}'
 )
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.replace("|", " ").split()).lower()
 
 
 class ExtractorAgent(BaseAgent):
@@ -67,7 +72,9 @@ class ExtractorAgent(BaseAgent):
                 if chunk_id in seen:
                     continue
                 seen.add(chunk_id)
-                excerpts.append({"tag": f"E{len(excerpts) + 1}", "text": chunk.get("text", "")[:1500], "grounding": grounding})
+                # A whole table can be long; prose excerpts stay short.
+                limit = 6000 if grounding.get("chunk_content_type") == "table" else 1500
+                excerpts.append({"tag": f"E{len(excerpts) + 1}", "text": chunk.get("text", "")[:limit], "grounding": grounding})
         if not excerpts:
             problems.discard("")
             if problems:
@@ -86,19 +93,46 @@ class ExtractorAgent(BaseAgent):
         if not isinstance(raw, dict):
             raw = {}
 
-        by_tag = {e["tag"]: e["grounding"] for e in excerpts}
+        # Per-field citations: numbered like the chat's [n] (one number per
+        # distinct excerpt), with the supporting quote checked against the
+        # excerpt text so a made-up quote is flagged rather than shown as fact.
+        by_tag = {e["tag"]: e for e in excerpts}
         values: dict[str, Any] = {}
         sources: dict[str, Any] = {}
+        citations: list[dict[str, Any]] = []
+        numbers: dict[str, int] = {}
         for f in fields:
             item = raw.get(f["key"])
             value = item.get("value") if isinstance(item, dict) else item
             values[f["key"]] = value
-            g = by_tag.get(item.get("source")) if isinstance(item, dict) else None
-            sources[f["key"]] = (
-                {"document": g.get("document_name"), "location": g.get("location"), "document_id": g.get("document_id")}
-                if g and value is not None else None
-            )
+            excerpt = by_tag.get(item.get("source")) if isinstance(item, dict) else None
+            if excerpt is None or value is None:
+                sources[f["key"]] = None
+                continue
+            g = excerpt["grounding"]
+            if excerpt["tag"] not in numbers:
+                numbers[excerpt["tag"]] = len(citations) + 1
+                citations.append({
+                    "n": numbers[excerpt["tag"]],
+                    "document": g.get("document_name"),
+                    "location": g.get("location"),
+                    "section": g.get("section"),
+                    "document_id": g.get("document_id"),
+                    "chunk_id": g.get("chunk_id"),
+                    "pages": g.get("table_pages"),
+                })
+            quote = item.get("quote") if isinstance(item.get("quote"), str) and item.get("quote").strip() else None
+            sources[f["key"]] = {
+                "n": numbers[excerpt["tag"]],
+                "document": g.get("document_name"),
+                "location": g.get("location"),
+                "section": g.get("section"),
+                "document_id": g.get("document_id"),
+                "chunk_id": g.get("chunk_id"),
+                "quote": quote.strip()[:400] if quote else None,
+                "quote_verified": bool(quote) and _normalized(quote) in _normalized(excerpt["text"]),
+            }
         found = sum(v is not None for v in values.values())
         await ctx.step("result", f"Found {found} of {len(fields)} value(s)")
-        await ctx.artifact("extraction.json", data={"values": values, "sources": sources}, kind="json")
+        await ctx.artifact("extraction.json", data={"values": values, "sources": sources, "citations": citations}, kind="json")
 

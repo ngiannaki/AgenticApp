@@ -465,3 +465,60 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
   - The app log showed "Failed to connect to MCP server 'indexing'/'retrieval', skipping" and only 16 tools: the API connected while those servers were still loading, so retrieval and indexing tools were missing for the whole run. This is why the Extractor found no text (its search call was an unknown tool; the failure was swallowed before the earlier extractor fix).
   - indexing, retrieval and db now have a TCP healthcheck (ports 8000/8001/8002) and `app` depends on them with `service_healthy` instead of `service_started`.
   - Not run here (no Docker): verify with `docker compose up --build` that the app log says "Connected to 2x MCP tool(s)" including retrieval_* and indexing_*.
+
+## 2026-10-02
+- **Change:** RAG tables are kept whole, Extractor gives a citation for every field, Agents page redesigned, and users can build their own agents from skills
+- **Files:** backend/mcp_servers/indexing/{langchain_structure,langchain_pipeline}.py, backend/mcp_servers/retrieval/langchain_pipeline.py, backend/core/vector_store/pg_store.py, backend/config/settings.py, backend/apps/agents/{extractor,custom (new),base,registry}.py, backend/core/agent_tools.py (new), backend/apps/api/{custom_agents (new),agent_tasks,main}.py, backend/apps/api/routers/agents.py, backend/migrations/0005_custom_agents.sql (new), backend/requirements-test.txt, backend/tests/{test_tables,test_custom_agents} (new), backend/tests/test_agents.py, .github/workflows/ci.yml (YAML fix carried over); frontend: src/app/agents/{page,builder (new),ui (new)}.tsx, src/lib/{api,types}.ts, src/app/globals.css
+- **Details:**
+  1. **Tables split across pages:** `stitch_cross_page_tables` joins a table that a page break cut in two.
+     - It applies when one page ends with a table (ignoring a short footer) and the next starts with one (ignoring a short running header) with the same number of columns.
+     - A repeated header is dropped. A first row that is really data is kept.
+     - The table records the pages it spans (`table_pages`).
+  2. **Table chunks:**
+     - Each chunk is tagged `table_id`, `table_part` and `table_parts`, plus `table_caption` when found.
+     - The text starts with `Section: …` and `Table: <caption>`, so the numbers embed with their context.
+     - Large tables are still split by rows, with the header repeated in each part.
+  3. **Whole-table retrieval:**
+     - A hit on any part of a split table returns the whole table rebuilt: header once, all rows, up to `RAG_V2_TABLE_EXPAND_MAX_CHARS=8000`.
+     - Past that limit it keeps the parts nearest the hit and marks the rows it left out.
+     - Other hits on the same table are merged into that one result.
+     - Prose keeps the ±1 neighbour expansion.
+     - Re-index existing documents (`python -m backend.scripts.reindex_all`) to get this.
+  4. **Extractor citations:**
+     - Every field gets a numbered citation `n`: document, page (or the pages a table spans), section and chunk.
+     - It also gets the exact supporting `quote`, checked against the excerpt (`quote_verified`).
+     - A `citations` list is returned alongside. Table excerpts are now sent to the LLM whole, up to 6000 characters.
+  5. **Agents page redesign:**
+     - Left rail: tasks grouped Active / Recent, with search and relative times.
+     - Home: agent cards with examples.
+     - Start form: a document picker with search, segmented selects, switches and example chips.
+     - Task view: live progress card, Result / Activity / Inputs tabs, inline rename, icon actions, a "Try again" button on failure, and a "Not quite right?" box that reruns with feedback.
+     - Extraction table: a coverage bar, numbered citation chips that expand to the quote with a verified/unverified badge, and a numbered sources list.
+     - Light and dark themes, plus skeleton placeholders while loading.
+  6. **Custom agents and skills:**
+     - A skill is instructions plus capabilities: your documents, web search, database, Python code (`backend/core/agent_tools.py`).
+     - An agent is a name, a description, instructions and a set of skills. Both are private per user, with full create/update/delete (`/api/skills`, `/api/custom-agents`, `/api/agent-capabilities`).
+     - User agents appear in `GET /api/agents` as `custom:<id>`. They run on the agents service's generic `custom` runner, with the definition resolved by the API at start and at rerun, so edits apply to the next run.
+     - The runner only exposes the tools its skills grant. Any tool that changes data (mandatory-approval list) pauses and asks the user first.
+     - Deleting a skill removes it from the agents that used it. Deleting an agent keeps its past tasks.
+     - The UI has a builder with a live preview of what the agent can use, and a Skills manager showing which agents use each skill.
+  - **Verification:**
+    - pytest 91 passed (new: stitching, table parts and rebuild, whole-table retrieval; extractor citations and quote check; skills/agents CRUD, ownership and the delete cascade; a full custom-agent run over A2A with the approval prompt).
+    - ruff clean. Frontend tsc/eslint/build clean.
+    - UI checked with screenshots against a mocked API (home, form, result, running, failed, builder, skills; light and dark).
+    - Not run: with a real LLM and real PDFs.
+
+## 2026-10-02
+- **Change:** Mobile layout — on phones the main sidebar is a slide-in drawer instead of a fixed column
+- **Files:** frontend: src/components/Sidebar.tsx, src/app/agents/page.tsx, src/app/globals.css
+- **Details:**
+  - At ≤768px wide, `Sidebar` renders a slim top bar: a menu button, the page title, and "New chat" on the chat page.
+  - The menu button opens the full sidebar as a drawer over the page, with a backdrop.
+  - It closes on backdrop tap, Escape, the ✕ button, picking a conversation, starting a new chat, or following a link. The page doesn't scroll behind it while it's open.
+  - It's built into the shared component, so Chat, Documents, Data and Agents all get it with no page changes. Desktop is unchanged.
+  - Agents page on phones: the task rail shows only on the agents home; a task, form, builder or skills view takes the full width, and the task view has a "← Tasks" back button.
+  - **Verification:**
+    - tsc/eslint/build clean.
+    - Screenshots at 390×844: chat closed and open, agents task view and home, documents.
+    - Tapping a link in the drawer navigates and closes it.
+    - Desktop at 1280 is unchanged.

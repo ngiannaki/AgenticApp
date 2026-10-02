@@ -299,3 +299,16 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ✅ docker-compose: app waits for indexing/retrieval/db to be healthy before connecting
 - ⬜ Rebuild/restart with `docker compose up --build`, confirm app log lists retrieval_* and indexing_* tools, re-upload/re-index docs if needed, retry the Extractor
 - ⬜ Optional: retry-on-startup (or a runtime reconnect) for MCP servers that are skipped, so a late server isn't lost until restart
+
+## 2026-10-02
+- ✅ Fixed CI workflow YAML syntax error (step name with a colon)
+- ✅ RAG tables: cross-page stitching, table id/part/caption metadata, whole-table retrieval
+- ✅ Extractor: numbered per-field citations with verified quotes + sources list
+- ✅ Agents page redesign (rail, home, form, task tabs, inline rerun, citation chips)
+- ✅ Custom agents + skills (documents / web / database / code), create/update/delete, approval before data changes
+- ⬜ Re-index existing documents so tables get the new chunking: `python -m backend.scripts.reindex_all`
+- ⬜ Try a custom agent with a real model (e.g. a skill with Documents + Python code over a spreadsheet)
+- ⬜ App-wide: the left Sidebar doesn't collapse on phones (all pages) — make it a drawer on small screens
+
+## 2026-10-02
+- ✅ Mobile: sidebar as a slide-in drawer on all pages; agents page full-width views on phones

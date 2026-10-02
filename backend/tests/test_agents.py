@@ -141,7 +141,8 @@ def test_extractor_returns_json_with_sources(monkeypatch) -> None:
     llm = FakeLlm([
         {"fields": [{"key": "revenue_growth", "description": "growth %", "query": "revenue growth"},
                     {"key": "ceo", "description": "CEO name", "query": "chief executive"}]},
-        '```json\n{"revenue_growth": {"value": 12, "source": "E1"}, "ceo": {"value": null, "source": null}}\n```',
+        '```json\n{"revenue_growth": {"value": 12, "source": "E1", "quote": "Revenue grew  12%"},'
+        ' "ceo": {"value": null, "source": null}}\n```',
     ])
     agent = ExtractorAgent()
     ctx = RunContext(agent, "t1", "alice", tools=FakeTools(), llm=llm)
@@ -157,7 +158,11 @@ def test_extractor_returns_json_with_sources(monkeypatch) -> None:
     asyncio.run(agent.run(ctx, agent.validate({"request": "summarize growth and CEO"})))
     assert out["kind"] == "json" and out["name"] == "extraction.json"
     assert out["data"]["values"] == {"revenue_growth": 12, "ceo": None}
-    assert out["data"]["sources"]["revenue_growth"]["document"] == "annual.pdf"
+    src = out["data"]["sources"]["revenue_growth"]
+    assert src["document"] == "annual.pdf" and src["location"] == 4 and src["n"] == 1
+    assert src["quote"] == "Revenue grew  12%" and src["quote_verified"] is True
+    assert out["data"]["citations"] == [{"n": 1, "document": "annual.pdf", "location": 4, "section": None,
+                                         "document_id": None, "chunk_id": "c-1", "pages": None}]
     assert out["data"]["sources"]["ceo"] is None
 
 
