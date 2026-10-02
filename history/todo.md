@@ -309,3 +309,6 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 - ⬜ Re-index existing documents so tables get the new chunking: `python -m backend.scripts.reindex_all`
 - ⬜ Try a custom agent with a real model (e.g. a skill with Documents + Python code over a spreadsheet)
 - ⬜ App-wide: the left Sidebar doesn't collapse on phones (all pages) — make it a drawer on small screens
+
+## 2026-10-02
+- ✅ Mobile: sidebar as a slide-in drawer on all pages; agents page full-width views on phones

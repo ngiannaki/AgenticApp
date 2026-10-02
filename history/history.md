@@ -507,3 +507,18 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
     - ruff clean. Frontend tsc/eslint/build clean.
     - UI checked with screenshots against a mocked API (home, form, result, running, failed, builder, skills; light and dark).
     - Not run: with a real LLM and real PDFs.
+
+## 2026-10-02
+- **Change:** Mobile layout — on phones the main sidebar is a slide-in drawer instead of a fixed column
+- **Files:** frontend: src/components/Sidebar.tsx, src/app/agents/page.tsx, src/app/globals.css
+- **Details:**
+  - At ≤768px wide, `Sidebar` renders a slim top bar: a menu button, the page title, and "New chat" on the chat page.
+  - The menu button opens the full sidebar as a drawer over the page, with a backdrop.
+  - It closes on backdrop tap, Escape, the ✕ button, picking a conversation, starting a new chat, or following a link. The page doesn't scroll behind it while it's open.
+  - It's built into the shared component, so Chat, Documents, Data and Agents all get it with no page changes. Desktop is unchanged.
+  - Agents page on phones: the task rail shows only on the agents home; a task, form, builder or skills view takes the full width, and the task view has a "← Tasks" back button.
+  - **Verification:**
+    - tsc/eslint/build clean.
+    - Screenshots at 390×844: chat closed and open, agents task view and home, documents.
+    - Tapping a link in the drawer navigates and closes it.
+    - Desktop at 1280 is unchanged.
