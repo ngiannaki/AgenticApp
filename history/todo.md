@@ -316,3 +316,7 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 ## 2026-10-02
 - ✅ Custom agents: Reports & files and Interactive UI capabilities; live page preview + report downloads in results
 - ⬜ Try a skill with Interactive UI + Your documents with a real model (CODE_MCP_ALLOW_UI_GENERATION must be true)
+
+## 2026-10-02
+- ✅ generate_file html format (styled report page with KPIs and charts) + agents prefer generate_ui for dashboards and retry after tool errors
+- ⬜ Rerun the NVIDIA dashboard task; for a live interactive dashboard give the agent a skill with the Interactive UI capability

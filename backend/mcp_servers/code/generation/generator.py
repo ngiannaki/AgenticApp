@@ -16,13 +16,14 @@ from backend.mcp_servers.code.artifacts import inline_artifact
 from backend.mcp_servers.code.errors import ValidationError
 from backend.mcp_servers.code.generation import writers
 
-_EXTENSIONS = {"txt": ".txt", "md": ".md", "csv": ".csv", "xlsx": ".xlsx", "docx": ".docx"}
+_EXTENSIONS = {"txt": ".txt", "md": ".md", "csv": ".csv", "xlsx": ".xlsx", "docx": ".docx", "html": ".html"}
 _CONTENT_TYPES = {
     "txt": "text/plain",
     "md": "text/markdown",
     "csv": "text/csv",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "html": "text/html",
 }
 _WRITERS = {
     "txt": writers.render_txt,
@@ -30,13 +31,17 @@ _WRITERS = {
     "csv": writers.render_csv,
     "xlsx": writers.render_xlsx,
     "docx": writers.render_docx,
+    "html": writers.render_html,
 }
 
 
 def generate_file(format: str, filename: str, content: dict[str, Any], *, settings: Any) -> dict[str, Any]:
     fmt = format.strip().lower() if isinstance(format, str) else ""
     if fmt not in _WRITERS:
-        raise ValidationError(f"format must be one of {sorted(_WRITERS)}, got {format!r}.")
+        raise ValidationError(
+            f"format must be one of {sorted(_WRITERS)}, got {format!r}. For an interactive page "
+            "(dashboard, calculator, form) use generate_ui with your own HTML instead."
+        )
     if not filename or not filename.strip():
         raise ValidationError("filename must be a non-empty string.")
     if not isinstance(content, dict):

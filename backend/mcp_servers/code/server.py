@@ -244,7 +244,7 @@ def run_python_code_on_document(
 
 @mcp.tool
 def generate_file(format: str, filename: str, content: dict) -> dict:
-    """Generate a properly-formatted txt, md, csv, xlsx, or docx file from
+    """Generate a properly-formatted txt, md, html, csv, xlsx, or docx file from
     structured content and return a URL the user can open it at.
 
     Unlike run_python_code, nothing is executed — `content` is validated,
@@ -262,7 +262,7 @@ def generate_file(format: str, filename: str, content: dict) -> dict:
 
     `content`'s shape depends on `format`:
 
-    For **txt** / **md** / **docx** (a "document" — title + sections):
+    For **txt** / **md** / **docx** / **html** (a "document" — title + sections):
     ```
     {
       "title": "Optional overall title",
@@ -282,6 +282,16 @@ def generate_file(format: str, filename: str, content: dict) -> dict:
     at least one of heading/paragraphs/bullets/numbered/table. Every table
     row must have as many cells as `headers` (or as the first row, if there
     are no headers).
+
+    **html** renders a styled, self-contained report page (light/dark aware,
+    printable) and additionally accepts: top-level `"subtitle"`, `"footer"`,
+    `"metrics": [{"label": "Total assets", "value": "$111.6B", "note": "+69.8% YoY"}]`
+    (KPI cards; a note starting with +/- is coloured green/red, or set
+    `"trend": "good"|"bad"` when lower is better), and per section a
+    `"chart": {"title": "...", "labels": ["FY24", "FY25"], "series":
+    [{"name": "Assets", "values": [65728, 111601]}]}` (bar chart, numbers
+    only). It has no scripts: for a page the user interacts with (filters,
+    toggles, inputs) use generate_ui instead.
 
     For **csv** (a single table):
     ```
