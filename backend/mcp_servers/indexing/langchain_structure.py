@@ -340,12 +340,34 @@ def stitch_cross_page_tables(docs: list[Document]) -> list[Document]:
     return out
 
 
+_EMPHASIS_RE = re.compile(r"\*{1,3}")
+_MAX_CRUMB_CHARS = 100
+
+
+def _clean_title(title: str) -> str:
+    """A heading without markdown emphasis markers (`**Title**`) and with
+    runs of whitespace collapsed — PDF engines often render headings bold."""
+    return re.sub(r"\s+", " ", _EMPHASIS_RE.sub("", title)).strip()
+
+
+def _breadcrumb(meta: dict) -> str:
+    """`h1 > h2 > h3` for the "Section:" line: a level that repeats the one
+    above it (a title the engine reported twice) is skipped, and each level
+    is cut to _MAX_CRUMB_CHARS so a long title can't swamp the chunk."""
+    titles: list[str] = []
+    for key in ("h1", "h2", "h3"):
+        title = meta.get(key)
+        if title and (not titles or title != titles[-1]):
+            titles.append(title)
+    return " > ".join(t if len(t) <= _MAX_CRUMB_CHARS else t[: _MAX_CRUMB_CHARS - 1] + "…" for t in titles)
+
+
 def _extract_headings(text: str) -> list[dict]:
     headings = []
     for line in text.splitlines():
         m = _HEADING_RE.match(line.strip())
-        if m:
-            headings.append({"level": len(m.group(1)), "title": m.group(2).strip()})
+        if m and (title := _clean_title(m.group(2))):
+            headings.append({"level": len(m.group(1)), "title": title})
     return headings
 
 
@@ -365,13 +387,33 @@ def _update_heading_state(state: dict, headings: list[dict]) -> None:
             state["h3"] = title
 
 
+def _inherit_sections(found: dict, prior: dict) -> dict:
+    """Section metadata for a prose block: the headings the splitter found
+    inside it, plus the enclosing ones it could not see — those that are
+    shallower than the first heading found, or all of them when the block
+    has no heading at all (text continuing a section from an earlier page).
+    Headings deeper than the first one found are not inherited: they belong
+    to the previous section."""
+    if not found:
+        return {k: v for k, v in prior.items() if v}
+    first = min(i for i, k in enumerate(("h1", "h2", "h3")) if k in found)
+    inherited = {k: prior[k] for k in ("h1", "h2", "h3")[:first] if prior.get(k)}
+    return {**inherited, **found}
+
+
 def split_markdown_preserving_structure(
     doc: Document,
     chunk_size: int,
     chunk_overlap: int,
+    heading_state: dict | None = None,
 ) -> tuple[list[Document], list[dict]]:
     """Split one markdown-flavored Document into chunks that keep tables
     atomic and carry section (h1/h2/h3) metadata.
+
+    `heading_state` ({"h1","h2","h3"}) is the section in force at the start of
+    `doc`; pass the same dict for each page of a document, in order, and it is
+    updated in place, so a page that has no heading of its own is still
+    labelled with the section it continues. Omit it for a standalone Document.
 
     Returns (chunks, headings_seen) — `headings_seen` is the ordered list of
     `{level, title}` headings found in `doc`, annotated with `doc.metadata`'s
@@ -396,7 +438,8 @@ def split_markdown_preserving_structure(
     )
 
     out: list[Document] = []
-    heading_state: dict = {"h1": None, "h2": None, "h3": None}
+    if heading_state is None:
+        heading_state = {"h1": None, "h2": None, "h3": None}
     table_no = 0
     caption: str | None = None
     # Set by stitch_cross_page_tables on a page whose last table continues
@@ -414,7 +457,7 @@ def split_markdown_preserving_structure(
             table_id = f"p{page}-t{table_no}" if page is not None else f"t{table_no}"
             # Context the bare numbers lack: the section it sits in and its
             # caption (the short line just above it), so it embeds/ranks well.
-            breadcrumb = " > ".join(section_meta[k] for k in ("h1", "h2", "h3") if section_meta.get(k))
+            breadcrumb = _breadcrumb(section_meta)
             prefix = "".join(
                 [f"Section: {breadcrumb}\n" if breadcrumb else "", f"Table: {caption}\n" if caption else ""]
             )
@@ -440,6 +483,7 @@ def split_markdown_preserving_structure(
 
         caption = _caption_candidate(segment)
 
+        prior_state = dict(heading_state)
         _update_heading_state(heading_state, _extract_headings(segment))
 
         try:
@@ -448,10 +492,14 @@ def split_markdown_preserving_structure(
             header_docs = [Document(page_content=segment, metadata={})]
 
         for hdoc in header_docs:
-            section_meta = {**base_metadata, **hdoc.metadata, "chunk_content_type": "prose"}
-            breadcrumb = " > ".join(
-                section_meta[k] for k in ("h1", "h2", "h3") if section_meta.get(k)
-            )
+            found = {k: t for k, v in hdoc.metadata.items() if k in ("h1", "h2", "h3") and (t := _clean_title(v))}
+            section_meta = {
+                **base_metadata,
+                **hdoc.metadata,
+                **_inherit_sections(found, prior_state),
+                "chunk_content_type": "prose",
+            }
+            breadcrumb = _breadcrumb(section_meta)
             for sub in char_splitter.split_documents([Document(page_content=hdoc.page_content, metadata=section_meta)]):
                 if breadcrumb and sub.page_content.strip():
                     sub.page_content = f"Section: {breadcrumb}\n\n{sub.page_content}"

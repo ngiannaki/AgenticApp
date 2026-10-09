@@ -21,6 +21,7 @@ import copy
 import json
 import logging
 import re
+import time
 import uuid
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
@@ -36,7 +37,8 @@ from backend.apps.api import skills as skills_lib
 from backend.apps.api.config import ApiSettings
 from backend.apps.api.sessions import ChatSession
 from backend.config import get_async_openai_client, get_chat_extra_body, settings as app_settings
-from backend.core.citations import _collect_and_stamp_citations, _render_citations
+from backend.core.citations import _collect_and_stamp_citations, _render_citations, remember_citations
+from backend.core.observability import UsageRecorder, cost_of, estimate_usage, usage_from_response
 from backend.core.storage.artifact_store import ArtifactStore
 
 logger = logging.getLogger("agentic_api")
@@ -273,8 +275,13 @@ class _StreamedMessage:
         self.content: list[str] = []
         self.reasoning: list[str] = []
         self.calls: dict[int, dict[str, Any]] = {}
+        self.usage: Any = None
+        """Token usage, from the final chunk when the server was asked for it
+        (stream_options.include_usage); None otherwise."""
 
     def add(self, chunk: Any) -> str:
+        if getattr(chunk, "usage", None):
+            self.usage = chunk.usage
         if not getattr(chunk, "choices", None):
             return ""
         delta = chunk.choices[0].delta
@@ -466,6 +473,8 @@ class AgentRuntime:
         self._injected_params: dict[str, set[str]] = {}
         self.file_tokens = FileTokenStore()
         self._artifact_store: ArtifactStore | None = None
+        self.usage: UsageRecorder | None = None
+        """Set by main.py's lifespan; records model calls and tool calls (None = no tracking)."""
         self.document_registry: Any = None
         """backend.apps.api.document_registry.DocumentRegistry, set by main.py's
         lifespan once Mongo is connected (None if it isn't). Used by
@@ -655,26 +664,40 @@ class AgentRuntime:
         """
         max_recovery_attempts = 2
         for attempt in range(max_recovery_attempts + 1):
+            started = time.perf_counter()
+            first_token_at: float | None = None
+            messages = session.memory.messages()
             try:
                 stream = bool(self.settings.stream_tokens)
+                stream_args: dict[str, Any] = {}
+                if stream:
+                    stream_args["stream"] = True
+                    if app_settings.obs.stream_usage:
+                        stream_args["stream_options"] = {"include_usage": True}
                 response = await self.llm.chat.completions.create(
                     model=app_settings.chat_model,
-                    messages=session.memory.messages(),
+                    messages=messages,
                     tools=(self.tools or None) if tools_enabled else None,
                     temperature=self.settings.temperature,
                     extra_body=get_chat_extra_body(),
-                    **({"stream": True} if stream else {}),
+                    **stream_args,
                 )
                 if stream and not hasattr(response, "choices"):
                     accumulated = _StreamedMessage()
                     async for chunk in response:
                         token = accumulated.add(chunk)
                         if token:
+                            if first_token_at is None:
+                                first_token_at = time.perf_counter()
                             yield ("event", events.token(token))
-                    response = SimpleNamespace(choices=[SimpleNamespace(message=accumulated.message())])
+                    response = SimpleNamespace(
+                        choices=[SimpleNamespace(message=accumulated.message())], usage=accumulated.usage
+                    )
+                self._record_chat_call(session, messages, response, started, first_token_at)
                 yield ("response", response)
                 return
             except openai.APIStatusError as exc:
+                self._record_chat_call(session, messages, None, started, first_token_at, error=str(exc))
                 malformed_tool_call = "error parsing tool call" in str(exc)
                 if malformed_tool_call and attempt < max_recovery_attempts:
                     logger.warning(
@@ -694,14 +717,128 @@ class AgentRuntime:
                 yield ("failed", None)
                 return
             except Exception as exc:  # noqa: BLE001 — surface upstream failure and end the turn
+                self._record_chat_call(session, messages, None, started, first_token_at, error=str(exc))
                 logger.exception("LLM chat call failed")
                 yield ("event", events.error(f"LLM call failed: {exc}"))
                 yield ("failed", None)
                 return
 
+    def _record_chat_call(
+        self,
+        session: ChatSession,
+        messages: list[dict[str, Any]],
+        response: Any,
+        started: float,
+        first_token_at: float | None,
+        error: str | None = None,
+    ) -> None:
+        """Record one model call (tokens, latency, cost) and add it to the
+        turn's running totals. `response` None = the call failed. Never raises."""
+        try:
+            model = app_settings.chat_model
+            latency_ms = round((time.perf_counter() - started) * 1000)
+            ttft_ms = round((first_token_at - started) * 1000) if first_token_at is not None else None
+            usage = None
+            if error is None:
+                usage = usage_from_response(getattr(response, "usage", None))
+                if usage is None:  # server reported none: estimate, flagged as such
+                    message = response.choices[0].message
+                    produced = (message.content or "") + "".join(
+                        tc.function.arguments or "" for tc in (message.tool_calls or [])
+                    )
+                    usage = estimate_usage(messages, produced)
+            if self.usage is not None:
+                cost = self.usage.llm_call(
+                    user_id=session.user_id,
+                    feature="chat",
+                    model=model,
+                    usage=usage,
+                    latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
+                    trace_id=session.trace_id,
+                    conversation_id=session.session_id,
+                    status="ok" if error is None else "error",
+                    error=error,
+                )
+            else:
+                cost = cost_of(model, usage) if usage else 0.0
+            totals = session.turn_usage
+            totals["llm_calls"] = totals.get("llm_calls", 0) + 1
+            if usage:
+                totals["input_tokens"] = totals.get("input_tokens", 0) + usage.input_tokens
+                totals["output_tokens"] = totals.get("output_tokens", 0) + usage.output_tokens
+                totals["estimated"] = totals.get("estimated", False) or usage.estimated
+            if cost is None:
+                totals["unpriced"] = True
+            else:
+                totals["cost_usd"] = totals.get("cost_usd", 0.0) + cost
+        except Exception:  # noqa: BLE001 - tracking must never break a turn
+            logger.warning("Could not record the model call", exc_info=True)
+
+    def _usage_event(self, session: ChatSession, turn_started: float) -> dict[str, Any]:
+        t = session.turn_usage
+        return events.usage(
+            {
+                "llm_calls": t.get("llm_calls", 0),
+                "tool_calls": t.get("tool_calls", 0),
+                "input_tokens": t.get("input_tokens", 0),
+                "output_tokens": t.get("output_tokens", 0),
+                "cost_usd": None if t.get("unpriced") else round(t.get("cost_usd", 0.0), 6),
+                "estimated": bool(t.get("estimated")),
+                "duration_ms": round((time.perf_counter() - turn_started) * 1000),
+            }
+        )
+
+    async def _timed_tool_call(
+        self,
+        mcp: Any,
+        name: str,
+        arguments: dict[str, Any],
+        timeout: float,
+        *,
+        user_id: str,
+        trace_id: str,
+        feature: str,
+    ) -> Any:
+        """mcp.call_tool with a timeout, recording how long it took (and, for
+        retrieval tools, the per-stage `timings_ms` they report). Raises what
+        call_tool raises."""
+        started = time.perf_counter()
+        status, attrs = "ok", {}
+        try:
+            result = await asyncio.wait_for(mcp.call_tool(name, arguments), timeout=timeout)
+            try:
+                text = _extract_text(result)
+                if '"timings_ms"' in text:
+                    attrs["timings_ms"] = json.loads(text).get("timings_ms")
+            except Exception:  # noqa: BLE001 - timings are a bonus
+                pass
+            return result
+        except asyncio.TimeoutError:
+            status = "timeout"
+            raise
+        except BaseException as exc:
+            status = "error"
+            attrs["error"] = str(exc)[:200]
+            raise
+        finally:
+            if self.usage is not None:
+                self.usage.span(
+                    user_id=user_id,
+                    feature=feature,
+                    name=name,
+                    duration_ms=round((time.perf_counter() - started) * 1000),
+                    trace_id=trace_id,
+                    status=status,
+                    attrs=attrs,
+                )
+
     async def run_stream(self, session: ChatSession, question: str) -> AsyncIterator[dict[str, Any]]:
         """Drive one user turn for `session`, yielding SSE-ready events as it goes."""
         session.touch()
+        session.trace_id = uuid.uuid4().hex
+        session.turn_usage = {}
+        turn_started = time.perf_counter()
         session.memory.add_user(_with_attached_documents_note(session, question))
         max_iterations = self.settings.max_iterations
         citations: list[dict[str, Any]] = []
@@ -729,14 +866,16 @@ class AgentRuntime:
 
             if not message.tool_calls:
                 raw_answer = message.content or ""
-                answer, cited = _render_citations(raw_answer, citations)
+                answer, cited = _render_citations(raw_answer, citations, session.chunk_history)
                 session.memory.add_assistant(answer)
                 if not raw_answer.strip() and iteration < max_iterations:
                     yield events.status("empty response from model, retrying")
                     continue
-                if citations:
+                remember_citations(session.chunk_history, citations)
+                if cited:
                     yield events.citations(cited)
                 yield events.message(answer)
+                yield self._usage_event(session, turn_started)
                 yield events.done(answer, iteration)
                 return
 
@@ -766,12 +905,14 @@ class AgentRuntime:
         if reasoning:
             yield events.reasoning(reasoning)
         raw_final = final_message.content or "Unable to produce a final answer in the allotted iterations."
-        final, cited = _render_citations(raw_final, citations)
+        final, cited = _render_citations(raw_final, citations, session.chunk_history)
 
         session.memory.add_assistant(final)
-        if citations:
+        remember_citations(session.chunk_history, citations)
+        if cited:
             yield events.citations(cited)
         yield events.message(final)
+        yield self._usage_event(session, turn_started)
         yield events.done(final, max_iterations)
 
     async def _handle_tool_call(
@@ -867,7 +1008,10 @@ class AgentRuntime:
         yield events.status(f"calling {name}")
         timeout = self.settings.tool_call_timeout_seconds
         try:
-            result = await asyncio.wait_for(session.mcp.call_tool(name, arguments), timeout=timeout)
+            session.turn_usage["tool_calls"] = session.turn_usage.get("tool_calls", 0) + 1
+            result = await self._timed_tool_call(
+                session.mcp, name, arguments, timeout, user_id=session.user_id, trace_id=session.trace_id, feature="chat"
+            )
             text = _extract_text(result)
             ok = True
         except asyncio.TimeoutError:
@@ -894,7 +1038,15 @@ class AgentRuntime:
             self._artifact_store = ArtifactStore()
         return materialize_artifacts(text, self._artifact_store, app_settings.code_mcp.artifact_public_base_url)
 
-    async def execute_tool(self, user_id: str, name: str, arguments: dict[str, Any], approved: bool = False) -> tuple[bool, str]:
+    async def execute_tool(
+        self,
+        user_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        approved: bool = False,
+        trace_id: str = "",
+        feature: str = "agent",
+    ) -> tuple[bool, str]:
         """Run one MCP tool for `user_id` outside a chat session — the agents
         service's path (POST /internal/tools/call). Same rules as a chat tool
         call: allowlisted tools only, mandatory approvals (the agent must have
@@ -916,7 +1068,9 @@ class AgentRuntime:
             arguments["file_token"] = self.file_tokens.issue(str(document_id)) if document_id else ""
         timeout = self.settings.tool_call_timeout_seconds
         try:
-            result = await asyncio.wait_for(self.mcp.call_tool(name, arguments), timeout=timeout)
+            result = await self._timed_tool_call(
+                self.mcp, name, arguments, timeout, user_id=user_id, trace_id=trace_id, feature=feature
+            )
         except asyncio.TimeoutError:
             return False, f"Error calling tool '{name}': timed out after {timeout:.0f}s."
         except Exception as exc:  # noqa: BLE001 - reported back to the agent

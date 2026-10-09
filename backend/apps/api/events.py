@@ -94,5 +94,10 @@ def error(detail: str) -> dict[str, Any]:
     return sse("error", {"detail": detail})
 
 
+def usage(summary: dict[str, Any]) -> dict[str, Any]:
+    """What this turn used: model calls, tool calls, tokens, cost, duration."""
+    return sse("usage", summary)
+
+
 def done(answer: str, iterations: int) -> dict[str, Any]:
     return sse("done", {"answer": answer, "iterations": iterations})

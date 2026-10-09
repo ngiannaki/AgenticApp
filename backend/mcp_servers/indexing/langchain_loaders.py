@@ -89,7 +89,7 @@ def _fallback_pptx(file_path: Path) -> list[Document]:
     return [
         Document(
             page_content=page.get("text", ""),
-            metadata={"source": file_path.name, "slide": page.get("page_number", i)},
+            metadata={"source": file_path.name, "slide": page.get("page_number", i), "slide_title": page.get("title") or ""},
         )
         for i, page in enumerate(pages)
     ]

@@ -104,6 +104,15 @@ class ChatSession:
     pending_interrupts: dict[str, PendingInterrupt] = field(default_factory=dict)
     pending_questions: dict[str, PendingQuestion] = field(default_factory=dict)
     last_active: float = field(default_factory=time.time)
+    trace_id: str = ""
+    """Id of the user turn being processed (new per turn), ties that turn's
+    model calls and tool calls together in app.llm_calls / app.trace_spans."""
+    chunk_history: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Chunks cited in earlier turns of this conversation, by chunk id (see
+    backend.core.citations.remember_citations), so a reused id still resolves."""
+    turn_usage: dict[str, Any] = field(default_factory=dict)
+    """Running totals for the current turn, reset by run_stream and sent to the
+    client as the `usage` event."""
 
     def touch(self) -> None:
         self.last_active = time.time()

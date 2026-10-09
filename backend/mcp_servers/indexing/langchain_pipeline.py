@@ -30,6 +30,24 @@ logger = logging.getLogger(__name__)
 # atomic/structured enough for a plain character split.
 _MARKDOWN_STRUCTURED_TYPES = {"pdf", "docx", "txt"}
 
+_MAX_SLIDE_TITLE_CHARS = 80
+
+
+def context_prefix(document_name: str | None, metadata: dict) -> str:
+    """The "which document / sheet / slide is this from" lines put in front
+    of a chunk's text, so the embedding and the keyword index know it (the
+    "Section:" line for pdf/docx/txt is added earlier, by the splitter).
+    No LLM involved: it is all read from the document's own structure."""
+    lines = []
+    if document_name and document_name != "Untitled":
+        lines.append(f"Document: {document_name}")
+    if metadata.get("sheet"):
+        lines.append(f"Sheet: {metadata['sheet']}")
+    if metadata.get("slide") is not None:
+        title = (metadata.get("slide_title") or "").strip()[:_MAX_SLIDE_TITLE_CHARS]
+        lines.append(f"Slide {metadata['slide']}" + (f": {title}" if title else ""))
+    return "\n".join(lines) + "\n" if lines else ""
+
 
 class LangchainIndexPipelineV2:
     """Parse -> split -> embed -> store, entirely on LangChain primitives."""
@@ -64,8 +82,13 @@ class LangchainIndexPipelineV2:
         split_docs: list[Document] = []
         toc_entries: list[dict] = []
         seen = set()
+        # One section state for the whole document, so a page with no heading
+        # of its own still carries the section it continues.
+        heading_state: dict = {"h1": None, "h2": None, "h3": None}
         for doc in stitch_cross_page_tables(raw_docs):
-            chunks, headings = split_markdown_preserving_structure(doc, self.cfg.chunk_size, self.cfg.chunk_overlap)
+            chunks, headings = split_markdown_preserving_structure(
+                doc, self.cfg.chunk_size, self.cfg.chunk_overlap, heading_state
+            )
             split_docs.extend(chunks)
             for h in headings:
                 key = (h["level"], h["title"], h.get("page"))
@@ -111,6 +134,9 @@ class LangchainIndexPipelineV2:
             }
 
             for i, doc in enumerate(split_docs):
+                prefix = context_prefix(document_name, doc.metadata)
+                if prefix:
+                    doc.page_content = prefix + doc.page_content
                 # Loader/splitter metadata (page, sheet, row, start_index, ...) is
                 # grounding info worth keeping, but its own "source" is the
                 # server-local file path store.create_document wrote to (an

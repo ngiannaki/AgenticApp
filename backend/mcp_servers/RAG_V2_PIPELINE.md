@@ -70,7 +70,15 @@ since those Documents are already row/slide-atomic):
    section (`RecursiveCharacterTextSplitter`, `chunk_size`/`chunk_overlap`).
    Each resulting chunk (`chunk_content_type=prose`) gets a `"Section: h1 >
    h2\n\n"` breadcrumb prepended to its text — this is embedded, not just
-   metadata, so section context affects retrieval relevance too.
+   metadata, so section context affects retrieval relevance too. The
+   heading state is carried from page to page, so a page with no heading of
+   its own still gets the section it continues (before, such chunks had no
+   section at all: 97 of 183 on a real 37-page paper). Heading text is
+   cleaned of markdown emphasis (`**Title**`), each breadcrumb level is capped
+   at 100 characters, and a level that repeats the one above it is skipped.
+   After splitting, the indexing pipeline puts `Document: <name>` (plus
+   `Sheet: <name>` for xlsx rows, `Slide N: <title>` for pptx slides) in front
+   of every chunk of every file type (`context_prefix`) — no LLM involved.
 4. Headings seen (with the page they appeared on) are collected across the
    whole document into a deduped, ordered list and stored as
    `collection_metadata["toc"]` (JSON string — Chroma collection metadata
@@ -102,6 +110,9 @@ query
   collection's already-loaded chunks (no extra Chroma round-trip) and
   merges their text in. `text` becomes the merged block;
   `grounding.expanded` says whether merging happened for that chunk.
+- `retrieve_document_v2` and `search_documents_v2` also return `timings_ms`
+  (embed, dense, keyword, fuse, rerank, expand), which the API stores on the
+  tool-call span for the Usage page.
 - Every chunk's `grounding` block: `document_id`, `document_name`, `source`,
   `location` (page/slide/sheet/row, whichever is set), `chunk_id`,
   `chunk_index`, `content_type` (file type: pdf/docx/...),

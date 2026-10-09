@@ -574,6 +574,37 @@ class LangchainRagSettings(BaseSettings):
     table_expand_max_chars: int = Field(default=8000, gt=0, description="A hit on part of a table split over several chunks returns the whole table, up to this many characters (parts nearest the hit first).")
 
 
+class ObservabilitySettings(BaseSettings):
+    """Usage, latency and cost tracking (backend/core/observability.py).
+    Stores metadata only — never prompts, answers or tool arguments."""
+
+    model_config = _settings_config("OBS_")
+
+    enabled: bool = Field(default=True, description="Record LLM calls and tool calls (app.llm_calls, app.trace_spans).")
+    retention_days: int = Field(default=90, ge=0, description="Rows older than this are deleted at API startup (0 = keep forever).")
+    stream_usage: bool = Field(
+        default=True,
+        description=(
+            "Ask the model server for token usage on streamed replies (stream_options.include_usage). "
+            "Set false if your OpenAI-compatible server rejects it; tokens are then estimated."
+        ),
+    )
+    admin_emails: str = Field(default="", description="Comma-separated emails allowed to see the team-wide usage view (GET /api/usage/admin).")
+    pricing_json: str | None = Field(
+        default=None,
+        description=(
+            'Price overrides/additions in USD per 1M tokens, by model-name prefix: '
+            '{"gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.6}}.'
+        ),
+    )
+
+    _normalize = field_validator("pricing_json", mode="before")(_blank_to_none)
+
+    @property
+    def admin_email_set(self) -> set[str]:
+        return {e.strip().lower() for e in self.admin_emails.split(",") if e.strip()}
+
+
 class AgentsSettings(BaseSettings):
     """The A2A agents service (backend/apps/agents) and how the API reaches it."""
 
@@ -662,6 +693,7 @@ class Settings:
         self.google_docai = GoogleDocAISettings()
         self.auth = AuthSettings()
         self.agents = AgentsSettings()
+        self.obs = ObservabilitySettings()
 
     # --- environment helpers -------------------------------------------------
     @property

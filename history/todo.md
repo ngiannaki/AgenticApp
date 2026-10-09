@@ -328,3 +328,38 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by `- [status-icon] task
 ## 2026-10-02
 - ✅ generate_file pptx format (title/KPI/chart/table slides, speaker notes) + prompts/skill route decks to it
 - ⬜ Rebuild the sandbox/code-server image or venv so python-pptx is installed where the code MCP server runs, then rerun the NVIDIA ppt task
+
+## 2026-10-08
+- ✅ Plan written: docs/PLAN_rag_eval_and_observability.md (eval harness, hybrid tuning, contextual retrieval, observability)
+- ⬜ Answer the open decisions in the plan (eval corpus, judge model, admin list, observability store, reranker)
+- ⬜ Evaluation harness: golden dataset, retrieval + generation metrics, runner/compare CLI, baseline run
+- ⬜ Observability: llm_calls + trace_spans tables, capture in chat/agents/tools/retrieval, pricing table, /api/usage, /usage page
+- ⬜ Hybrid search tuning driven by eval (RRF weights, keyword config, reranker model, relevance cutoff, query rewriting, MMR)
+- ⬜ Contextual retrieval (opt-in) with reindex --contextual and eval A/B
+
+## 2026-10-08
+- ✅ Scope decision: evaluation harness, hybrid tuning and per-chunk contextual retrieval will NOT be built (sample app, token cost)
+- ⬜ Zero-LLM context enrichment: carry h1/h2/h3 across pages (bug), add document title to chunk prefix, sheet/slide context for csv/xlsx/pptx, then reindex
+- ⬜ Observability and cost tracking (approved)
+
+## 2026-10-08
+- ✅ Zero-LLM context enrichment: section carried across pages, Document/Sheet/Slide line on every chunk
+- ✅ Observability and cost tracking: tables, recording in chat and agents, pricing, /api/usage, Usage page, per-answer usage line
+- ⬜ Re-index existing documents to get the section and Document lines: `python -m backend.scripts.reindex_all`
+- ⬜ Run the new DB tests (test_observability.py) against a real Postgres (set TEST_DATABASE_ADMIN_URL, or let CI do it)
+- ⬜ Look at the Usage page in a browser and check the model server really returns token usage when streaming (else set OBS_STREAM_USAGE=false)
+- ⬜ Set OBS_ADMIN_EMAILS and check OBS prices in backend/config/pricing.py against your provider
+- ⬜ Track embedding calls (query and indexing) in the usage tables
+
+## 2026-10-08
+- ✅ Citations: tolerate mangled citation tags, stamp search_my_documents_v2 results, clickable [n] badges in answers
+- ⬜ Check in the browser that the [n] badges and the Sources strip look right on a real answer
+
+## 2026-10-08
+- ✅ Citations: unknown chunk ids are stripped, ids from earlier turns resolve (session chunk_history)
+- ⬜ Restart the API and ask a follow-up question on the same document to confirm no raw id appears
+
+## 2026-10-08
+- ✅ generate_ui: reject pages whose inline script has unbalanced brackets
+- ⬜ Restart the code MCP server and ask the agent for a dashboard again to see the retry path in a real run
+- ⬜ Optional: tell the model in the agent prompt that chart axes with percentages need a `%` label and mixed-unit series need separate axes (seen in the NVIDIA dashboard)

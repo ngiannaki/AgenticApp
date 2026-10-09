@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from backend.config import settings as app_settings
+from backend.core.observability import LlmUsage
 
 from backend.apps.api.routers.files import _document_store
 
@@ -71,6 +72,7 @@ def _require_agents_token(request: Request) -> None:
 class ToolCall(BaseModel):
     user_id: str
     agent_id: str = ""
+    task_id: str = ""
     name: str
     arguments: dict[str, Any] = {}
     approved: bool = False
@@ -88,5 +90,56 @@ def tool_schemas(request: Request, names: str = "") -> list[dict]:
 async def call_tool(body: ToolCall, request: Request) -> dict:
     _require_agents_token(request)
     logger.info("[AGENT TOOL] agent=%s user=%s tool=%s", body.agent_id, body.user_id, body.name)
-    ok, text = await request.app.state.runtime.execute_tool(body.user_id, body.name, body.arguments, approved=body.approved)
+    ok, text = await request.app.state.runtime.execute_tool(
+        body.user_id,
+        body.name,
+        body.arguments,
+        approved=body.approved,
+        trace_id=body.task_id,
+        feature=f"agent:{body.agent_id}" if body.agent_id else "agent",
+    )
     return {"ok": ok, "text": text}
+
+
+class LlmUsageReport(BaseModel):
+    """One model call made by the agents service, reported after the fact."""
+
+    user_id: str
+    agent_id: str = ""
+    task_id: str = ""
+    model: str
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    estimated: bool = False
+    latency_ms: int | None = None
+    status: str = "ok"
+    error: str | None = None
+
+
+@router.post("/usage")
+async def report_usage(body: LlmUsageReport, request: Request) -> dict:
+    """The agents service has no database of its own: it reports each model
+    call here and the API records it (cost is worked out here, from the model)."""
+    _require_agents_token(request)
+    recorder = getattr(request.app.state, "usage", None)
+    if recorder is not None:
+        recorder.llm_call(
+            user_id=body.user_id,
+            feature=f"agent:{body.agent_id}" if body.agent_id else "agent",
+            model=body.model,
+            usage=LlmUsage(
+                input_tokens=body.input_tokens,
+                cached_tokens=body.cached_tokens,
+                output_tokens=body.output_tokens,
+                reasoning_tokens=body.reasoning_tokens,
+                estimated=body.estimated,
+            ),
+            latency_ms=body.latency_ms,
+            trace_id=body.task_id or None,
+            task_id=body.task_id or None,
+            status=body.status,
+            error=body.error,
+        )
+    return {"ok": True}

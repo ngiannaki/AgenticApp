@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -46,6 +47,7 @@ from a2a.server.tasks import TaskUpdater
 from a2a.types import TaskState
 
 from backend.config import get_async_openai_client, get_chat_extra_body, settings
+from backend.core.observability import estimate_usage, usage_from_response
 
 logger = logging.getLogger("agents")
 
@@ -150,8 +152,10 @@ class Llm:
     """Thin wrapper over the app's one OpenAI-compatible client (Ollama in
     DEV, OpenAI in PROD — same switch as the chat)."""
 
-    def __init__(self) -> None:
+    def __init__(self, user_id: str = "", task_id: str = "", agent_id: str = "") -> None:
         self._client = None
+        self.user_id, self.task_id, self.agent_id = user_id, task_id, agent_id
+        self._reports: set[asyncio.Task] = set()
 
     @property
     def client(self):
@@ -160,14 +164,57 @@ class Llm:
         return self._client
 
     async def complete(self, messages: list[dict], tools: list[dict] | None = None, temperature: float = 0.2):
-        response = await self.client.chat.completions.create(
-            model=settings.chat_model,
-            messages=messages,
-            tools=tools or None,
-            temperature=temperature,
-            extra_body=get_chat_extra_body(),
-        )
-        return response.choices[0].message
+        started = time.perf_counter()
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.chat_model,
+                messages=messages,
+                tools=tools or None,
+                temperature=temperature,
+                extra_body=get_chat_extra_body(),
+            )
+        except Exception as exc:
+            self._report(started, error=str(exc))
+            raise
+        message = response.choices[0].message
+        usage = usage_from_response(getattr(response, "usage", None))
+        if usage is None:  # server reported none: estimate, flagged as such
+            produced = (message.content or "") + "".join(tc.function.arguments or "" for tc in (message.tool_calls or []))
+            usage = estimate_usage(messages, produced)
+        self._report(started, usage=usage)
+        return message
+
+    def _report(self, started: float, usage=None, error: str | None = None) -> None:
+        """Tell the API about this model call (it owns the database), without
+        slowing the agent down; a failure to report is ignored."""
+        if not self.user_id or not settings.agents.internal_token:
+            return
+        payload = {
+            "user_id": self.user_id,
+            "agent_id": self.agent_id,
+            "task_id": self.task_id,
+            "model": settings.chat_model,
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "status": "error" if error else "ok",
+            "error": error,
+            **({"input_tokens": usage.input_tokens, "cached_tokens": usage.cached_tokens, "output_tokens": usage.output_tokens,
+                "reasoning_tokens": usage.reasoning_tokens, "estimated": usage.estimated} if usage else {}),
+        }
+
+        async def send() -> None:
+            try:
+                async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+                    await client.post(
+                        f"{settings.agents.api_url}/internal/usage",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {settings.agents.internal_token}"},
+                    )
+            except Exception:  # noqa: BLE001 - tracking must never break a task
+                logger.debug("Could not report model usage", exc_info=True)
+
+        task = asyncio.get_running_loop().create_task(send())
+        self._reports.add(task)
+        task.add_done_callback(self._reports.discard)
 
     async def text(self, system: str, user: str) -> str:
         message = await self.complete([{"role": "system", "content": system}, {"role": "user", "content": user}])
@@ -188,15 +235,16 @@ class Llm:
 class ToolClient:
     """Calls tools through the API's internal endpoint (as the task's user)."""
 
-    def __init__(self, user_id: str, agent_id: str) -> None:
+    def __init__(self, user_id: str, agent_id: str, task_id: str = "") -> None:
         self.user_id = user_id
         self.agent_id = agent_id
+        self.task_id = task_id
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {settings.agents.internal_token}"}
 
     async def call(self, name: str, arguments: dict[str, Any], approved: bool = False) -> ToolResult:
-        payload = {"user_id": self.user_id, "agent_id": self.agent_id, "name": name, "arguments": arguments, "approved": approved}
+        payload = {"user_id": self.user_id, "agent_id": self.agent_id, "task_id": self.task_id, "name": name, "arguments": arguments, "approved": approved}
         async with httpx.AsyncClient(timeout=settings.agents.tool_call_timeout_seconds + 30, trust_env=False) as client:
             response = await client.post(f"{settings.agents.api_url}/internal/tools/call", json=payload, headers=self._headers())
         if response.status_code != 200:
@@ -220,8 +268,8 @@ class RunContext:
         self.agent = agent
         self.task_id = task_id
         self.user_id = user_id
-        self.tools = tools or ToolClient(user_id, agent.id)
-        self.llm = llm or Llm()
+        self.tools = tools or ToolClient(user_id, agent.id, task_id)
+        self.llm = llm or Llm(user_id=user_id, task_id=task_id, agent_id=agent.id)
         self._updater: TaskUpdater | None = None
         self._paused = asyncio.Event()
         self._reply: asyncio.Future[str] | None = None

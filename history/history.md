@@ -581,3 +581,55 @@ Each entry is a `##` block dated `YYYY-MM-DD`, followed by fixed `- **Field:** v
   2. **New pptx format:** a themed 16:9 deck from the same document shape as html/docx. The title becomes a dark title slide; `metrics` become KPI-card slides (coloured by trend); each section becomes a slide with text on the left and a native, editable column or line chart on the right; each `table` gets its own styled table slide (split every 9 rows); optional per-section `notes` become speaker notes.
   3. **Routing:** the SKILL.md tool table, the content-shape list, the agent system prompt and the tool docstring now tell the model to use generate_file for decks and never hand-write pptx. python-pptx was added to the code-server and sandbox requirements.
   - **Verification:** new test (slide count, native chart, table slides split, notes); a sample deck was exported through PowerPoint and checked slide by slide.
+
+## 2026-10-08
+- **Change:** Planned (not implemented) an evaluation harness, hybrid-search tuning, contextual retrieval and observability/cost tracking
+- **Files:** docs/PLAN_rag_eval_and_observability.md (new)
+- **Details:**
+  1. **Finding:** hybrid search (pgvector + full-text, weighted RRF) and a cross-encoder reranker already exist in retrieval/langchain_pipeline.py, so the hybrid item became "tune it with evidence from the eval". RAG_V2_PIPELINE.md still describes Chroma and is stale.
+  2. **Plan:** eval harness first (retrieval metrics without an LLM, LLM-judge generation metrics, runner and compare CLI), then observability (llm_calls and trace_spans tables, pricing table, usage API and page), then hybrid tuning, then opt-in contextual retrieval measured by A/B.
+  3. **Semantic cache** is explicitly out of scope.
+
+## 2026-10-08
+- **Change:** Narrowed the RAG plan: no evaluation harness, no hybrid tuning, no per-chunk contextual retrieval; added a zero-LLM context-enrichment item from reviewing how the TOC and section breadcrumb are built
+- **Files:** docs/PLAN_rag_eval_and_observability.md (scope update section), history/todo.md
+- **Details:**
+  1. **Why:** this is a sample app and those pieces burn tokens, and per-chunk context costs about one LLM call per chunk (roughly 270 for a large document).
+  2. **Finding:** in langchain_structure.py the heading state is tracked per page, so a page without its own heading gets no "Section:" prefix and no h1/h2/h3 metadata, even though the document TOC knows the section. Reproduced with a two-page sample.
+  3. **Other gaps:** the document title is not in the embedded text, and csv/xlsx/pptx chunks get no context prefix.
+
+## 2026-10-08
+- **Change:** Chunks now carry their section across pages plus a Document/Sheet/Slide line (no LLM), and the app tracks tokens, latency and cost (new Usage page)
+- **Files:** backend: mcp_servers/indexing/{langchain_structure,langchain_pipeline,langchain_loaders}.py, mcp_servers/retrieval/langchain_pipeline.py, core/observability.py (new), config/pricing.py (new), config/settings.py (OBS_*), migrations/0006_observability.sql (new), apps/api/{streaming_agent,sessions,events,main}.py, apps/api/routers/{usage (new),internal,chat}.py, apps/agents/base.py, tests/{test_context_enrichment,test_observability}.py (new), .env.example; frontend: src/app/usage/page.tsx (new), components/{ChatWindow,ChatApp,Sidebar}.tsx, lib/{api,types}.ts, app/globals.css
+- **Details:**
+  1. **Section carried across pages:** the splitter used to restart the heading state on every page, so a page with no heading of its own got no "Section:" line and no h1/h2/h3. The pipeline now shares one state across the document. On the real paper (docling, 37 pages) chunks without a section went from 97 of 183 to 1. Headings are cleaned of `**bold**` markers, capped at 100 characters per level and a repeated title is skipped (with the pymupdf4llm engine the paper's only heading is its title, which would otherwise have been stamped on every chunk). Needs a re-index (`python -m backend.scripts.reindex_all`) to apply to existing documents.
+  2. **Document / sheet / slide line:** every chunk starts with `Document: <name>`; xlsx rows add `Sheet:`, pptx slides add `Slide N: <title>` (the loader now keeps the slide title).
+  3. **Observability:** `app.llm_calls` (one row per model call: tokens, cached tokens, latency, time to first token, cost, estimated flag, status) and `app.trace_spans` (one row per tool call, with the retrieval stage timings). Recorded from the chat loop and, for agents, through a new `POST /internal/usage` because the agents service has no database. Metadata only, no prompts or answers. Local models are recorded at $0; a PROD model without a known price is stored as unknown, not guessed. Prices are in config/pricing.py and can be overridden with OBS_PRICING_JSON. Streaming asks for usage with `stream_options.include_usage` (OBS_STREAM_USAGE=false turns that off; tokens are then estimated and shown with ~). Rows older than OBS_RETENTION_DAYS (90) are deleted at API startup.
+  4. **Where to see it:** each answer gets a muted line (tokens in/out, cost, seconds, tool calls) from a new `usage` SSE event that is saved with the message's steps. New Usage page (`/usage`, sidebar): cost / tokens / calls per day, by feature, by model, tools (calls, failures, avg and p95), where retrieval time goes, most expensive chats; admins (OBS_ADMIN_EMAILS, or anyone with AUTH_DEV_BYPASS) get an "Everyone" view with a per-user table.
+  - **Not built (decided):** evaluation harness, hybrid-search tuning, per-chunk contextual retrieval (see docs/PLAN_rag_eval_and_observability.md). Embedding calls are not tracked yet.
+  - **Verification:** pytest 74 passed, 42 skipped (the skips are the Postgres tests: there is no Postgres here, so the new SQL and the migration were only parsed with the real PostgreSQL parser, not run; the new DB tests will run in CI). Frontend tsc, eslint and `next build` clean. The Usage page was not looked at in a browser.
+
+## 2026-10-08
+- **Change:** Citations no longer leak raw chunk ids into answers; `[n]` markers are now clickable badges; multi-document search results can be cited
+- **Files:** backend/core/citations.py, backend/tests/test_citations.py (new), frontend/src/components/{Markdown,ChatWindow}.tsx, frontend/src/app/globals.css
+- **Details:**
+  1. **Cause:** the renderer only understood the exact `<citation id="..."/>` tag. When the model wrote the tag differently (seen in chat: `cite` glued to the chunk id), nothing matched and the raw id stayed in the answer. Separately, `retrieval_search_my_documents_v2` results were never stamped with a `cite_as` tag, so answers from that tool had nothing correct to copy.
+  2. **Fix:** the tag, the `cite_as` field, the prompts and the skill are unchanged and still the main mechanism. The renderer now also accepts a mangled reference to a chunk id it really handed out (`cite<id>`, `[cite: <id>]`, `cite_as="<id>"`, `<citation id=<id>>`, the bare id) and turns it into the same `[n]` marker, in reading order; unknown ids are still dropped. Text around a reference (spaces, newlines) is left alone. Search results from `search_my_documents_v2` are stamped like `retrieve_document_v2`.
+  3. **Look:** the `[n]` markers in an assistant answer show as small superscript badges; clicking one opens that source in the Sources strip under the answer.
+  - **Verification:** pytest 89 passed, 42 skipped (Postgres tests); the new citation tests cover each mangled form. Frontend tsc, eslint and build clean; the badge plugin was rendered in node (code and links untouched). Not looked at in a browser. The answer you pasted was already saved with the raw ids, so it will keep showing them; new answers are fixed.
+
+## 2026-10-08
+- **Change:** A chunk id the current turn doesn't know can no longer show up in an answer; ids from earlier turns of the same chat still resolve to their source
+- **Files:** backend/core/citations.py, backend/apps/api/{sessions,streaming_agent}.py, backend/tests/test_citations.py
+- **Details:**
+  1. **Cause:** the first fix only recognised ids returned by the current turn's retrieval. In a follow-up question the model reused an id it had seen in an earlier turn's tool result, so it matched nothing and stayed in the text (`cite<id>`).
+  2. **Fix:** the session now remembers the chunks cited in earlier turns (`chunk_history`, last 400, oldest dropped) and the renderer resolves those to `[n]` and a Sources entry. Any other text shaped like a chunk id (`<uuid>-v2-<n>-<hash>`), bare or inside a mangled tag, is removed. The Sources strip is now sent whenever the answer cites something, not only when this turn retrieved something. The `<citation id="..."/>` tag and the prompts are unchanged; nothing instructs the model to write `cite<id>`, it paraphrases the `cite_as` field name.
+  - **Verification:** pytest 93 passed, 42 skipped (Postgres tests), including the exact id from the chat. The API must be restarted to pick this up; already-saved answers keep their raw ids.
+
+## 2026-10-08
+- **Change:** generate_ui now refuses a page whose inline `<script>` has unbalanced brackets, so the model gets the error and can fix it instead of the user seeing blank charts
+- **Files:** backend/mcp_servers/code/generation/ui.py, backend/tests/test_generate_ui.py
+- **Details:**
+  1. **Cause:** an agent-generated NVIDIA dashboard showed its cards and legends but empty plots, KPIs and takeaway. `bars()` ended with `})))}` (one `)` too many), a JavaScript syntax error, so the browser dropped the whole script. Nothing in the pipeline noticed.
+  2. **Fix:** `_check_inline_scripts` scans each inline script (skips `src=` and non-JS types) with a small bracket matcher that understands strings, comments, regex literals and nested template literals. On a mismatch it raises a `ValidationError` naming the bracket and the script line. Only bracket mismatches are checked, so valid pages are not rejected. There is no Node in the backend image, so this is pure Python and not a full parser.
+  - **Verification:** 9 new tests pass (the real broken pattern, an unclosed brace, valid tricky JS, external and JSON scripts); the real dashboard HTML is accepted when fixed and rejected when broken. The code MCP server must be restarted to pick this up.

@@ -36,7 +36,7 @@ from backend.apps.api.document_registry import DocumentRegistry
 from backend.apps.api.indexer import Indexer
 from backend.apps.api.logging_config import setup_logging
 from backend.apps.api.persistence import ConversationStore
-from backend.apps.api.routers import agents, auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools
+from backend.apps.api.routers import agents, auth, chat, conversations, data, files, internal, interrupts, questions, sessions, tools, usage
 from backend.apps.api.agent_tasks import AgentHub, TaskStore
 from backend.apps.api import custom_agents
 from backend.apps.api.sessions import SessionManager
@@ -48,6 +48,7 @@ from backend.apps.api.sessions import SessionManager
 from backend.apps.api.streaming_agent import AgentRuntime
 from backend.config import settings as app_settings
 from backend.core.mcp_http import internal_token
+from backend.core.observability import UsageRecorder
 from backend.core.db import apply_migrations, close_pool, ensure_agent_role, get_pool, run_sync
 
 logger = logging.getLogger("agentic_api")
@@ -139,6 +140,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = await AgentRuntime.connect(servers, settings)
 
     app.state.runtime = runtime
+    app.state.usage = runtime.usage = UsageRecorder(pool)
+    try:
+        purged = await run_sync(app.state.usage.purge)
+        if purged:
+            logger.info("Deleted %d usage rows older than %d days", purged, app_settings.obs.retention_days)
+    except Exception:  # noqa: BLE001 - housekeeping, never blocks startup
+        logger.warning("Could not purge old usage rows", exc_info=True)
     app.state.session_manager = SessionManager(settings.session_idle_timeout_seconds, runtime)
 
     app.state.conversation_store = ConversationStore(pool)
@@ -214,6 +222,7 @@ def create_app() -> FastAPI:
     app.include_router(files.documents_router)
     app.include_router(data.router)
     app.include_router(internal.router)
+    app.include_router(usage.router)
     app.include_router(agents.router)
     app.include_router(custom_agents.router)
 

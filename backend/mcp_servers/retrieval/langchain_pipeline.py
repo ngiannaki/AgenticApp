@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from functools import lru_cache
 from typing import Any
 
@@ -262,16 +263,31 @@ class LangchainRetrievalPipelineV2:
 
     def _search(
         self, document_ids: list[str], query: str, top_k: int | None, filters: dict | None
-    ) -> tuple[list[dict], bool, bool]:
+    ) -> tuple[list[dict], bool, bool, dict[str, int]]:
         """Hybrid search over `document_ids` (already ownership-checked).
-        Returns (source_chunks, used_keyword_leg, reranked)."""
+        Returns (source_chunks, used_keyword_leg, reranked, timings_ms) —
+        timings_ms is the milliseconds each stage took (embed, dense,
+        keyword, fuse, rerank, expand), for the app's usage dashboard."""
         top_k = min(top_k or self.cfg.default_top_k, self.cfg.max_top_k)
         fetch_k = min(max(top_k * self.cfg.fetch_k_multiplier, 10), self.cfg.max_fetch_k)
 
+        timings: dict[str, int] = {}
+        mark = time.perf_counter()
+
+        def lap(stage: str) -> None:
+            nonlocal mark
+            now = time.perf_counter()
+            timings[stage] = round((now - mark) * 1000)
+            mark = now
+
         query_vector = self.embeddings.embed_query(query)
+        lap("embed")
         dense = self.store.dense_search(document_ids, query_vector, fetch_k, filters)
+        lap("dense")
         keyword = self.store.keyword_search(document_ids, query, fetch_k, filters)
+        lap("keyword")
         fused = fuse_rankings([dense, keyword], [self.cfg.dense_weight, self.cfg.sparse_weight])
+        lap("fuse")
 
         candidates = [_row_to_document(r) for r in fused]
         for doc, row in zip(candidates, fused):
@@ -284,6 +300,7 @@ class LangchainRetrievalPipelineV2:
                 reranked = True
             except Exception as e:  # noqa: BLE001 — degrade to fused order, don't fail the search
                 logger.warning(f"[RETRIEVAL_V2] Reranker unavailable, skipping: {e}")
+        lap("rerank")
         docs = candidates[:top_k]
 
         expanded_docs = self._expand_neighbors(docs)
@@ -299,7 +316,8 @@ class LangchainRetrievalPipelineV2:
                     "grounding": self._grounding(metadata, expanded=expanded),
                 }
             )
-        return source_chunks, bool(keyword), reranked
+        lap("expand")
+        return source_chunks, bool(keyword), reranked, timings
 
     def retrieve(
         self,
@@ -332,7 +350,7 @@ class LangchainRetrievalPipelineV2:
             return {"success": False, "document_id": document_id, "query": query, "error": mismatch}
 
         try:
-            source_chunks, used_keyword, reranked = self._search([document_id], query, top_k, filters)
+            source_chunks, used_keyword, reranked, timings = self._search([document_id], query, top_k, filters)
             logger.info(
                 f"[RETRIEVAL_V2] document_id={document_id} hybrid={used_keyword} reranked={reranked} -> {len(source_chunks)} chunks"
             )
@@ -346,6 +364,7 @@ class LangchainRetrievalPipelineV2:
                 "retrieval_mode": "hybrid" if used_keyword else "dense",
                 "reranked": reranked,
                 "filters": filters,
+                "timings_ms": timings,
             }
         except Exception as e:
             logger.exception(f"[RETRIEVAL_V2] Retrieval failed for document_id={document_id}")
@@ -396,7 +415,7 @@ class LangchainRetrievalPipelineV2:
             }
 
         try:
-            source_chunks, used_keyword, reranked = self._search(searchable, query, top_k, filters)
+            source_chunks, used_keyword, reranked, timings = self._search(searchable, query, top_k, filters)
             logger.info(
                 f"[RETRIEVAL_V2] search across {len(searchable)} doc(s) hybrid={used_keyword} reranked={reranked} -> {len(source_chunks)} chunks"
             )
@@ -411,6 +430,7 @@ class LangchainRetrievalPipelineV2:
                 "retrieval_mode": "hybrid" if used_keyword else "dense",
                 "reranked": reranked,
                 "filters": filters,
+                "timings_ms": timings,
             }
         except Exception as e:
             logger.exception("[RETRIEVAL_V2] Cross-document search failed")

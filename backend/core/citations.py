@@ -12,6 +12,11 @@ import re
 from typing import Any
 
 
+# Tools whose results carry citable chunks (matched by suffix: the chat prefixes
+# the server name, e.g. "retrieval_search_my_documents_v2").
+_CITABLE_TOOLS = ("retrieve_document_v2", "search_my_documents_v2")
+
+
 def _collect_and_stamp_citations(
     citations: list[dict[str, Any]], chunk_numbers: dict[str, int], name: str, ok: bool, text: str
 ) -> str:
@@ -47,7 +52,7 @@ def _collect_and_stamp_citations(
     memory and show in the tool-result event, so the model reads the same
     stamped version this function computed from.
     """
-    if not ok or not name.endswith("retrieve_document_v2"):
+    if not ok or not name.endswith(_CITABLE_TOOLS):
         return text
     try:
         data = json.loads(text)
@@ -74,8 +79,51 @@ def _collect_and_stamp_citations(
 _CITATION_TAG_RE = re.compile(r'<citation\s+id="([^"]*)"\s*/?>')
 
 
+def _citation_reference_re(chunk_ids: list[str]) -> "re.Pattern[str]":
+    """Matches either the exact `<citation id="..."/>` tag (group `tag_id`, any
+    id) or a looser reference to a chunk id we really handed out (group
+    `loose_id`): the id on its own, or after/inside some mangled form of the
+    tag a model sometimes writes instead — `cite<id>`, `[cite: <id>]`,
+    `<citation id=<id>>`, `cite_as="<id>"`. Chunk ids are long and unique
+    (`<document>-v2-<n>-<hash>`), so matching known ids anywhere is safe, and
+    it keeps a raw id from ever reaching the user."""
+    known = "|".join(re.escape(i) for i in sorted(chunk_ids, key=len, reverse=True))
+    # Whitespace is only consumed when it is part of the reference itself
+    # (between the bracket/"cite" and the id, or before a closing "/>" or
+    # bracket), never the space or newline around it.
+    loose = (
+        r"(?i:(?:[<\[(]\s*)?(?:cit(?:e|ation)(?:[_\s]*(?:as|id))?\s*[:=]?\s*)?)"
+        r"[\"']?(?P<loose_id>" + known + r")[\"']?(?:\s*/?[>\])])?"
+    ) if known else r"(?!x)x"
+    return re.compile(r'<citation\s+id="(?P<tag_id>[^"]*)"\s*/?>|' + loose)
+
+
+# A chunk id left in the answer that matches no chunk we can resolve (a typo, an
+# invented one, or one from a conversation we no longer remember): shaped
+# "<document uuid>-v2-<n>-<8 hex>", optionally wrapped in a mangled tag.
+_STRAY_CHUNK_REF_RE = re.compile(
+    r"(?i:(?:[<\[(]\s*)?(?:cit(?:e|ation)(?:[_\s]*(?:as|id))?\s*[:=]?\s*)?)"
+    r"[\"']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-v2-\d+-[0-9a-f]{8}[\"']?(?:\s*/?[>\])])?"
+)
+
+_MAX_REMEMBERED_CHUNKS = 400
+
+
+def remember_citations(history: dict[str, dict[str, Any]], citations: list[dict[str, Any]]) -> None:
+    """Keep the chunks cited this turn, so a later turn that reuses one of their
+    ids (the model still sees earlier tool results) can still resolve it to a
+    real source instead of leaving a raw id behind. Bounded, oldest dropped."""
+    for c in citations:
+        chunk_id = (c.get("grounding") or {}).get("chunk_id")
+        if chunk_id:
+            history.pop(chunk_id, None)
+            history[chunk_id] = c
+    while len(history) > _MAX_REMEMBERED_CHUNKS:
+        history.pop(next(iter(history)))
+
+
 def _render_citations(
-    answer: str, citations: list[dict[str, Any]]
+    answer: str, citations: list[dict[str, Any]], earlier: dict[str, dict[str, Any]] | None = None
 ) -> tuple[str, list[dict[str, Any]]]:
     """Turn the model's inline `<citation id="..."/>` tags into the
     user-facing answer text plus the filtered, display-numbered Sources
@@ -108,12 +156,17 @@ def _render_citations(
     Falls back to returning every collected citation, un-renumbered, when
     the answer contains no tags at all, so a model that skipped the
     instruction still shows sources rather than none.
+
+    `earlier` holds chunks cited in previous turns of the same conversation
+    (see remember_citations): an id from one of them resolves like a current
+    one. Any other chunk-id-shaped text left over is removed, so a raw id is
+    never shown.
     """
-    by_chunk_id = {c["grounding"].get("chunk_id"): c for c in citations}
+    by_chunk_id = {**(earlier or {}), **{c["grounding"].get("chunk_id"): c for c in citations}}
     display_numbers: dict[str, int] = {}
 
     def _replace(match: "re.Match[str]") -> str:
-        chunk_id = match.group(1)
+        chunk_id = match.group("loose_id") or match.group("tag_id")
         if chunk_id not in by_chunk_id:
             return ""
         number = display_numbers.get(chunk_id)
@@ -122,7 +175,8 @@ def _render_citations(
             display_numbers[chunk_id] = number
         return f"[{number}]"
 
-    clean_answer = _CITATION_TAG_RE.sub(_replace, answer)
+    clean_answer = _citation_reference_re([i for i in by_chunk_id if i]).sub(_replace, answer)
+    clean_answer = _STRAY_CHUNK_REF_RE.sub("", clean_answer)
 
     if not display_numbers:
         return clean_answer, citations
